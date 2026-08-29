@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""palivane-hook — Claude Code hook: local, pre-execution inspection of tool calls & prompts.
+
+The egress proxy can't see agent actions that never touch the network (local stdio MCP
+servers, file access, shell commands), and cert-pinned clients bypass it entirely. And
+with the default subscription sign-in (no gateway rerouting), the typed prompt goes
+straight to api.anthropic.com with nothing of Palivane's in the path. This hook closes both
+gaps from inside Claude Code itself, dispatching on `hook_event_name`:
+
+  PreToolUse       -> every tool call *before execution*, mapped to Palivane's MCP-activity
+                      shape -> /api/ingest/mcp (dangerous commands, sensitive resources,
+                      tool poisoning, secrets/PII in arguments)
+  UserPromptSubmit -> the user's typed prompt *before it leaves the device*
+                      -> /api/ingest/ai-usage (secrets/PII/data-loss on the prompt — the
+                      piece nothing else sees under subscription auth)
+
+Monitor by default: tool-call verdicts are recorded with zero added latency (the report
+is posted by a detached child process). Prompts are the exception: they are scanned
+inline even in monitor mode so a confirmed secret/PII leak (`force_block`) is stopped
+before it leaves — same rule as the egress proxy: block the certain, monitor the fuzzy.
+Set PALIVANE_ENFORCE=true to also block on ordinary high-risk verdicts — tool calls are
+then scanned synchronously and denied with the reason shown to the model; blocked prompts
+are erased with the reason shown to the user. The org can set that stance centrally
+(console Settings → Enforcement): `palivane-connect` provisions it at connect time, and
+inline verdicts carry the live value in their `enforce` field. Fails open on any error:
+Palivane being down never breaks the developer.
+
+Installed by `palivane-connect` (PreToolUse + UserPromptSubmit entries in
+~/.claude/settings.json), or manually:
+
+    {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": "/path/to/palivane-hook", "timeout": 10}]}],
+      "UserPromptSubmit": [{"hooks": [
+        {"type": "command", "command": "/path/to/palivane-hook", "timeout": 10}]}]}}
+
+Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key) from the environment, else from the
+`env` block of ~/.claude/settings.json (where palivane-connect writes them; the gateway
+token ANTHROPIC_AUTH_TOKEN doubles as the ingest credential). Stdlib only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# Tool calls with no security surface — pure agent bookkeeping. Never reported.
+# Reported in the User-Agent so the console can inventory client builds per device.
+VERSION = "1.1.0"
+
+SKIP_TOOLS = {"TodoWrite", "Task", "ExitPlanMode", "AskUserQuestion"}
+
+_MAX_ARGS_TEXT = 20000
+
+
+def _harvest_strings(obj, out: list[str]) -> None:
+    """Recursively collect string *values* from an arbitrary JSON structure (dict keys
+    are ignored) — scans unknown tool-input shapes without a per-tool parser."""
+    if isinstance(obj, str):
+        if len(obj) >= 2:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _harvest_strings(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _harvest_strings(v, out)
+
+
+def _settings_env(path: str = "~/.claude/settings.json") -> dict:
+    """The `env` block of Claude Code's settings file ({} if unreadable)."""
+    try:
+        with open(os.path.expanduser(path)) as f:
+            env = json.load(f).get("env")
+        return env if isinstance(env, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_config() -> dict:
+    """Resolve backend URL/token/mode: environment first, then ~/.claude/settings.json.
+
+    The settings fallback makes the hook independent of whether Claude Code exports the
+    settings `env` block to hook processes. palivane-connect writes PALIVANE_URL/PALIVANE_TOKEN
+    there; the gateway credential (ANTHROPIC_AUTH_TOKEN, an ak_… key valid for ingest
+    too) and ANTHROPIC_BASE_URL (the gateway, minus /v1) serve as final fallbacks."""
+    senv = _settings_env()
+    url = os.getenv("PALIVANE_URL") or senv.get("PALIVANE_URL", "")
+    token = os.getenv("PALIVANE_TOKEN") or senv.get("PALIVANE_TOKEN", "")
+    if not token:
+        gw = senv.get("ANTHROPIC_AUTH_TOKEN", "")
+        if isinstance(gw, str) and gw.startswith("ak_"):
+            token = gw
+    if not url:
+        base = senv.get("ANTHROPIC_BASE_URL", "")
+        if isinstance(base, str) and base:
+            url = base.rstrip("/")
+            if url.endswith("/v1"):
+                url = url[: -len("/v1")]
+    enforce = (os.getenv("PALIVANE_ENFORCE") or senv.get("PALIVANE_ENFORCE") or "").lower() in ("1", "true", "yes")
+    try:
+        timeout = float(os.getenv("PALIVANE_HOOK_TIMEOUT", "5"))
+    except ValueError:
+        timeout = 5.0
+    user = os.getenv("PALIVANE_USER") or senv.get("PALIVANE_USER", "")
+    # Directories to NOT inspect (e.g. the Palivane repo itself, whose test fixtures are full
+    # of realistic-looking secrets) — os.pathsep- or comma-separated absolute paths.
+    raw_excl = os.getenv("PALIVANE_HOOK_EXCLUDE_DIRS") or senv.get("PALIVANE_HOOK_EXCLUDE_DIRS", "")
+    exclude = [os.path.realpath(os.path.expanduser(p)) for p in
+               raw_excl.replace(",", os.pathsep).split(os.pathsep) if p.strip()]
+    return {"url": url, "token": token, "enforce": enforce, "timeout": timeout,
+            "user": user, "exclude": exclude}
+
+
+def _is_excluded(cwd: str, exclude: list) -> bool:
+    """True if the session's working directory is at/under an excluded dir — so developing
+    Palivane itself doesn't flag its own secret fixtures on every tool call."""
+    if not cwd or not exclude:
+        return False
+    try:
+        rp = os.path.realpath(os.path.expanduser(cwd))
+    except OSError:
+        return False
+    return any(rp == d or rp.startswith(d + os.sep) for d in exclude)
+
+
+def build_activity(tool_name: str, tool_input: dict) -> dict | None:
+    """Map a Claude Code tool call onto Palivane's MCP-activity shape (POST /api/ingest/mcp).
+
+    MCP tools (mcp__<server>__<tool>) carry their server name so the org allowlist
+    applies; built-in tools send server="" — they aren't MCP servers, so the
+    untrusted-server policy signal must not fire for them. transport=stdio matches how
+    the backend already keys local (non-network) agent activity."""
+    if not tool_name or tool_name in SKIP_TOOLS:
+        return None
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    activity = {"method": "tools/call", "server": "", "tool": tool_name,
+                "args_text": "", "resource": "", "transport": "stdio"}
+
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__", 2)  # mcp__<server>__<tool>; tool may contain __
+        activity["server"] = parts[1] if len(parts) > 1 else ""
+        activity["tool"] = parts[2] if len(parts) > 2 else ""
+        harvested: list[str] = []
+        _harvest_strings(tool_input, harvested)
+        activity["args_text"] = "\n".join(harvested)[:_MAX_ARGS_TEXT]
+    elif tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        desc = tool_input.get("description", "")
+        activity["args_text"] = "\n".join(p for p in (cmd, desc) if isinstance(p, str) and p)[:_MAX_ARGS_TEXT]
+    elif tool_name == "Read":
+        activity["method"] = "resources/read"
+        fp = tool_input.get("file_path", "")
+        activity["resource"] = fp if isinstance(fp, str) else ""
+    else:
+        # Write/Edit/WebFetch/… — harvest all string values (file paths land in
+        # args_text for the sensitive-path check; content is scanned for secrets/PII).
+        harvested = []
+        _harvest_strings(tool_input, harvested)
+        activity["args_text"] = "\n".join(harvested)[:_MAX_ARGS_TEXT]
+    return activity
+
+
+def build_prompt_usage(event: dict) -> dict | None:
+    """UserPromptSubmit -> ai-usage payload (the typed prompt on its way to the model)."""
+    prompt = event.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    return {"content": prompt[:_MAX_ARGS_TEXT], "destination": "claude-code", "tool": "claude-code"}
+
+
+# --- Auth circuit breaker -------------------------------------------------------------
+# HTTP 401/403 means THIS token is dead (revoked or invalid) — a permanent signal, so we
+# stop calling out on every prompt/tool call. We fingerprint the token, stand down (fail
+# open, no network) for _DEAUTH_SECS, and re-probe hourly in case the 401 was transient.
+# A fresh token from `palivane connect` has a different fingerprint, so a stale marker never
+# suppresses it. Repeated transient errors (timeouts/5xx) trip a shorter cooldown so we
+# don't retry-storm an unreachable backend either.
+_DEAUTH_SECS = 3600
+_COOLDOWN_SECS = 300
+_FAIL_THRESHOLD = 3
+
+
+def _breaker_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, "hook-breaker.json")
+
+
+def _token_fp(token: str) -> str:
+    return hashlib.sha256((token or "").encode()).hexdigest()[:16]
+
+
+def _breaker_load() -> dict:
+    try:
+        with open(_breaker_path()) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _breaker_save(state: dict) -> None:
+    try:
+        path = _breaker_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _breaker_skip(token: str) -> str:
+    """Reason to skip the network and fail open, or '' to proceed."""
+    st, fp, now = _breaker_load(), _token_fp(token), time.time()
+    if st.get("deauth_fp") == fp and now < st.get("deauth_until", 0):
+        return "deauthorized"
+    if now < st.get("cooldown_until", 0):
+        return "backoff"
+    return ""
+
+
+def _breaker_record(token: str, status) -> None:
+    """status: 200 healthy | 401/403 revoked | None transient error."""
+    st, fp, now = _breaker_load(), _token_fp(token), time.time()
+    if status == 200:
+        if st:
+            _breaker_save({})                       # healthy — clear breaker state
+        return
+    if status in (401, 403):
+        first = st.get("deauth_fp") != fp
+        _breaker_save({"deauth_fp": fp, "deauth_until": now + _DEAUTH_SECS})
+        if first:
+            sys.stderr.write("palivane: capture key rejected (revoked or invalid) — standing "
+                             "down; re-run `palivane connect` to re-issue.\n")
+        return
+    fails = int(st.get("fails", 0)) + 1
+    if fails >= _FAIL_THRESHOLD:
+        st.update(fails=0, cooldown_until=now + _COOLDOWN_SECS)
+    else:
+        st["fails"] = fails
+    _breaker_save(st)
+
+
+def scan(endpoint: str, payload: dict, url: str, token: str,
+         user: str = "", timeout: float = 5.0) -> dict:
+    """Call a Palivane ingest endpoint; fail open (action=allow) on any error. A revoked key
+    trips the circuit breaker so we stop hammering the backend on every call."""
+    skip = _breaker_skip(token)
+    if skip:
+        return {"action": "allow", "reason": f"scan-skipped:{skip}"}
+    try:
+        body = dict(payload)
+        body["user"] = user
+        req = urllib.request.Request(
+            url.rstrip("/") + endpoint, method="POST",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "User-Agent": f"palivane-hook/{VERSION}", "X-Palivane-Token": token},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = json.loads(r.read())
+        _breaker_record(token, 200)
+        return out
+    except urllib.error.HTTPError as e:
+        _breaker_record(token, e.code)
+        return {"action": "allow", "reason": f"scan-failed:{e.code}"}
+    except Exception:
+        _breaker_record(token, None)
+        return {"action": "allow", "reason": "scan-failed"}
+
+
+def scan_mcp(activity: dict, url: str, token: str, user: str = "", timeout: float = 5.0) -> dict:
+    """Call the Palivane MCP ingest endpoint; fail open (action=allow) on any error."""
+    return scan("/api/ingest/mcp", activity, url, token, user, timeout)
+
+
+def _auth_rejected(verdict: dict) -> bool:
+    """True when this verdict is a fail-open caused by the backend REFUSING our key.
+
+    Distinct from a transient network failure: a rejected key means governance is off for
+    this machine until someone re-connects, and nothing else will say so. The stderr notice
+    in _breaker_record is invisible in practice — hosts (Claude Code among them) discard a
+    hook's stderr unless it exits non-zero — so main() turns this into a non-zero exit,
+    which surfaces as a NON-BLOCKING hook error. The tool call still proceeds either way.
+    """
+    return str(verdict.get("reason", "")).startswith(("scan-failed:401", "scan-failed:403"))
+
+
+def should_block(verdict: dict, enforce: bool) -> bool:
+    """Mirror of the proxy's rule: a confirmed secret/PII leak (force_block) is blocked
+    even in monitor mode — block the certain, monitor the fuzzy. Everything else blocks
+    under enforce — local (PALIVANE_ENFORCE) or the org's stance from the console
+    (Settings → Enforcement), which the server returns on every verdict."""
+    if verdict.get("force_block"):
+        return True
+    return (enforce or bool(verdict.get("enforce"))) and verdict.get("action") == "block"
+
+
+def deny_output(verdict: dict) -> dict:
+    """PreToolUse structured deny — the reason is fed back to the model."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    reason = (f"Blocked by Palivane: risky tool call ({cats or 'policy'}) — "
+              f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'high')}.")
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }}
+
+
+def prompt_block_output(verdict: dict) -> dict:
+    """UserPromptSubmit structured block — the prompt is erased and the reason (with the
+    fix, since the reader here is the user, not the model) is shown in the transcript."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    reason = (f"Blocked by Palivane: {cats or 'policy'} in your prompt — "
+              f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'high')}. "
+              f"The prompt was not sent.")
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        reason += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return {"decision": "block", "reason": reason}
+
+
+def _send_detached(endpoint: str, payload: dict, cfg: dict) -> None:
+    """Report in a detached child so the hook returns instantly (monitor mode)."""
+    p = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--send"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    p.stdin.write(json.dumps({
+        "endpoint": endpoint, "payload": payload, "url": cfg["url"],
+        "token": cfg["token"], "user": cfg["user"], "timeout": cfg["timeout"],
+    }).encode())
+    p.stdin.close()
+
+
+def main() -> int:
+    if "--send" in sys.argv[1:]:
+        # Worker mode (spawned by the monitor path): post the report and exit.
+        try:
+            job = json.load(sys.stdin)
+            scan(job.get("endpoint", "/api/ingest/mcp"), job["payload"], job["url"],
+                 job["token"], job.get("user", ""), float(job.get("timeout", 5)))
+        except Exception:
+            pass
+        return 0
+
+    try:
+        event = json.load(sys.stdin)
+    except Exception:
+        return 0
+
+    cfg = read_config()
+    # Skip inspection entirely inside an excluded working directory (e.g. the Palivane repo).
+    if _is_excluded(event.get("cwd") or "", cfg["exclude"]):
+        return 0
+
+    if event.get("hook_event_name") == "UserPromptSubmit":
+        payload = build_prompt_usage(event)
+        if payload is None:
+            return 0
+        if not cfg["url"] or not cfg["token"]:
+            return 0  # not connected to Palivane — nothing to report to
+        # Prompts are always scanned inline (even in monitor mode): a confirmed
+        # secret/PII leak (force_block) must be stopped before it leaves the device.
+        verdict = scan("/api/ingest/ai-usage", payload, cfg["url"], cfg["token"],
+                       cfg["user"], cfg["timeout"])
+        if should_block(verdict, cfg["enforce"]):
+            print(json.dumps(prompt_block_output(verdict)))
+        return 1 if _auth_rejected(verdict) else 0
+
+    activity = build_activity(event.get("tool_name", ""), event.get("tool_input") or {})
+    if activity is None:
+        return 0
+
+    if not cfg["url"] or not cfg["token"]:
+        return 0  # not connected to Palivane — nothing to report to
+
+    if cfg["enforce"]:
+        verdict = scan_mcp(activity, cfg["url"], cfg["token"], cfg["user"], cfg["timeout"])
+        if should_block(verdict, True):
+            print(json.dumps(deny_output(verdict)))
+            return 0
+        return 1 if _auth_rejected(verdict) else 0
+    else:
+        _send_detached("/api/ingest/mcp", activity, cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # fail open — never break the developer's session

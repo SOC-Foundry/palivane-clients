@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""palivane-import — pipe a third-party secret scanner's output into Palivane (CI integration).
+
+Turns an existing TruffleHog / Gitleaks / GitGuardian job into unified Palivane findings —
+one console, one scoring model, one alert/SIEM path across every scanner. The backend masks
+the secret at ingest and never persists the raw value; TruffleHog's verification escalates
+a live credential to critical.
+
+    trufflehog git file://. --json           | palivane-import trufflehog
+    gitleaks detect --report-format json -o /dev/stdout . | palivane-import gitleaks
+    ggshield secret scan path . --json       | palivane-import gitguardian
+
+Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key) from the environment, else the
+palivane-connect credentials (~/.claude/settings.json or ~/.cursor/palivane.json). Stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.request
+
+
+def _settings(path: str) -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            data = json.load(f)
+        env = data.get("env") if isinstance(data, dict) else None
+        return env if isinstance(env, dict) else (data if isinstance(data, dict) else {})
+    except Exception:
+        return {}
+
+
+def read_config() -> dict:
+    url = os.getenv("PALIVANE_URL", "")
+    token = os.getenv("PALIVANE_TOKEN", "")
+    if not url or not token:
+        claude, cursor = _settings("~/.claude/settings.json"), _settings("~/.cursor/palivane.json")
+        token = token or claude.get("PALIVANE_TOKEN", "") or cursor.get("token", "")
+        if not token:
+            gw = claude.get("ANTHROPIC_AUTH_TOKEN", "")
+            if isinstance(gw, str) and gw.startswith("ak_"):
+                token = gw
+        if not url:
+            url = claude.get("PALIVANE_URL", "") or cursor.get("url", "")
+            base = claude.get("ANTHROPIC_BASE_URL", "")
+            if not url and isinstance(base, str) and base:
+                url = base[:-3] if base.rstrip("/").endswith("/v1") else base
+    return {"url": url.rstrip("/"), "token": token}
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: <scanner> --json | palivane-import <trufflehog|gitleaks|gitguardian>",
+              file=sys.stderr)
+        return 2
+    tool = sys.argv[1].strip().lower()
+    raw = sys.stdin.read()
+    if not raw.strip():
+        print("no scanner output on stdin", file=sys.stderr)
+        return 0
+
+    cfg = read_config()
+    if not cfg["url"] or not cfg["token"]:
+        print("not connected to Palivane (set PALIVANE_URL/PALIVANE_TOKEN or run palivane-connect)",
+              file=sys.stderr)
+        return 1
+    host = os.getenv("PALIVANE_HOST") or os.uname().nodename
+    try:
+        req = urllib.request.Request(
+            cfg["url"] + "/api/scan/import", method="POST",
+            data=json.dumps({"tool": tool, "results": raw, "host": host, "record": True}).encode(),
+            headers={"content-type": "application/json", "User-Agent": "palivane-import/1.0", "X-Palivane-Token": cfg["token"]})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+    except Exception as e:
+        print(f"import failed: {e}", file=sys.stderr)
+        return 1
+    print(f"Imported {resp.get('scanned', 0)} {tool} finding(s): "
+          f"{resp.get('flagged', 0)} flagged, {resp.get('verified_live', 0)} verified-live. "
+          "Review in the Palivane console.")
+    # Non-zero exit when live secrets were confirmed, so a CI job can fail the build.
+    return 1 if resp.get("verified_live", 0) else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)

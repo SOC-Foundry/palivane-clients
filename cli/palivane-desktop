@@ -1,0 +1,729 @@
+#!/usr/bin/env bash
+# palivane-desktop — govern *desktop* AI apps (Claude/ChatGPT desktop, pinned IDE assistants)
+# that make their own HTTPS calls and can't use the gateway or the browser extension.
+#
+# It runs a LOCAL mitmproxy on 127.0.0.1:8081 with Palivane's addon, trusts its CA, and
+# points the machine's system HTTPS proxy at it — so those apps' traffic is inspected and
+# (in enforce mode) blocked before it leaves. Reuses the per-user token that `palivane
+# connect` already stored, so no separate sign-in.
+#
+#   palivane-desktop install              # desktop apps + CLIs (sudo: CA trust + system proxy)
+#   palivane-desktop install --cli-only   # CLIs only (Claude Code, Codex, Gemini) — no sudo
+#   palivane-desktop uninstall            # stop it; remove system proxy, CA trust, CLI shims
+#   palivane-desktop status
+#
+# macOS and Linux (GNOME/KDE; other desktops fall back to manual/env-var setup).
+# On Linux the CA is trusted in BOTH the system bundle and the per-user NSS store
+# (certutil), because Chromium/Electron desktop apps (Claude/ChatGPT desktop) verify TLS
+# against NSS and ignore the system bundle — without NSS trust their capture never works.
+# mitmproxy installs as a self-contained binary (no system Python; PEP-668-proof).
+# Windows is a separate PowerShell path (see docs).
+set -euo pipefail
+
+PALIVANE_URL="${PALIVANE_URL:-https://app.palivane.io}"
+PORT="${PALIVANE_PROXY_PORT:-8081}"
+HOME_DIR="${HOME}"
+WDIR="${HOME_DIR}/.palivane"
+# Hosts that must never route through the local proxy: loopback, tailnets (MagicDNS +
+# CGNAT range), and private ranges — so intranet/VPC traffic on VPN'd machines (Zscaler,
+# Tailscale, corp networks) skips the proxy hop entirely. CIDR entries are honored by
+# curl/Go/requests and harmlessly ignored by clients that don't parse them. Extend at
+# install time with PALIVANE_PROXY_NO_PROXY_EXTRA (comma-separated).
+NO_PROXY_BASE="localhost,127.0.0.1,::1,.ts.net,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10"
+NO_PROXY_ALL="${NO_PROXY_BASE}${PALIVANE_PROXY_NO_PROXY_EXTRA:+,${PALIVANE_PROXY_NO_PROXY_EXTRA}}"
+# Corporate-proxy chaining. On fleets behind a mandatory egress proxy / PAC (Zscaler,
+# Netskope, corp SWG) mitmdump can't reach the internet directly — it must forward through
+# that proxy. Set PALIVANE_UPSTREAM_PROXY=http://corp-proxy:port (MDM-pushed) to run mitmdump
+# in `--mode upstream:`; if the corp proxy TLS-inspects, point PALIVANE_UPSTREAM_CA at its
+# root bundle so mitmproxy trusts the upstream leg. When unset, we auto-adopt an ambient
+# https_proxy at install time (below) so a machine already configured for the corp proxy
+# just works. PALIVANE_UPSTREAM_AUTH=user:pass for an authenticated proxy.
+UPSTREAM_PROXY="${PALIVANE_UPSTREAM_PROXY:-}"
+UPSTREAM_AUTH="${PALIVANE_UPSTREAM_AUTH:-}"
+UPSTREAM_CA="${PALIVANE_UPSTREAM_CA:-}"
+UPSTREAM_INSECURE="${PALIVANE_UPSTREAM_INSECURE:-}"   # skip upstream cert verify (last resort)
+# Watchdog state (Linux): consecutive-failure count + "we failed the system proxy open".
+WATCHDOG_FAILS="${WDIR}/proxy-watchdog-fails"
+WATCHDOG_MARKER="${WDIR}/proxy-watchdog-failopen"
+ADDON="${WDIR}/palivane_addon.py"
+CA="${HOME_DIR}/.mitmproxy/mitmproxy-ca-cert.pem"
+SHIM_DIR="${WDIR}/bin"
+# Chromium/Electron desktop apps (Claude/ChatGPT desktop) on Linux DON'T use the system CA
+# bundle — they read this per-user NSS store. The proxy's TLS interception fails for them
+# unless the CA is trusted here too (no sudo needed — it's per-user).
+NSS_DB="sql:${HOME_DIR}/.pki/nssdb"
+CA_NICK="palivane-mitmproxy"
+# mitmproxy is installed here as a self-contained binary (bundles its own Python) so the
+# default install needs no system Python and never trips PEP-668. Pin with PALIVANE_MITM_VERSION.
+MITM_DIR="${WDIR}/mitmproxy"
+MITM_FALLBACK_VERSION="12.2.3"   # used only if the latest-version lookup fails
+# CLIs captured via a PATH shim — they use their own HTTP client and ignore the OS proxy
+# + trust store, so a system proxy alone never sees them. Override with PALIVANE_CLI_TOOLS.
+CLI_SHIM_TOOLS="${PALIVANE_CLI_TOOLS:-claude codex gemini}"
+OS="$(uname -s)"
+
+log() { printf '\033[36m[palivane-desktop]\033[0m %s\n' "$*"; }
+die() { printf '\033[31m[palivane-desktop] %s\033[0m\n' "$*" >&2; exit 1; }
+
+# Normalized Linux desktop, e.g. "kde", "gnome". We branch on this rather than on
+# `command -v gsettings`: gsettings is often installed on KDE, but KDE ignores the
+# org.gnome.system.proxy keys — so trusting its presence sets a proxy nobody reads
+# (silent no-op, the worst failure mode for a security control).
+linux_de() { printf '%s' "${XDG_CURRENT_DESKTOP:-}" | tr '[:upper:]' '[:lower:]'; }
+
+# The env-var method works for CLIs (Claude Code) and most native apps regardless of DE.
+proxy_env_note() {
+  log "For CLIs/native apps, export in their environment:"
+  log "  HTTPS_PROXY=http://127.0.0.1:$PORT   HTTP_PROXY=http://127.0.0.1:$PORT"
+}
+proxy_manual_note() {
+  log "Couldn't auto-set the system proxy for this desktop (${XDG_CURRENT_DESKTOP:-unknown})."
+  log "Set your HTTPS proxy to 127.0.0.1:$PORT in your desktop's network settings, or:"
+  proxy_env_note
+}
+
+read_token() {
+  # The per-user token palivane-connect wrote into Claude Code's settings. Parsed with sed
+  # (not python) so this path carries no Python dependency; the file is small, flat JSON.
+  local f="${HOME_DIR}/.claude/settings.json" tok
+  [ -f "$f" ] || die "No Palivane token found. Run 'palivane connect' first, then re-run this."
+  tok="$(sed -n 's/.*"PALIVANE_TOKEN"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)"
+  [ -n "$tok" ] || tok="$(sed -n 's/.*"ANTHROPIC_AUTH_TOKEN"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)"
+  printf '%s' "$tok"
+}
+
+# Map uname -m to mitmproxy's release arch token (empty = unsupported → caller falls back).
+mitm_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  printf 'x86_64' ;;
+    aarch64|arm64) [ "$OS" = "Darwin" ] && printf 'arm64' || printf 'aarch64' ;;
+  esac
+}
+
+# Latest published version (strip the leading v); PALIVANE_MITM_VERSION pins it, and a baked
+# fallback keeps install working if GitHub is unreachable.
+mitm_version() {
+  [ -n "${PALIVANE_MITM_VERSION:-}" ] && { printf '%s' "$PALIVANE_MITM_VERSION"; return; }
+  local v
+  v="$(curl -fsSL https://api.github.com/repos/mitmproxy/mitmproxy/releases/latest 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([0-9.]*\)".*/\1/p' | head -1)"
+  printf '%s' "${v:-$MITM_FALLBACK_VERSION}"
+}
+
+# Preferred install: the self-contained release tarball (bundles Python) → no system deps,
+# no PEP-668. Lands mitmdump/mitmproxy/mitmweb in $MITM_DIR.
+install_mitm_standalone() {
+  local arch os ver url tmp
+  arch="$(mitm_arch)"; [ -n "$arch" ] || return 1
+  case "$OS" in Darwin) os=macos ;; Linux) os=linux ;; *) return 1 ;; esac
+  ver="$(mitm_version)"; [ -n "$ver" ] || return 1
+  url="https://downloads.mitmproxy.org/${ver}/mitmproxy-${ver}-${os}-${arch}.tar.gz"
+  log "downloading mitmproxy ${ver} (${os}-${arch}); no Python required…"
+  mkdir -p "$MITM_DIR"; tmp="$(mktemp -d)"
+  if curl -fsSL "$url" -o "${tmp}/m.tar.gz" && tar -xzf "${tmp}/m.tar.gz" -C "$MITM_DIR"; then
+    rm -rf "$tmp"; [ -x "${MITM_DIR}/mitmdump" ]
+  else
+    rm -rf "$tmp"; return 1
+  fi
+}
+
+# Fallback (unusual arch, or downloads.mitmproxy.org blocked): a dedicated venv or pipx —
+# both sidestep PEP-668 (never pip --user into system site-packages). Symlinks into $MITM_DIR.
+install_mitm_pip() {
+  if command -v python3 >/dev/null 2>&1 && python3 -m venv "${MITM_DIR}/venv" >/dev/null 2>&1 \
+       && "${MITM_DIR}/venv/bin/pip" install --quiet mitmproxy >/dev/null 2>&1; then
+    ln -sf "${MITM_DIR}/venv/bin/mitmdump" "${MITM_DIR}/mitmdump"; return 0
+  fi
+  if command -v pipx >/dev/null 2>&1 && pipx install mitmproxy >/dev/null 2>&1; then
+    local m; m="$(command -v mitmdump || printf '%s' "${HOME_DIR}/.local/bin/mitmdump")"
+    mkdir -p "$MITM_DIR"; ln -sf "$m" "${MITM_DIR}/mitmdump"; return 0
+  fi
+  return 1
+}
+
+ensure_mitm() {
+  command -v mitmdump >/dev/null 2>&1 && return
+  [ -x "${MITM_DIR}/mitmdump" ] && { export PATH="${MITM_DIR}:$PATH"; return; }
+  log "installing mitmproxy (self-contained; no system changes)…"
+  install_mitm_standalone || install_mitm_pip \
+    || die "could not install mitmproxy automatically; install it from https://mitmproxy.org/downloads/ and re-run."
+  export PATH="${MITM_DIR}:$PATH"
+  command -v mitmdump >/dev/null 2>&1 || die "mitmproxy installed but 'mitmdump' is still not on PATH."
+}
+
+fetch_addon() {
+  mkdir -p "$WDIR"
+  log "fetching capture addon…"
+  curl -fsSL "${PALIVANE_URL%/}/cli/palivane_addon.py" -o "$ADDON" || die "could not download palivane_addon.py from $PALIVANE_URL"
+}
+
+bootstrap_ca() {
+  [ -f "$CA" ] && return
+  log "generating mitmproxy CA (first run)…"
+  ( mitmdump -q --listen-port "$PORT" >/dev/null 2>&1 & echo $! >/tmp/palivane-mitm-boot.pid ) || true
+  for _ in $(seq 1 20); do [ -f "$CA" ] && break; sleep 0.5; done
+  kill "$(cat /tmp/palivane-mitm-boot.pid 2>/dev/null)" 2>/dev/null || true
+  rm -f /tmp/palivane-mitm-boot.pid
+  [ -f "$CA" ] || die "mitmproxy CA was not generated at $CA"
+}
+
+# Linux distros split on how the system trust store is managed: Debian/Ubuntu use
+# update-ca-certificates (dropping into /usr/local/share/ca-certificates), while the
+# p11-kit distros (Arch, Fedora/RHEL, openSUSE) use update-ca-trust with a per-distro
+# anchors dir. Debian's tools DON'T exist on the p11-kit distros, so hard-coding that path
+# left the system CA untrusted there — curl/git and other system-bundle clients then reject
+# the proxy cert (desktop-app capture via NSS still worked, masking it). Detect the family.
+P11KIT_ANCHOR_DIRS="/etc/ca-certificates/trust-source/anchors /etc/pki/ca-trust/source/anchors /etc/pki/trust/anchors"
+
+p11kit_anchor_dir() {
+  local d
+  for d in $P11KIT_ANCHOR_DIRS; do [ -d "$d" ] && { printf '%s' "$d"; return; }; done
+  printf '/etc/ca-certificates/trust-source/anchors'   # Arch default (created below if absent)
+}
+
+trust_ca_system() {
+  if command -v update-ca-certificates >/dev/null 2>&1 && [ -d /usr/local/share/ca-certificates ]; then
+    log "trusting the CA (sudo; Debian trust store)…"
+    sudo cp "$CA" /usr/local/share/ca-certificates/palivane-mitmproxy.crt
+    sudo update-ca-certificates >/dev/null
+  elif command -v update-ca-trust >/dev/null 2>&1; then
+    local dir; dir="$(p11kit_anchor_dir)"
+    log "trusting the CA (sudo; $dir)…"
+    sudo mkdir -p "$dir"
+    sudo cp "$CA" "$dir/palivane-mitmproxy.crt"
+    sudo update-ca-trust extract   # regenerate the extracted bundle curl/git actually read
+  else
+    log "note: no system-CA tool found (update-ca-certificates / update-ca-trust) —"
+    log "      CLIs using the system trust store won't trust the proxy. Trust $CA manually."
+  fi
+}
+
+# Reverse of trust_ca_system, for both distro families and both brand generations —
+# palivane-mitmproxy.crt predates the rebrand, and uninstall must clean up installs made
+# before it. Best-effort; never fails uninstall.
+untrust_ca_system() {
+  local f d refresh_deb=0 refresh_p11=0
+  for f in palivane-mitmproxy.crt palivane-mitmproxy.crt; do
+    if [ -f "/usr/local/share/ca-certificates/$f" ]; then
+      sudo rm -f "/usr/local/share/ca-certificates/$f" || true
+      refresh_deb=1
+    fi
+    for d in $P11KIT_ANCHOR_DIRS; do
+      if [ -f "$d/$f" ]; then
+        sudo rm -f "$d/$f" || true
+        refresh_p11=1
+      fi
+    done
+  done
+  [ "$refresh_deb" = 1 ] && { sudo update-ca-certificates --fresh >/dev/null 2>&1 || sudo update-ca-certificates >/dev/null 2>&1 || true; }
+  [ "$refresh_p11" = 1 ] && command -v update-ca-trust >/dev/null 2>&1 && { sudo update-ca-trust extract || true; }
+  return 0
+}
+
+trust_ca() {
+  case "$OS" in
+    Darwin)
+      log "trusting the CA (sudo; system keychain)…"
+      sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CA" ;;
+    Linux)
+      trust_ca_system
+      nss_trust_ca ;;
+    *) die "unsupported OS: $OS" ;;
+  esac
+}
+
+# Chromium/Electron (Claude/ChatGPT desktop, VS Code) verify TLS against the per-user NSS
+# store, not the system bundle — so the system-CA trust above is invisible to them. Add
+# the CA to NSS too (no sudo). Without this, those apps route through the proxy and then
+# reject its certificate, so desktop-app capture silently never works on Linux.
+nss_trust_ca() {
+  [ "$OS" = "Linux" ] || return 0
+  if ! command -v certutil >/dev/null 2>&1; then
+    log "note: certutil not found — Chromium/Electron desktop apps (Claude/ChatGPT desktop)"
+    log "      won't trust the proxy CA. Install it: sudo <pkgmgr> install libnss3-tools (nss-tools)."
+    return 0
+  fi
+  [ -d "${HOME_DIR}/.pki/nssdb" ] || mkdir -p "${HOME_DIR}/.pki/nssdb"
+  # Replace any prior copy under EITHER nickname: a pre-rebrand install stored the same
+  # CA as palivane-mitmproxy, and certutil -A silently no-ops when the cert already sits
+  # in the store under another name — so the palivane nickname was never created.
+  certutil -d "$NSS_DB" -D -n "$CA_NICK" 2>/dev/null || true
+  certutil -d "$NSS_DB" -D -n palivane-mitmproxy 2>/dev/null || true
+  if certutil -d "$NSS_DB" -A -n "$CA_NICK" -t C,, -i "$CA" 2>/dev/null; then
+    log "trusted the CA in the NSS store — Chromium/Electron desktop apps now verify through the proxy."
+  else
+    log "warning: couldn't add the CA to the NSS store; Electron desktop apps may reject the proxy."
+  fi
+}
+
+nss_untrust_ca() {
+  [ "$OS" = "Linux" ] || return 0
+  command -v certutil >/dev/null 2>&1 || return 0
+  local n
+  for n in "$CA_NICK" palivane-mitmproxy; do   # second is the pre-rebrand nickname
+    certutil -d "$NSS_DB" -D -n "$n" 2>/dev/null && log "removed the CA from the NSS store ($n)." || true
+  done
+}
+
+set_proxy() {
+  case "$OS" in
+    Darwin)
+      local svc; svc="$(networksetup -listnetworkserviceorder | awk -F') ' '/\) /{print $2}' | head -1)"
+      log "pointing system HTTPS proxy at 127.0.0.1:$PORT (service: $svc)…"
+      sudo networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$PORT"
+      sudo networksetup -setsecurewebproxystate "$svc" on ;;
+    Linux)
+      case "$(linux_de)" in
+        *gnome*|*unity*|*cinnamon*|*mate*|*budgie*)
+          if command -v gsettings >/dev/null 2>&1; then
+            log "setting GNOME system proxy…"
+            gsettings set org.gnome.system.proxy mode 'manual'
+            gsettings set org.gnome.system.proxy.https host '127.0.0.1'
+            gsettings set org.gnome.system.proxy.https port "$PORT"
+          else
+            proxy_manual_note
+          fi ;;
+        *kde*|*plasma*)
+          local kw; kw="$(command -v kwriteconfig6 || command -v kwriteconfig5 || true)"
+          if [ -n "$kw" ]; then
+            log "setting KDE system proxy (kioslaverc)…"
+            "$kw" --file kioslaverc --group "Proxy Settings" --key ProxyType 1
+            "$kw" --file kioslaverc --group "Proxy Settings" --key httpsProxy "http://127.0.0.1:$PORT/"
+            "$kw" --file kioslaverc --group "Proxy Settings" --key httpProxy  "http://127.0.0.1:$PORT/"
+            # Nudge running KIO apps to reload proxy config (best-effort).
+            command -v dbus-send >/dev/null 2>&1 && \
+              dbus-send --type=signal /KIO/Scheduler org.kde.KIO.Scheduler.reparseSlaveConfiguration string:'' 2>/dev/null || true
+            log "KDE proxy set. KIO-aware apps honor it; CLIs/native apps also need the env vars:"
+            proxy_env_note
+          else
+            proxy_manual_note
+          fi ;;
+        *)
+          proxy_manual_note ;;
+      esac
+      # The DE proxy settings above only reach DE-integrated apps: GNOME's gsettings is
+      # read by Chromium, but KDE's kioslaverc is NOT — Chromium/Electron (Claude/ChatGPT
+      # desktop, browsers) ignore it. So ALSO set the proxy as session-wide env via
+      # systemd's environment.d, which the graphical session imports and GUI apps inherit
+      # on any desktop. This is what makes desktop-app capture actually always-on on KDE
+      # (and a belt-and-suspenders on GNOME). Takes effect on next login.
+      set_session_proxy_env ;;
+  esac
+}
+
+# Session-wide proxy env for GUI apps that ignore the DE proxy config (Chromium/Electron).
+# systemd user imports ~/.config/environment.d/*.conf into the graphical session at login.
+set_session_proxy_env() {
+  local d="${HOME_DIR}/.config/environment.d"
+  mkdir -p "$d"
+  cat > "$d/palivane-proxy.conf" <<ENV
+# Palivane desktop egress proxy (palivane-desktop). Remove this file (or run
+# 'palivane-desktop uninstall') to stop routing GUI apps through Palivane.
+http_proxy=http://127.0.0.1:$PORT
+https_proxy=http://127.0.0.1:$PORT
+HTTP_PROXY=http://127.0.0.1:$PORT
+HTTPS_PROXY=http://127.0.0.1:$PORT
+no_proxy=$NO_PROXY_ALL
+NO_PROXY=$NO_PROXY_ALL
+ENV
+  # Best-effort: push into the LIVE session managers too, so things launched from this
+  # session pick it up without a re-login. Two separate managers hold their own env copy:
+  # the systemd user manager (spawns user units) and the D-Bus activation environment
+  # (spawns D-Bus-activated GUI apps). import-environment would read from THIS shell —
+  # where the vars aren't exported — so set explicit values. Already-running apps keep
+  # whatever env they started with until restarted.
+  systemctl --user set-environment \
+    "http_proxy=http://127.0.0.1:$PORT" "https_proxy=http://127.0.0.1:$PORT" \
+    "HTTP_PROXY=http://127.0.0.1:$PORT" "HTTPS_PROXY=http://127.0.0.1:$PORT" \
+    "no_proxy=$NO_PROXY_ALL" "NO_PROXY=$NO_PROXY_ALL" 2>/dev/null || true
+  command -v dbus-update-activation-environment >/dev/null 2>&1 && \
+    dbus-update-activation-environment \
+      "http_proxy=http://127.0.0.1:$PORT" "https_proxy=http://127.0.0.1:$PORT" \
+      "HTTP_PROXY=http://127.0.0.1:$PORT" "HTTPS_PROXY=http://127.0.0.1:$PORT" 2>/dev/null || true
+  log "session proxy env written (environment.d) and pushed into the live session managers."
+  log "CAPTURE IS NOT FULLY ON YET: the desktop shell (plasmashell/gnome-shell) keeps the"
+  log "env it had at login and injects it into apps launched from the taskbar/menu — those"
+  log "launches may bypass the proxy until you log out and back in. Quit+reopen can be"
+  log "enough for some launch paths, but don't trust it for a security control: verify each"
+  log "app's traffic actually shows in the Palivane console, and re-login if it doesn't."
+}
+
+unset_session_proxy_env() {
+  # Both brand generations: palivane-proxy.conf is the pre-rebrand filename.
+  rm -f "${HOME_DIR}/.config/environment.d/palivane-proxy.conf" \
+        "${HOME_DIR}/.config/environment.d/palivane-proxy.conf"
+  systemctl --user unset-environment http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
+  # The D-Bus activation environment is a SEPARATE copy of the session env — GUI apps
+  # launched via D-Bus activation keep getting the dead proxy unless it's scrubbed too.
+  # There's no "unset" for it; setting empty values is the standard way to neutralize.
+  command -v dbus-update-activation-environment >/dev/null 2>&1 && \
+    dbus-update-activation-environment \
+      http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= all_proxy= ALL_PROXY= 2>/dev/null || true
+  return 0
+}
+
+# Location 4 of 4 (KDE): plasmashell keeps the env it had at LOGIN and passes its own
+# copy into every app launched from the taskbar/menu — bypassing the systemd and D-Bus
+# scrubs above, so a freshly launched app still gets the dead proxy. If it carries the
+# proxy, restart it: windows are untouched (kwin keeps running), panels reload briefly.
+# krunner launches apps the same way; killing it is enough — it respawns on demand with
+# the clean env. GNOME has the same launcher-env problem in gnome-shell, but restarting
+# that kills the whole Wayland session, so there re-login is the only safe flush.
+flush_kde_launcher_env() {
+  local pid
+  pid="$(pgrep -o -x plasmashell 2>/dev/null || true)"
+  [ -n "$pid" ] || return 0
+  tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+    | grep -Eq "^(http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY)=.*127\.0\.0\.1:${PORT}\$" || return 0
+  log "plasmashell still carries the proxy env and re-injects it into every app it"
+  log "launches — restarting it so taskbar/menu launches come up clean…"
+  if ! systemctl --user restart plasma-plasmashell.service 2>/dev/null; then
+    # Plasma session not managed by systemd: replace the shell in place instead.
+    (nohup plasmashell --replace >/dev/null 2>&1 &)
+  fi
+  pkill -x krunner 2>/dev/null || true
+}
+
+# --- Watchdog: fail the system proxy OPEN if the proxy process stays dead --------------
+# Restart=always covers crashes, but a persistently broken proxy (bad upgrade, disk full)
+# with the system proxy still pointed at 127.0.0.1:$PORT is a machine-wide outage — the
+# exact failure class of the 2026-08 stale-env field incident. A user timer checks the
+# port every 20s; after 3 consecutive misses it removes the system proxy (leaving the
+# service to keep retrying) and re-applies it automatically when the proxy is back.
+# Linux only: macOS system-proxy changes need sudo, which a background agent can't do —
+# there the CLI shims' per-launch fail-open is the safety net.
+
+proxy_port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
+
+disable_system_proxy_linux() {
+  case "$(linux_de)" in
+    *gnome*|*unity*|*cinnamon*|*mate*|*budgie*)
+      command -v gsettings >/dev/null 2>&1 && gsettings set org.gnome.system.proxy mode 'none' || true ;;
+    *kde*|*plasma*)
+      local kw; kw="$(command -v kwriteconfig6 || command -v kwriteconfig5 || true)"
+      if [ -n "$kw" ]; then
+        "$kw" --file kioslaverc --group "Proxy Settings" --key ProxyType 0 2>/dev/null || true
+        # Delete the proxy URLs, not just ProxyType: Chromium/Electron apps read
+        # kioslaverc through their KDE integration and can keep honoring the stale
+        # httpProxy/httpsProxy values even after ProxyType is set back to 0.
+        "$kw" --file kioslaverc --group "Proxy Settings" --key httpProxy  --delete 2>/dev/null || true
+        "$kw" --file kioslaverc --group "Proxy Settings" --key httpsProxy --delete 2>/dev/null || true
+      fi
+      command -v dbus-send >/dev/null 2>&1 && \
+        dbus-send --type=signal /KIO/Scheduler org.kde.KIO.Scheduler.reparseSlaveConfiguration string:'' 2>/dev/null || true ;;
+  esac
+}
+
+install_watchdog() {
+  [ "$OS" = "Linux" ] || return 0
+  local dir="${HOME_DIR}/.config/systemd/user" self
+  self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  mkdir -p "$dir"
+  cat > "$dir/palivane-proxy-watchdog.service" <<UNIT
+[Unit]
+Description=Palivane proxy watchdog (fails the system proxy open if the proxy stays dead)
+[Service]
+Type=oneshot
+ExecStart=${self} watchdog-tick
+UNIT
+  cat > "$dir/palivane-proxy-watchdog.timer" <<UNIT
+[Unit]
+Description=Palivane proxy watchdog timer
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=20
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now palivane-proxy-watchdog.timer 2>/dev/null || true
+  log "watchdog armed: if the proxy stays down ~60s, the system proxy is removed (fail-open)"
+  log "and re-applied automatically when the proxy recovers."
+}
+
+remove_watchdog() {
+  systemctl --user disable --now palivane-proxy-watchdog.timer 2>/dev/null || true
+  rm -f "${HOME_DIR}/.config/systemd/user/palivane-proxy-watchdog.service" \
+        "${HOME_DIR}/.config/systemd/user/palivane-proxy-watchdog.timer" \
+        "$WATCHDOG_FAILS" "$WATCHDOG_MARKER"
+  systemctl --user daemon-reload 2>/dev/null || true
+}
+
+cmd_watchdog_tick() {
+  if proxy_port_open; then
+    rm -f "$WATCHDOG_FAILS"
+    if [ -f "$WATCHDOG_MARKER" ]; then
+      log "proxy is back — re-applying the system proxy (was failed open)."
+      rm -f "$WATCHDOG_MARKER"
+      set_proxy
+    fi
+    return 0
+  fi
+  local n=0
+  [ -f "$WATCHDOG_FAILS" ] && n="$(cat "$WATCHDOG_FAILS" 2>/dev/null || printf 0)"
+  n=$((n + 1)); printf '%s' "$n" > "$WATCHDOG_FAILS"
+  [ "$n" -lt 3 ] && return 0             # give Restart=always a chance to win first
+  [ -f "$WATCHDOG_MARKER" ] && return 0  # already failed open
+  log "proxy has been down for $n consecutive checks — FAILING OPEN: removing the system"
+  log "proxy so the machine keeps working (uncaptured). Re-applies when the proxy is back."
+  touch "$WATCHDOG_MARKER"
+  disable_system_proxy_linux
+  unset_session_proxy_env
+  flush_kde_launcher_env
+}
+
+# Extra mitmdump flags for corporate-proxy chaining, as a plain space-separated string
+# (for the systemd ExecStart line). Empty when no upstream proxy is configured.
+mitm_upstream_flags() {
+  [ -n "$UPSTREAM_PROXY" ] || return 0
+  printf ' --mode upstream:%s' "$UPSTREAM_PROXY"
+  [ -n "$UPSTREAM_AUTH" ] && printf ' --upstream-auth %s' "$UPSTREAM_AUTH"
+  [ -n "$UPSTREAM_CA" ] && printf ' --set ssl_verify_upstream_trusted_ca=%s' "$UPSTREAM_CA"
+  [ -n "$UPSTREAM_INSECURE" ] && printf ' --ssl-insecure'
+  return 0
+}
+
+# Same flags as launchd <string> elements (one XML line per token).
+mitm_upstream_plist() {
+  [ -n "$UPSTREAM_PROXY" ] || return 0
+  printf '    <string>--mode</string><string>upstream:%s</string>\n' "$UPSTREAM_PROXY"
+  [ -n "$UPSTREAM_AUTH" ] && printf '    <string>--upstream-auth</string><string>%s</string>\n' "$UPSTREAM_AUTH"
+  [ -n "$UPSTREAM_CA" ] && printf '    <string>--set</string><string>ssl_verify_upstream_trusted_ca=%s</string>\n' "$UPSTREAM_CA"
+  [ -n "$UPSTREAM_INSECURE" ] && printf '    <string>--ssl-insecure</string>\n'
+  return 0
+}
+
+start_service() {
+  local tok; tok="$1"
+  local up_flags up_plist
+  up_flags="$(mitm_upstream_flags)"
+  up_plist="$(mitm_upstream_plist)"
+  [ -n "$UPSTREAM_PROXY" ] && log "chaining egress through upstream proxy: ${UPSTREAM_PROXY}$([ -n "$UPSTREAM_CA" ] && printf ' (trusting %s upstream)' "$UPSTREAM_CA")"
+  case "$OS" in
+    Darwin)
+      local plist="${HOME_DIR}/Library/LaunchAgents/io.palivane.proxy.plist"
+      mkdir -p "${HOME_DIR}/Library/LaunchAgents"
+      cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.palivane.proxy</string>
+  <key>ProgramArguments</key><array>
+    <string>$(command -v mitmdump)</string>
+    <string>-q</string><string>-s</string><string>${ADDON}</string>
+    <string>--listen-port</string><string>${PORT}</string>
+${up_plist}  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PALIVANE_URL</key><string>${PALIVANE_URL}</string>
+    <key>PALIVANE_TOKEN</key><string>${tok}</string>
+    <key>PALIVANE_PROXY_ENFORCE</key><string>${PALIVANE_PROXY_ENFORCE:-false}</string>
+    <key>PALIVANE_PROXY_INTERCEPT_EXTRA</key><string>${PALIVANE_PROXY_INTERCEPT_EXTRA:-}</string>
+    <key>PALIVANE_PROXY_INTERCEPT_ALL</key><string>${PALIVANE_PROXY_INTERCEPT_ALL:-}</string>
+  </dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>
+PLIST
+      launchctl unload "$plist" 2>/dev/null || true
+      launchctl load "$plist"
+      log "launchd service loaded (io.palivane.proxy)." ;;
+    Linux)
+      local unit="${HOME_DIR}/.config/systemd/user/palivane-proxy.service"
+      mkdir -p "${HOME_DIR}/.config/systemd/user"
+      cat > "$unit" <<UNIT
+[Unit]
+Description=Palivane desktop egress proxy
+[Service]
+Environment=PALIVANE_URL=${PALIVANE_URL}
+Environment=PALIVANE_TOKEN=${tok}
+Environment=PALIVANE_PROXY_ENFORCE=${PALIVANE_PROXY_ENFORCE:-false}
+Environment=PALIVANE_PROXY_INTERCEPT_EXTRA=${PALIVANE_PROXY_INTERCEPT_EXTRA:-}
+Environment=PALIVANE_PROXY_INTERCEPT_ALL=${PALIVANE_PROXY_INTERCEPT_ALL:-}
+ExecStart=$(command -v mitmdump) -q -s ${ADDON} --listen-port ${PORT}${up_flags}
+Restart=always
+[Install]
+WantedBy=default.target
+UNIT
+      systemctl --user daemon-reload
+      systemctl --user enable --now palivane-proxy.service
+      log "systemd --user service started (palivane-proxy)." ;;
+  esac
+}
+
+# Resolve the real executable for a tool, skipping our own shim dir — and any capture
+# shim from either brand generation elsewhere on PATH: a stale ~/.palivane/bin shim
+# otherwise gets wired as the "real" binary, and the new shim exec's a path that dies
+# the moment that leftover dir is cleaned up. Prints the path; non-zero if not found.
+real_bin() {
+  local name="$1" p IFS=:
+  for p in $PATH; do
+    [ "$p" = "$SHIM_DIR" ] && continue
+    [ -x "$p/$name" ] || continue
+    grep -qE "(palivane|palivane)-desktop CLI capture shim" "$p/$name" 2>/dev/null && continue
+    printf '%s' "$p/$name"; return 0
+  done
+  return 1
+}
+
+# CLIs (Claude Code, Codex, Gemini) are Node/own-HTTP-client tools that ignore the OS
+# trust store and system proxy — so pushing a system proxy never captures them. Drop a
+# PATH shim that sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS *before* the tool starts
+# (NODE_EXTRA_CA_CERTS is read once at Node startup, so it must precede launch), then
+# exec the real binary. Surgical + reversible (uninstall removes the shims).
+wire_cli_capture() {
+  # Sweep shims from BOTH generations first (we rewrite ours anyway): a leftover
+  # ~/.palivane/bin shim earlier on PATH would keep shadowing the fresh one forever.
+  unwire_cli_capture
+  mkdir -p "$SHIM_DIR"
+  case ":$PATH:" in
+    *":$SHIM_DIR:"*) : ;;
+    *) log "note: $SHIM_DIR is not on PATH — add it (install.sh does) or the shims won't take effect." ;;
+  esac
+  local wired="" name real shim
+  for name in $CLI_SHIM_TOOLS; do
+    real="$(real_bin "$name")" || continue
+    shim="$SHIM_DIR/$name"
+    cat > "$shim" <<EOF
+#!/usr/bin/env bash
+# palivane-desktop CLI capture shim (auto-generated; 'palivane-desktop uninstall' removes it).
+# Fail-open: if the local proxy is down, run the tool direct instead of breaking it —
+# a dead security control must never become a dead developer tool.
+if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
+  export HTTPS_PROXY="http://127.0.0.1:${PORT}"
+  export HTTP_PROXY="http://127.0.0.1:${PORT}"
+  export no_proxy="${NO_PROXY_ALL}"
+  export NO_PROXY="${NO_PROXY_ALL}"
+  export NODE_EXTRA_CA_CERTS="${CA}"
+else
+  echo "[palivane] egress proxy is down — running ${name} uncaptured (fail-open)" >&2
+fi
+exec "${real}" "\$@"
+EOF
+    chmod +x "$shim"
+    wired="$wired $name"
+  done
+  if [ -n "$wired" ]; then
+    log "CLI capture wired:$wired (shims in $SHIM_DIR -> 127.0.0.1:$PORT)."
+    log "Open a NEW terminal for the shims to take effect."
+  else
+    log "no target CLIs found on PATH to wire (looked for: $CLI_SHIM_TOOLS)."
+  fi
+}
+
+unwire_cli_capture() {
+  # Sweep the current shim dir AND the pre-rebrand one (~/.palivane/bin); match either
+  # generation's marker so an old shim never survives an uninstall.
+  local dir name shim removed=""
+  for dir in "$SHIM_DIR" "${HOME_DIR}/.palivane/bin"; do
+    [ -d "$dir" ] || continue
+    for name in $CLI_SHIM_TOOLS; do
+      shim="$dir/$name"
+      if [ -f "$shim" ] && grep -qE "(palivane|palivane)-desktop CLI capture shim" "$shim" 2>/dev/null; then
+        rm -f "$shim"; removed="$removed $name"
+      fi
+    done
+  done
+  [ -n "$removed" ] && log "removed CLI capture shims:$removed" || true
+}
+
+cmd_install() {
+  local cli_only=0 a
+  for a in "$@"; do [ "$a" = "--cli-only" ] && cli_only=1; done
+  command -v curl >/dev/null 2>&1 || die "curl is required."
+  local tok; tok="$(read_token)"; [ -n "$tok" ] || die "empty Palivane token; run 'palivane connect' first."
+  # If the machine is already behind a corporate egress proxy (ambient https_proxy) and no
+  # explicit upstream was set, adopt it — so a Zscaler/Netskope-configured device works out
+  # of the box. Skip loopback (that's us, from a prior install).
+  if [ -z "$UPSTREAM_PROXY" ]; then
+    local amb="${https_proxy:-${HTTPS_PROXY:-}}"
+    case "$amb" in
+      ""|*127.0.0.1:*|*localhost:*|*::1:*) : ;;
+      *) UPSTREAM_PROXY="$amb"
+         log "detected an existing egress proxy in the environment ($amb) — chaining through it." ;;
+    esac
+  fi
+  ensure_mitm
+  fetch_addon
+  bootstrap_ca          # generates the CA (also the one NODE_EXTRA_CA_CERTS points at)
+  if [ "$cli_only" = "1" ]; then
+    log "CLI-only mode: skipping system CA trust + system proxy (no sudo)."
+  else
+    trust_ca
+  fi
+  start_service "$tok"
+  if [ "$cli_only" != "1" ]; then
+    set_proxy
+    install_watchdog    # fail the system proxy open if the proxy process stays dead
+  fi
+  wire_cli_capture      # PATH shims for Node CLIs (needed in both modes — Node ignores the OS proxy/trust)
+  if [ "$cli_only" = "1" ]; then
+    log "done. CLIs (${CLI_SHIM_TOOLS}) now route through Palivane. Enforce mode: ${PALIVANE_PROXY_ENFORCE:-false} (monitor)."
+    log "Verify: open a NEW terminal and run 'claude'; check findings in the console."
+  else
+    log "done. CLIs route through Palivane now. Enforce mode: ${PALIVANE_PROXY_ENFORCE:-false} (monitor)."
+    log "Desktop apps (Claude/ChatGPT) route AFTER YOU LOG OUT AND BACK IN: the desktop shell"
+    log "keeps its login-time env and injects it into taskbar/menu launches, so until re-login"
+    log "those launches can silently bypass the proxy. Quit+reopen may work for some launch"
+    log "paths — verify in the Palivane console (traffic visible = captured); don't assume."
+  fi
+}
+
+cmd_uninstall() {
+  unwire_cli_capture
+  case "$OS" in
+    Darwin)
+      local svc; svc="$(networksetup -listnetworkserviceorder | awk -F') ' '/\) /{print $2}' | head -1)"
+      sudo networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
+      local pl
+      for pl in io.palivane.proxy.plist; do
+        launchctl unload "${HOME_DIR}/Library/LaunchAgents/$pl" 2>/dev/null || true
+        rm -f "${HOME_DIR}/Library/LaunchAgents/$pl"
+      done
+      log "stopped. (CA left in the keychain; remove manually if desired.)" ;;
+    Linux)
+      # Stop + remove the unit — both brand generations. disable alone leaves the unit
+      # file behind, and a pre-rebrand install left palivane-proxy.service that the renamed
+      # uninstall never touched.
+      local u
+      for u in palivane-proxy.service palivane-proxy.service; do
+        systemctl --user disable --now "$u" 2>/dev/null || true
+        rm -f "${HOME_DIR}/.config/systemd/user/$u"
+      done
+      systemctl --user daemon-reload 2>/dev/null || true
+      remove_watchdog
+      disable_system_proxy_linux
+      nss_untrust_ca
+      untrust_ca_system
+      unset_session_proxy_env
+      flush_kde_launcher_env
+      log "stopped. Proxy off; CA untrusted (system trust store + NSS); session proxy env"
+      log "         removed from all four locations: environment.d file, live systemd user"
+      log "         env, D-Bus activation env, and the desktop shell's launcher env (KDE)."
+      log "IMPORTANT: terminals/apps that are ALREADY RUNNING keep the proxy env they started"
+      log "           with — anything launched from an old terminal tab still points at the"
+      log "           dead proxy. Log out and back in to flush the last stragglers."
+      log "         (If you set HTTPS_PROXY/HTTP_PROXY env vars manually, unset them too.)" ;;
+  esac
+}
+
+cmd_status() {
+  case "$OS" in
+    Darwin) launchctl list 2>/dev/null | grep -q palivane-proxy && echo "proxy: running" || echo "proxy: not running" ;;
+    Linux)
+      printf 'proxy: %s\n' "$(systemctl --user is-active palivane-proxy.service 2>/dev/null || echo 'not running')"
+      printf 'watchdog: %s\n' "$(systemctl --user is-active palivane-proxy-watchdog.timer 2>/dev/null || echo 'not installed')"
+      [ -f "$WATCHDOG_MARKER" ] && echo "system proxy: FAILED OPEN (proxy down — re-applies on recovery)" ;;
+  esac
+  local name active=""
+  for name in $CLI_SHIM_TOOLS; do
+    [ -f "$SHIM_DIR/$name" ] && grep -q "palivane-desktop CLI capture shim" "$SHIM_DIR/$name" 2>/dev/null && active="$active $name"
+  done
+  [ -n "$active" ] && echo "cli shims:$active" || echo "cli shims: none"
+}
+
+case "${1:-install}" in
+  install)       shift 2>/dev/null || true; cmd_install "$@" ;;
+  uninstall)     cmd_uninstall ;;
+  status)        cmd_status ;;
+  watchdog-tick) cmd_watchdog_tick ;;   # invoked by the systemd user timer, not by hand
+  *) die "usage: palivane-desktop [install [--cli-only]|uninstall|status]" ;;
+esac

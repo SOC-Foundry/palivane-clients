@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""palivane-reenroll — Claude Code apiKeyHelper that self-enrolls a per-device key.
+
+Instead of baking a static `ak_…` device key into managed-settings.json (which dies the
+moment an admin revokes/rotates it, needing a re-push to every machine), the installer
+writes an *enrollment* config and points Claude Code's `apiKeyHelper` at this script. On
+each call it returns a live device key: it validates the cached key and, if that key is
+gone (revoked/rotated), redeems the fleet enrollment token for a fresh one — so a device
+self-heals within one apiKeyHelper TTL, no admin action or re-push required.
+
+Claude Code invokes this with no args and uses stdout as the credential, so stdout carries
+ONLY the key; everything else goes to stderr.
+
+Config (first found wins), shape {"url","enroll_token","device"}:
+    $PALIVANE_URL / $PALIVANE_ENROLL_TOKEN   (env overrides, device defaults to user@host)
+    ~/.palivane/enroll.json                (per-user)
+    /etc/palivane/enroll.json              (system-wide, written by the device installer)
+
+    palivane-reenroll                      # print a live device key (apiKeyHelper mode)
+    palivane-reenroll --refresh            # force a fresh enrollment, ignoring the cache
+    palivane-reenroll --setup URL TOKEN    # write ~/.palivane/enroll.json (installer helper)
+
+Stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import sys
+import urllib.error
+import urllib.request
+
+_USER_CFG = os.path.expanduser("~/.palivane/enroll.json")
+_SYS_CFG = "/etc/palivane/enroll.json"
+# Windows system-wide config the installer writes (no /etc there).
+_WIN_CFG = os.path.join(os.environ.get("PROGRAMDATA", ""), "Palivane", "enroll.json") \
+    if os.environ.get("PROGRAMDATA") else ""
+_KEY_CACHE = os.path.expanduser("~/.palivane/device-key")
+_TIMEOUT = 8
+
+
+def _log(msg: str) -> None:
+    print(f"palivane-reenroll: {msg}", file=sys.stderr)
+
+
+def _device_id() -> str:
+    try:
+        host = socket.gethostname().split(".")[0]
+    except Exception:
+        host = "device"
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
+    return f"{user}@{host}"
+
+
+def _load_config() -> dict:
+    cfg: dict = {}
+    for path in (_USER_CFG, _SYS_CFG, _WIN_CFG):
+        if path and os.path.isfile(path):
+            try:
+                cfg = json.load(open(path))
+                break
+            except (ValueError, OSError):
+                continue
+    url = (os.environ.get("PALIVANE_URL") or cfg.get("url") or "").rstrip("/")
+    token = os.environ.get("PALIVANE_ENROLL_TOKEN") or cfg.get("enroll_token") or ""
+    device = cfg.get("device") or _device_id()
+    if not url or not token:
+        sys.exit("palivane-reenroll: no enrollment config (set PALIVANE_URL + "
+                 "PALIVANE_ENROLL_TOKEN, or write ~/.palivane/enroll.json).")
+    return {"url": url, "enroll_token": token, "device": device}
+
+
+def _read_cached_key() -> str:
+    try:
+        return open(_KEY_CACHE).read().strip()
+    except OSError:
+        return ""
+
+
+def _write_cached_key(key: str) -> None:
+    os.makedirs(os.path.dirname(_KEY_CACHE), exist_ok=True)
+    with open(_KEY_CACHE, "w") as f:
+        f.write(key)
+    os.chmod(_KEY_CACHE, 0o600)
+
+
+def _post(url: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json", "User-Agent": "palivane-reenroll/1.0"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _key_is_live(cfg: dict, key: str) -> bool:
+    """True if `key` still authenticates. On a network error, assume live (fail-safe: a
+    transient blip shouldn't force a needless re-enroll / lock the dev out)."""
+    req = urllib.request.Request(
+        cfg["url"] + "/api/enroll/check",
+        headers={"X-Palivane-Token": key, "User-Agent": "palivane-reenroll/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT):
+            return True
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def _enroll(cfg: dict) -> str:
+    resp = _post(cfg["url"] + "/api/enroll",
+                 {"token": cfg["enroll_token"], "device": cfg["device"]})
+    key = resp.get("token", "")
+    if not key:
+        sys.exit(f"palivane-reenroll: enrollment returned no key: {resp}")
+    _write_cached_key(key)
+    _log(f"enrolled device {cfg['device']} (new device key cached)")
+    return key
+
+
+def _resolve_key(cfg: dict, force: bool) -> str:
+    if not force:
+        cached = _read_cached_key()
+        if cached and _key_is_live(cfg, cached):
+            return cached
+    return _enroll(cfg)
+
+
+def _setup(url: str, token: str) -> None:
+    os.makedirs(os.path.dirname(_USER_CFG), exist_ok=True)
+    with open(_USER_CFG, "w") as f:
+        json.dump({"url": url.rstrip("/"), "enroll_token": token, "device": _device_id()}, f, indent=2)
+    os.chmod(_USER_CFG, 0o600)
+    _log(f"wrote {_USER_CFG}")
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if args and args[0] == "--setup":
+        if len(args) != 3:
+            sys.exit("usage: palivane-reenroll --setup URL ENROLL_TOKEN")
+        _setup(args[1], args[2])
+        return
+    force = bool(args and args[0] == "--refresh")
+    cfg = _load_config()
+    try:
+        key = _resolve_key(cfg, force)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"palivane-reenroll: enrollment failed (HTTP {e.code}): {e.read().decode()[:200]}")
+    except (urllib.error.URLError, OSError) as e:
+        # Network down: fall back to a cached key if we have one, so Claude Code keeps
+        # working offline; only hard-fail when there's nothing cached to fall back to.
+        cached = _read_cached_key()
+        if cached:
+            print(cached)
+            return
+        sys.exit(f"palivane-reenroll: cannot reach {cfg['url']}: {e}")
+    print(key)  # stdout = the credential (apiKeyHelper contract)
+
+
+if __name__ == "__main__":
+    main()

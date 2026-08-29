@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""palivane-s3-scan — scan an AWS S3 bucket's object contents for secrets/PII at rest and
+detect public-bucket exposure, reporting to Palivane.
+
+Buckets are where secrets go to die quietly: a stray `.env`, a Terraform state, a DB dump —
+sitting in object storage that's often more open than anyone realizes. This plane walks a
+bucket's objects, detects secrets/PII in them LOCALLY (palivane_detect, shared with
+palivane-secrets), and sends only what it found to `POST /api/scan/s3`: the category, a
+label, the line, and a masked preview. Object bytes never leave the account that owns
+them. It also determines whether the bucket is *publicly reachable*. A world-readable bucket holding sensitive data is
+the crown-jewel case, so the backend escalates any non-clean object in a public bucket to a
+hard `block`.
+
+AWS auth uses the standard boto3 default chain (env vars / shared profile / instance role) —
+credentials are NEVER passed as flags; set AWS_PROFILE / AWS_REGION and boto3 reads them.
+Palivane auth is PALIVANE_URL + PALIVANE_TOKEN (an ak_… key) from the environment (token is env-only,
+never a flag). Stdlib + boto3 (imported lazily so the CLI loads without boto3 installed).
+
+    palivane-s3-scan my-bucket                    # scan the whole bucket, report to Palivane
+    palivane-s3-scan my-bucket --prefix logs/     # limit to a key prefix
+    palivane-s3-scan my-bucket --dry-run          # list what would be scanned + exposure; send nothing
+    palivane-s3-scan my-bucket --record           # persist findings server-side
+    palivane-s3-scan my-bucket --fail-closed      # exit non-zero on backend/AWS error (CI)
+
+Exit codes: 0 = clean/allowed, 1 = a block-level finding. On a backend/AWS error it fails
+OPEN (exit 0) unless --fail-closed is given.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+MAX_CONTENT = 200_000
+
+# Detection is shared with palivane-secrets and lives beside this script. The CLIs are
+# downloaded individually, so fall back to fetching it from the same deployment this
+# scanner reports to rather than failing with an ImportError the user cannot act on.
+def _load_detect():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "palivane_detect.py")
+    if not os.path.exists(path):
+        base = (os.environ.get("PALIVANE_URL") or "").rstrip("/")
+        if not base:
+            sys.exit("palivane_detect.py not found next to this script and PALIVANE_URL "
+                     "is unset, so it cannot be fetched. Download it from "
+                     "<your-palivane-url>/cli/palivane_detect.py into the same directory.")
+        try:
+            import urllib.request
+            with urllib.request.urlopen(base + "/cli/palivane_detect.py", timeout=20) as r:
+                body = r.read()
+            path = os.path.join(tempfile.gettempdir(), "palivane_detect.py")
+            with open(path, "wb") as fh:
+                fh.write(body)
+        except Exception as e:                                    # noqa: BLE001
+            sys.exit(f"could not fetch palivane_detect.py from {base}: {e}")
+    spec = importlib.util.spec_from_file_location("palivane_detect", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+detect = _load_detect()
+
+        # backend caps object content at 200k chars — truncate to match
+BATCH = 100                  # objects per POST — bounded request size, well under the 2000 cap
+# S3 predefined group URIs that mean "the public" (or any AWS-authenticated principal).
+_PUBLIC_GRANTEE_URIS = (
+    "http://acs.amazonaws.com/groups/global/AllUsers",
+    "http://acs.amazonaws.com/groups/global/AuthenticatedUsers",
+)
+
+
+def _s3_client(region: str):
+    """Build an S3 client from the boto3 default credential chain. Lazy import so the module
+    (and its tests) load even where boto3 isn't installed."""
+    import boto3  # noqa: PLC0415
+
+    return boto3.client("s3", region_name=(region or None))
+
+
+def is_public(s3, bucket: str) -> bool:
+    """Best-effort: is the bucket actually publicly reachable? A bucket is public only if it
+    grants public access — an explicit `IsPublic` policy status, or an ACL grant to the
+    AllUsers / AuthenticatedUsers groups. A *fully-enabled* Block Public Access config then
+    overrides that (grants are neutralized), so we force not-public. Absence of a bucket-level
+    block config does NOT mean public — most private buckets have none (they rely on
+    account-level BPA / default-private ACLs); treating that as public would flag everything.
+    Every call is guarded so AccessDenied / missing config can't crash the scan."""
+    public = False
+
+    # An explicit "this bucket is public" verdict from AWS's own policy evaluation.
+    try:
+        st = s3.get_bucket_policy_status(Bucket=bucket)
+        if st.get("PolicyStatus", {}).get("IsPublic"):
+            public = True
+    except Exception:
+        pass
+
+    # ACL grants to the public / any-authenticated-user groups.
+    try:
+        acl = s3.get_bucket_acl(Bucket=bucket)
+        for grant in acl.get("Grants", []):
+            if grant.get("Grantee", {}).get("URI") in _PUBLIC_GRANTEE_URIS:
+                public = True
+                break
+    except Exception:
+        pass
+
+    # Block Public Access, fully on, neutralizes any public grant above — treat as private.
+    if public:
+        try:
+            blk = s3.get_public_access_block(Bucket=bucket).get("PublicAccessBlockConfiguration", {})
+            if all(blk.get(k) for k in ("BlockPublicAcls", "IgnorePublicAcls",
+                                        "BlockPublicPolicy", "RestrictPublicBuckets")):
+                public = False
+        except Exception:
+            pass
+
+    return public
+
+
+def list_objects(s3, bucket: str, prefix: str, max_objects: int) -> list[dict]:
+    """Paginated list of objects (key + size) under `prefix`, capped at `max_objects`."""
+    out: list[dict] = []
+    token = None
+    while len(out) < max_objects:
+        kw = {"Bucket": bucket, "MaxKeys": min(1000, max_objects - len(out))}
+        if prefix:
+            kw["Prefix"] = prefix
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        for c in resp.get("Contents", []):
+            out.append({"key": c.get("Key", ""), "size": int(c.get("Size", 0) or 0)})
+            if len(out) >= max_objects:
+                break
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+    return out
+
+
+def read_object(s3, bucket: str, key: str) -> str | None:
+    """Fetch one object's body as utf-8 text, truncated to the backend limit. Returns None on
+    a binary object (UnicodeDecodeError) or a read error — those are simply skipped."""
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+        raw = resp["Body"].read()
+    except Exception:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None   # binary — not scannable as text
+    return text[:MAX_CONTENT]
+
+
+def read_config(url_flag: str) -> dict:
+    """Palivane backend URL + token. Token is env-only (never a flag); URL falls back to env."""
+    url = (url_flag or os.getenv("PALIVANE_URL", "")).rstrip("/")
+    return {"url": url, "token": os.getenv("PALIVANE_TOKEN", "")}
+
+
+def post_batch(cfg: dict, bucket: str, region: str, public: bool, objects: list[dict],
+               record: bool, timeout: float = 30.0) -> dict:
+    """POST one batch of objects to /api/scan/s3. Raises on transport/HTTP error so the caller
+    can honor --fail-closed."""
+    payload = json.dumps({"bucket": bucket, "region": region, "public": public,
+                          "objects": objects, "record": record}).encode()
+    req = urllib.request.Request(
+        cfg["url"] + "/api/scan/s3", data=payload, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "palivane-s3-scan/1.0",
+                 "X-Palivane-Token": cfg["token"]})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _batched(items: list, n: int):
+    for i in range(0, len(items), n):
+        yield items[i:i + n]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Scan an S3 bucket for secrets/PII at rest & public exposure via Palivane.")
+    ap.add_argument("bucket", help="S3 bucket name to scan")
+    ap.add_argument("--prefix", default="", help="limit the scan to keys under this prefix")
+    ap.add_argument("--region", default=os.getenv("AWS_REGION", ""), help="AWS region (else boto3 default chain)")
+    ap.add_argument("--max-object-bytes", type=int, default=1_000_000,
+                    help="skip objects larger than this many bytes (default 1000000)")
+    ap.add_argument("--max-objects", type=int, default=5000, help="cap objects scanned (default 5000)")
+    ap.add_argument("--record", action="store_true", help="persist findings server-side")
+    ap.add_argument("--dry-run", action="store_true", help="list what would be scanned + exposure; send nothing")
+    ap.add_argument("--fail-closed", action="store_true", help="exit non-zero on backend/AWS error")
+    ap.add_argument("--url", default="", help="Palivane backend base URL (or PALIVANE_URL)")
+    args = ap.parse_args()
+
+    cfg = read_config(args.url)
+    # Token is required to report — but --dry-run touches only AWS, so allow it without a token.
+    if not args.dry_run and (not cfg["url"] or not cfg["token"]):
+        print("palivane: set PALIVANE_URL and PALIVANE_TOKEN to report findings.", file=sys.stderr)
+        return 1 if args.fail_closed else 0
+
+    try:
+        s3 = _s3_client(args.region)
+        public = is_public(s3, args.bucket)
+        listing = list_objects(s3, args.bucket, args.prefix, args.max_objects)
+    except Exception as e:
+        print(f"palivane: AWS error ({e}). {'Failing closed.' if args.fail_closed else 'Failing open.'}",
+              file=sys.stderr)
+        return 1 if args.fail_closed else 0
+
+    banner = "  ⚠ PUBLIC BUCKET — world-readable" if public else "  private"
+    print(f"Bucket: s3://{args.bucket}{('/' + args.prefix) if args.prefix else ''}  [{banner.strip()}]")
+
+    # Read scannable objects: within the size cap and utf-8-decodable (binary skipped).
+    objects: list[dict] = []
+    scanned_keys: list[str] = []
+    skipped_large = skipped_binary = 0
+    for o in listing:
+        if o["size"] > args.max_object_bytes:
+            skipped_large += 1
+            continue
+        content = read_object(s3, args.bucket, o["key"])
+        if content is None:
+            skipped_binary += 1
+            continue
+        # Detect HERE. Only what was found travels: category, label, line, masked
+        # preview. The object's bytes stay in the account that owns them, which is the
+        # same contract palivane-secrets keeps for endpoints.
+        found = detect.scan_all(content)
+        if found:
+            objects.append({"key": o["key"], "findings": [
+                {"category": c, "label": lbl, "line": ln, "masked": mk}
+                for c, lbl, ln, mk in found]})
+        scanned_keys.append(o["key"])
+
+    print(f"Listed {len(listing)} object(s); scanned {len(scanned_keys)} locally, "
+          f"{len(objects)} with findings "
+          f"(skipped {skipped_large} over size cap, {skipped_binary} binary/unreadable).")
+
+    if args.dry_run:
+        for k in scanned_keys:
+            print(f"  • {k}")
+        print(f"\n(--dry-run: exposure={'PUBLIC' if public else 'private'}; nothing sent to Palivane)")
+        return 0
+
+    if not objects:
+        print("✓ Nothing sensitive found." if scanned_keys
+              else "✓ Nothing scannable, bucket empty or all objects skipped.")
+        return 0
+
+    # POST in batches; aggregate the flagged objects and the worst overall action.
+    flagged: list[dict] = []
+    scanned = 0
+    worst = "allow"
+    _rank = {"allow": 0, "warn": 1, "block": 2}
+    try:
+        for batch in _batched(objects, BATCH):
+            resp = post_batch(cfg, args.bucket, args.region, public, batch, args.record)
+            scanned += resp.get("scanned", len(batch))
+            flagged.extend(resp.get("objects", []))
+            if _rank.get(resp.get("action", "allow"), 0) > _rank[worst]:
+                worst = resp.get("action", "allow")
+    except urllib.error.HTTPError as e:
+        print(f"palivane: backend returned HTTP {e.code} — {e.read().decode('utf-8', 'replace')[:200]}",
+              file=sys.stderr)
+        return 1 if args.fail_closed else 0
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"palivane: could not reach backend ({e}). {'Failing closed.' if args.fail_closed else 'Failing open.'}",
+              file=sys.stderr)
+        return 1 if args.fail_closed else 0
+
+    if not flagged:
+        print(f"palivane: scanned {scanned} object(s) — clean ✓")
+        return 0
+
+    if public:
+        print("\n  🔴 This bucket is PUBLIC and holds sensitive data — the crown-jewel case.")
+    print(f"\n  ⚠ Palivane flagged {len(flagged)} object(s):\n")
+    blocking = False
+    for f in flagged:
+        mark = "🔴 BLOCK" if f.get("action") == "block" else "🟠 WARN "
+        cats = ", ".join(dict.fromkeys(s.get("category", "") for s in f.get("signals", [])))
+        ev = "; ".join(s.get("evidence", "") for s in f.get("signals", []) if s.get("evidence"))
+        print(f"  {mark}  {f.get('key')}  [{cats}]  {('— ' + ev) if ev else ''}")
+        if f.get("action") == "block":
+            blocking = True
+    print()
+
+    if blocking:
+        print("  Sensitive data at rest in S3. Remove/rotate the exposed secrets and lock down\n"
+              "  the bucket (block public access, tighten the policy/ACL).", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

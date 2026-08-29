@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font: 13px/1.45 system-ui, sans-serif; width: 280px; margin: 0; padding: 14px; color: #111; }
+    h1 { font-size: 14px; margin: 0 0 10px; }
+    .logo { color: #2f6fed; }
+    .stat { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #eee; }
+    .verdict { margin-top: 10px; padding: 8px 10px; border-radius: 6px; background: #f4f5f7; }
+    .sev { font-weight: 700; text-transform: uppercase; font-size: 11px; }
+    .sev-critical, .sev-high { color: #c0283a; }
+    .sev-suspicious { color: #b8791f; }
+    .sev-low, .sev-benign { color: #1a7f37; }
+    .sigs { color: #555; margin-top: 4px; font-size: 12px; }
+    .muted { color: #888; }
+    a { color: #2f6fed; cursor: pointer; }
+    .row { margin-top: 10px; display: flex; justify-content: space-between; }
+    .conn { margin: 8px 0 10px; padding: 8px 10px; border-radius: 6px; background: #f4f5f7; }
+    .conn .who { font-weight: 600; }
+    button { width: 100%; padding: 8px; margin-top: 6px; border: 0; border-radius: 6px;
+             background: #2f6fed; color: #fff; font-weight: 600; cursor: pointer; }
+    button:hover { filter: brightness(1.05); }
+    .err { color: #c0283a; }
+  </style>
+</head>
+<body>
+  <h1><span class="logo">◆</span> Palivane. Shadow-AI Guard</h1>
+  <div id="conn" class="conn muted">Checking connection…</div>
+  <div class="stat"><span>Blocked this session</span><strong id="blockCount">0</strong></div>
+  <div id="verdict" class="verdict muted">No prompts inspected yet.</div>
+  <div class="row">
+    <a id="reset">reset counter</a>
+    <a id="options">options</a>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

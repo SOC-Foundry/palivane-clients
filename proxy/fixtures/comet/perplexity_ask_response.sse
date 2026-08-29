@@ -1,0 +1,14 @@
+event: message
+data: {"backend_uuid": "00000000-0000-4000-8000-0000000000ee", "query_str": "SYNTHETIC FIXTURE (not a real capture) — book the flight and pay with card 4111 1111 1111 1111", "status": "pending"}
+
+event: message
+data: {"blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "IN_PROGRESS", "chunks": ["SYNTHETIC agent step: opening "]}}], "status": "pending"}
+
+event: message
+data: {"blocks": [{"intended_usage": "ask_text", "markdown_block": {"progress": "DONE", "chunks": ["SYNTHETIC agent step: opening ", "the airline checkout page and filling the payment form."]}}], "status": "completed"}
+
+event: message
+data: {"text": "[{\"step_type\": \"FINAL\", \"content\": {\"answer\": \"SYNTHETIC final answer: flight booked; confirmation SYNTH-12345 sent to jane.doe@example-synthetic.test.\"}}]"}
+
+event: end_of_stream
+data: {"status": "completed"}

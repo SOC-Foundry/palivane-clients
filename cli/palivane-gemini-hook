@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""palivane-gemini-hook — Gemini CLI hook adapter: local, pre-execution inspection.
+
+Gemini CLI's endpoint depends on its auth mode (generativelanguage / cloudcode-pa /
+aiplatform), only the API-key mode honors a base-URL override, and the default "log in
+with Google" mode ignores it entirely — so neither the gateway nor the proxy reliably
+sees its prompts. This hook closes that gap from *inside* Gemini CLI using its hooks
+system (gemini-cli 0.26+): the CLI runs it at agent-lifecycle events, passing structured
+JSON on stdin, and honors a JSON verdict on stdout. Because it runs locally, it is
+independent of auth mode and endpoint.
+
+One script handles both security-relevant events, dispatched on `hook_event_name`:
+
+  BeforeAgent -> the user's typed prompt, before it reaches the model
+                 -> /api/ingest/ai-usage  (secrets/PII/data-loss on what's about to leave)
+  BeforeTool  -> tool call (shell, file, MCP) before execution
+                 -> /api/ingest/mcp       (dangerous commands, sensitive resources,
+                                           server allowlist, secrets/PII in arguments)
+
+Monitor by default: tool-call verdicts are recorded by a detached child with ~zero added
+latency. Prompts (BeforeAgent) are the exception: they are scanned inline even in monitor
+mode so a confirmed secret/PII leak (`force_block`) is stopped before it leaves — same
+rule as the egress proxy: block the certain, monitor the fuzzy. Set PALIVANE_ENFORCE=true
+to scan every event synchronously and DENY on a block verdict. Fails open on any error:
+Palivane being down never breaks the developer.
+
+Register in ~/.gemini/settings.json (user), <project>/.gemini/settings.json, or the
+system path pushed by MDM (Linux /etc/gemini-cli/settings.json, macOS
+/Library/Application Support/GeminiCli/settings.json, Windows
+C:\\ProgramData\\gemini-cli\\settings.json) — note timeouts are in milliseconds:
+
+  {"hooks": {
+     "BeforeAgent": [{"hooks": [{"name": "palivane", "type": "command",
+                                 "command": "/usr/local/bin/palivane-gemini-hook",
+                                 "timeout": 10000}]}],
+     "BeforeTool":  [{"matcher": ".*",
+                      "hooks": [{"name": "palivane", "type": "command",
+                                 "command": "/usr/local/bin/palivane-gemini-hook",
+                                 "timeout": 10000}]}]}}
+
+Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key) from the environment, else from
+~/.gemini/palivane.json ({"url","token","user","enforce"} — written by palivane-connect),
+else the pair palivane-connect wrote to ~/.claude/settings.json. Stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+
+# Reported in the User-Agent so the console can inventory client builds per device.
+VERSION = "1.1.0"
+_MAX_ARGS_TEXT = 20000
+
+
+def _harvest_strings(obj, out: list[str]) -> None:
+    """Recursively collect string *values* from an arbitrary JSON structure (dict keys
+    ignored) — scans unknown tool-input shapes without a per-tool parser."""
+    if isinstance(obj, str):
+        if len(obj) >= 2:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _harvest_strings(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _harvest_strings(v, out)
+
+
+def _cap(text: str) -> str:
+    return text[:_MAX_ARGS_TEXT]
+
+
+def build_ai_usage(event: dict) -> dict | None:
+    """BeforeAgent -> ai-usage payload (the typed prompt on its way to the model)."""
+    prompt = event.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    return {"content": _cap(prompt), "destination": "gemini-cli", "tool": "gemini-cli"}
+
+
+def build_activity(event: dict) -> dict | None:
+    """BeforeTool -> Palivane's MCP-activity shape (POST /api/ingest/mcp).
+
+    Gemini names MCP tools mcp_<server>_<tool>; those carry their server name so the org
+    allowlist applies. Built-in tools (run_shell_command, read_file, write_file, …) send
+    server="" — they aren't MCP servers, so the untrusted-server signal must not fire."""
+    tool_name = event.get("tool_name", "")
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    tool_input = event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    activity = {"method": "tools/call", "server": "", "tool": tool_name,
+                "args_text": "", "resource": "", "transport": "stdio"}
+
+    if tool_name.startswith("mcp_"):
+        parts = tool_name.split("_", 2)  # mcp_<server>_<tool>; tool may contain _
+        activity["server"] = parts[1] if len(parts) > 1 else ""
+        activity["tool"] = parts[2] if len(parts) > 2 else ""
+        harvested: list[str] = []
+        _harvest_strings(tool_input, harvested)
+        activity["args_text"] = _cap("\n".join(harvested))
+    elif tool_name == "run_shell_command":
+        cmd = tool_input.get("command", "")
+        desc = tool_input.get("description", "")
+        activity["args_text"] = _cap("\n".join(
+            p for p in (cmd, desc) if isinstance(p, str) and p))
+    elif tool_name == "read_file":
+        activity["method"] = "resources/read"
+        fp = tool_input.get("absolute_path") or tool_input.get("file_path") or ""
+        activity["resource"] = fp if isinstance(fp, str) else ""
+    else:
+        # write_file/replace/web_fetch/… — harvest all string values (file paths land in
+        # args_text for the sensitive-path check; content is scanned for secrets/PII).
+        harvested = []
+        _harvest_strings(tool_input, harvested)
+        activity["args_text"] = _cap("\n".join(harvested))
+    return activity
+
+
+def _gemini_config(path: str = "~/.gemini/palivane.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _claude_settings_env(path: str = "~/.claude/settings.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            env = json.load(f).get("env")
+        return env if isinstance(env, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_config() -> dict:
+    """Resolve backend URL/token/mode: environment, then ~/.gemini/palivane.json, then the
+    pair palivane-connect wrote to ~/.claude/settings.json (PALIVANE_URL/PALIVANE_TOKEN, or the
+    gateway pair — the ak_ token doubles as ingest auth)."""
+    gc = _gemini_config()
+    url = os.getenv("PALIVANE_URL") or gc.get("url", "")
+    token = os.getenv("PALIVANE_TOKEN") or gc.get("token", "")
+    enforce_raw = os.getenv("PALIVANE_ENFORCE")
+    enforce = (enforce_raw if enforce_raw is not None else str(gc.get("enforce", ""))).lower() in ("1", "true", "yes")
+    user = os.getenv("PALIVANE_USER") or gc.get("user", "")
+
+    if not url or not token:
+        senv = _claude_settings_env()
+        url = url or senv.get("PALIVANE_URL", "")
+        if not token:
+            tok = senv.get("PALIVANE_TOKEN", "") or senv.get("ANTHROPIC_AUTH_TOKEN", "")
+            if isinstance(tok, str) and tok.startswith("ak_"):
+                token = tok
+        if not url:
+            base = senv.get("ANTHROPIC_BASE_URL", "")
+            if isinstance(base, str) and base:
+                url = base.rstrip("/")
+                if url.endswith("/v1"):
+                    url = url[: -len("/v1")]
+    try:
+        timeout = float(os.getenv("PALIVANE_HOOK_TIMEOUT", "5"))
+    except ValueError:
+        timeout = 5.0
+    # Directories to NOT inspect (e.g. the Palivane repo, whose fixtures look like real secrets)
+    # — PALIVANE_HOOK_EXCLUDE_DIRS, os.pathsep- or comma-separated, from env or settings.json env.
+    raw_excl = (os.getenv("PALIVANE_HOOK_EXCLUDE_DIRS")
+                or _claude_settings_env().get("PALIVANE_HOOK_EXCLUDE_DIRS", ""))
+    exclude = [os.path.realpath(os.path.expanduser(p)) for p in
+               raw_excl.replace(",", os.pathsep).split(os.pathsep) if p.strip()]
+    return {"url": url, "token": token, "enforce": enforce, "timeout": timeout,
+            "user": user, "exclude": exclude}
+
+
+def _post(endpoint: str, payload: dict, cfg: dict) -> dict:
+    """POST to a Palivane ingest endpoint; fail open (action=allow) on any error."""
+    try:
+        body = dict(payload)
+        body["user"] = cfg.get("user", "")
+        req = urllib.request.Request(
+            cfg["url"].rstrip("/") + endpoint, method="POST",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "User-Agent": f"palivane-gemini-hook/{VERSION}", "X-Palivane-Token": cfg["token"]},
+        )
+        with urllib.request.urlopen(req, timeout=cfg.get("timeout", 5.0)) as r:
+            return json.loads(r.read())
+    except Exception:
+        return {"action": "allow", "reason": "scan-failed"}
+
+
+def should_block(verdict: dict, enforce: bool) -> bool:
+    """Mirror of the proxy's rule: a confirmed secret/PII leak (force_block) is blocked
+    even in monitor mode — block the certain, monitor the fuzzy. Everything else blocks
+    under enforce — local, or the org's stance from the console (Settings → Enforcement),
+    which the server returns on every verdict."""
+    if verdict.get("force_block"):
+        return True
+    return (enforce or bool(verdict.get("enforce"))) and verdict.get("action") == "block"
+
+
+def block_output(event_name: str, verdict: dict) -> dict:
+    """Gemini deny verdict: {"decision": "deny"} blocks the turn (BeforeAgent — the
+    prompt is not sent) or the tool call (BeforeTool); the reason is shown to the user."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    what = "prompt" if event_name == "BeforeAgent" else "tool call"
+    reason = (f"Blocked by Palivane: {cats or 'policy'} in this {what} — "
+              f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'high')}.")
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        reason += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return {"decision": "deny", "reason": reason}
+
+
+def _send_detached(endpoint: str, payload: dict, cfg: dict) -> None:
+    """Report in a detached child so the hook returns instantly (monitor mode)."""
+    p = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--send"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    p.stdin.write(json.dumps({"endpoint": endpoint, "payload": payload, "cfg": cfg}).encode())
+    p.stdin.close()
+
+
+def _event_cwd(event: dict) -> str:
+    """The working directory this hook event happened in — the event's cwd, its tool_input's
+    cwd, else the hook process's own cwd (the project root the CLI was launched in)."""
+    cwd = event.get("cwd")
+    if not cwd and isinstance(event.get("tool_input"), dict):
+        cwd = event["tool_input"].get("cwd")
+    return cwd or os.getcwd()
+
+
+def _is_excluded(cwd: str, exclude: list) -> bool:
+    """True if `cwd` is at/under an excluded dir (PALIVANE_HOOK_EXCLUDE_DIRS) — so developing
+    Palivane itself doesn't flag its own secret fixtures on every tool call."""
+    if not cwd or not exclude:
+        return False
+    try:
+        rp = os.path.realpath(os.path.expanduser(cwd))
+    except OSError:
+        return False
+    return any(rp == d or rp.startswith(d + os.sep) for d in exclude)
+
+
+def main() -> int:
+    if "--send" in sys.argv[1:]:
+        try:
+            job = json.load(sys.stdin)
+            _post(job["endpoint"], job["payload"], job["cfg"])
+        except Exception:
+            pass
+        return 0
+
+    try:
+        event = json.load(sys.stdin)
+    except Exception:
+        return 0
+    if _is_excluded(_event_cwd(event), read_config()["exclude"]):
+        return 0
+    name = event.get("hook_event_name", "")
+
+    if name == "BeforeAgent":
+        endpoint, payload = "/api/ingest/ai-usage", build_ai_usage(event)
+    elif name == "BeforeTool":
+        endpoint, payload = "/api/ingest/mcp", build_activity(event)
+    else:
+        return 0
+    if payload is None:
+        return 0
+
+    cfg = read_config()
+    if not cfg["url"] or not cfg["token"]:
+        return 0  # not connected to Palivane — nothing to report to
+
+    # Prompts are always scanned inline (even in monitor mode): a confirmed secret/PII
+    # leak (force_block) must be stopped before it leaves the device. Tool calls scan
+    # inline only under enforce. No stdout on allow — Gemini treats that as proceed.
+    if name == "BeforeAgent" or cfg["enforce"]:
+        verdict = _post(endpoint, payload, cfg)
+        if should_block(verdict, cfg["enforce"]):
+            print(json.dumps(block_output(name, verdict)))
+        return 0
+
+    _send_detached(endpoint, payload, cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # fail open — never break the developer's session

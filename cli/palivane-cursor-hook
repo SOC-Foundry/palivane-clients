@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""palivane-cursor-hook — Cursor agent-hook adapter: local, pre-execution inspection.
+
+Cursor's model/chat endpoint pins its certificate, so the egress proxy can't read its
+prompts, and Cursor ignores OPENAI_BASE_URL, so the gateway can't be interposed either.
+This hook closes that gap from *inside* Cursor using its Hooks API (Cursor 1.7+): Cursor
+runs it at agent-lifecycle events, passing structured JSON on stdin, and honors a JSON
+verdict on stdout. Because it runs locally, it is immune to the cert pinning.
+
+One script handles every event, dispatched on `hook_event_name`:
+
+  beforeSubmitPrompt   -> the user's prompt (+ attachments)  -> /api/ingest/ai-usage
+                          (shadow-AI / data-loss on what's about to leave — the piece the
+                          proxy can't see because Cursor pins its cert)
+  beforeShellExecution -> shell command                       -> /api/ingest/mcp (tool=shell)
+  beforeMCPExecution   -> MCP tool call (server/tool/args)    -> /api/ingest/mcp
+  beforeReadFile       -> file pulled into context (+content) -> /api/ingest/mcp (resources/read)
+  afterFileEdit        -> written content (secrets/PII)       -> /api/ingest/mcp (monitor-only;
+                          Cursor supports no output for this event)
+
+Monitor by default: tool-surface verdicts are recorded by a detached child and the action
+is allowed with ~zero added latency. Prompts (beforeSubmitPrompt) are the exception: they
+are scanned inline even in monitor mode so a confirmed secret/PII leak (`force_block`) is
+stopped before it leaves — same rule as the egress proxy: block the certain, monitor the
+fuzzy. Set PALIVANE_ENFORCE=true to scan every event synchronously and DENY on a block
+verdict — the reason is surfaced to the user and the agent. Fails open on any error:
+Palivane being down never breaks the developer.
+
+Register in ~/.cursor/hooks.json (user), <project>/.cursor/hooks.json, or the enterprise
+path pushed by MDM (macOS /Library/Application Support/Cursor/hooks.json, Linux
+/etc/cursor/hooks.json, Windows C:\\ProgramData\\Cursor\\hooks.json):
+
+  {"version": 1, "hooks": {
+     "beforeSubmitPrompt":   [{"command": "/usr/local/bin/palivane-cursor-hook"}],
+     "beforeShellExecution": [{"command": "/usr/local/bin/palivane-cursor-hook"}],
+     "beforeMCPExecution":   [{"command": "/usr/local/bin/palivane-cursor-hook"}],
+     "beforeReadFile":       [{"command": "/usr/local/bin/palivane-cursor-hook"}],
+     "afterFileEdit":        [{"command": "/usr/local/bin/palivane-cursor-hook"}]}}
+
+Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key) from the environment, else from
+~/.cursor/palivane.json ({"url","token","enforce"}), else the gateway pair in
+~/.claude/settings.json (if palivane-connect already ran there). Stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+
+# Reported in the User-Agent so the console can inventory client builds per device.
+VERSION = "1.1.0"
+_MAX_ARGS_TEXT = 20000
+
+# Events that expect a permission verdict ({"permission": allow|deny|ask}); the odd ones
+# out are beforeSubmitPrompt (uses {"continue": bool}) and afterFileEdit (no output).
+_PERMISSION_EVENTS = {"beforeShellExecution", "beforeMCPExecution", "beforeReadFile"}
+
+
+def _harvest_strings(obj, out: list[str]) -> None:
+    """Recursively collect string *values* from an arbitrary JSON structure (dict keys
+    ignored) — scans unknown tool-input shapes without a per-tool parser."""
+    if isinstance(obj, str):
+        if len(obj) >= 2:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _harvest_strings(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _harvest_strings(v, out)
+
+
+def _cap(text: str) -> str:
+    return text[:_MAX_ARGS_TEXT]
+
+
+def _server_from_mcp(event: dict) -> str:
+    """Best-effort MCP server id from a beforeMCPExecution payload: the URL host for a
+    remote server, the command's basename for a stdio server, else the tool-name prefix."""
+    url = event.get("url")
+    if isinstance(url, str) and url:
+        host = urllib.parse.urlparse(url).hostname
+        if host:
+            return host
+    cmd = event.get("command")
+    if isinstance(cmd, str) and cmd:
+        first = cmd.split()[0] if cmd.split() else cmd
+        return os.path.basename(first)
+    name = event.get("tool_name", "")
+    if isinstance(name, str) and "_" in name:
+        # e.g. "mcp_github_create_issue" -> "github"
+        parts = name.split("_")
+        return parts[1] if parts[0] == "mcp" and len(parts) > 1 else parts[0]
+    return ""
+
+
+def build_ai_usage(event: dict) -> dict | None:
+    """beforeSubmitPrompt -> ai-usage payload (prompt text + attachment paths)."""
+    prompt = event.get("prompt")
+    parts: list[str] = []
+    if isinstance(prompt, str) and prompt:
+        parts.append(prompt)
+    for att in event.get("attachments") or []:
+        if isinstance(att, dict) and isinstance(att.get("file_path"), str):
+            parts.append(att["file_path"])
+    content = "\n".join(parts).strip()
+    if not content:
+        return None
+    return {"content": _cap(content), "destination": "cursor", "tool": "cursor"}
+
+
+def build_activity(event: dict) -> dict | None:
+    """Map a Cursor tool-surface event onto Palivane's MCP-activity shape
+    (POST /api/ingest/mcp). Returns None for events with no security surface."""
+    name = event.get("hook_event_name", "")
+    activity = {"method": "tools/call", "server": "", "tool": "", "args_text": "",
+                "resource": "", "transport": "stdio"}
+
+    if name == "beforeShellExecution":
+        cmd = event.get("command", "")
+        cwd = event.get("cwd", "")
+        activity["tool"] = "shell"
+        activity["args_text"] = _cap("\n".join(p for p in (cmd, cwd) if isinstance(p, str) and p))
+        return activity if cmd else None
+
+    if name == "beforeMCPExecution":
+        activity["server"] = _server_from_mcp(event)
+        activity["tool"] = event.get("tool_name", "") if isinstance(event.get("tool_name"), str) else ""
+        activity["transport"] = "http" if event.get("url") else "stdio"
+        ti = event.get("tool_input", "")
+        if isinstance(ti, str):
+            activity["args_text"] = _cap(ti)
+        else:
+            harvested: list[str] = []
+            _harvest_strings(ti, harvested)
+            activity["args_text"] = _cap("\n".join(harvested))
+        return activity
+
+    if name == "beforeReadFile":
+        fp = event.get("file_path", "")
+        activity["method"] = "resources/read"
+        activity["resource"] = fp if isinstance(fp, str) else ""
+        # Include the file's content so secrets/PII being pulled into context are scanned.
+        content = event.get("content", "")
+        if isinstance(content, str) and content:
+            activity["args_text"] = _cap(content)
+        return activity if activity["resource"] else None
+
+    if name == "afterFileEdit":
+        fp = event.get("file_path", "")
+        activity["tool"] = "edit"
+        activity["resource"] = fp if isinstance(fp, str) else ""
+        harvested = []
+        for e in event.get("edits") or []:
+            if isinstance(e, dict) and isinstance(e.get("new_string"), str):
+                harvested.append(e["new_string"])
+        activity["args_text"] = _cap("\n".join(harvested))
+        return activity if (harvested or activity["resource"]) else None
+
+    return None
+
+
+def _cursor_config(path: str = "~/.cursor/palivane.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _claude_settings_env(path: str = "~/.claude/settings.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            env = json.load(f).get("env")
+        return env if isinstance(env, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_config() -> dict:
+    """Resolve backend URL/token/mode: environment, then ~/.cursor/palivane.json, then the
+    gateway pair palivane-connect writes to ~/.claude/settings.json (the ak_ token doubles
+    as ingest auth; ANTHROPIC_BASE_URL minus /v1 locates the backend)."""
+    cc = _cursor_config()
+    url = os.getenv("PALIVANE_URL") or cc.get("url", "")
+    token = os.getenv("PALIVANE_TOKEN") or cc.get("token", "")
+    enforce_raw = os.getenv("PALIVANE_ENFORCE")
+    enforce = (enforce_raw if enforce_raw is not None else str(cc.get("enforce", ""))).lower() in ("1", "true", "yes")
+    user = os.getenv("PALIVANE_USER") or cc.get("user", "")
+
+    if not url or not token:
+        senv = _claude_settings_env()
+        if not token:
+            gw = senv.get("ANTHROPIC_AUTH_TOKEN", "")
+            if isinstance(gw, str) and gw.startswith("ak_"):
+                token = gw
+        if not url:
+            base = senv.get("ANTHROPIC_BASE_URL", "")
+            if isinstance(base, str) and base:
+                url = base.rstrip("/")
+                if url.endswith("/v1"):
+                    url = url[: -len("/v1")]
+    try:
+        timeout = float(os.getenv("PALIVANE_HOOK_TIMEOUT", "5"))
+    except ValueError:
+        timeout = 5.0
+    # Directories to NOT inspect (e.g. the Palivane repo, whose fixtures look like real secrets)
+    # — PALIVANE_HOOK_EXCLUDE_DIRS, os.pathsep- or comma-separated, from env or settings.json env.
+    raw_excl = (os.getenv("PALIVANE_HOOK_EXCLUDE_DIRS")
+                or _claude_settings_env().get("PALIVANE_HOOK_EXCLUDE_DIRS", ""))
+    exclude = [os.path.realpath(os.path.expanduser(p)) for p in
+               raw_excl.replace(",", os.pathsep).split(os.pathsep) if p.strip()]
+    return {"url": url, "token": token, "enforce": enforce, "timeout": timeout,
+            "user": user, "exclude": exclude}
+
+
+def _post(endpoint: str, payload: dict, cfg: dict) -> dict:
+    """POST to a Palivane ingest endpoint; fail open (action=allow) on any error."""
+    try:
+        body = dict(payload)
+        body["user"] = cfg.get("user", "")
+        req = urllib.request.Request(
+            cfg["url"].rstrip("/") + endpoint, method="POST",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "User-Agent": f"palivane-cursor-hook/{VERSION}", "X-Palivane-Token": cfg["token"]},
+        )
+        with urllib.request.urlopen(req, timeout=cfg.get("timeout", 5.0)) as r:
+            return json.loads(r.read())
+    except Exception:
+        return {"action": "allow", "reason": "scan-failed"}
+
+
+def should_block(verdict: dict, enforce: bool) -> bool:
+    """Mirror of the proxy's rule: a confirmed secret/PII leak (force_block) is blocked
+    even in monitor mode — block the certain, monitor the fuzzy. Everything else blocks
+    under enforce — local, or the org's stance from the console (Settings → Enforcement),
+    which the server returns on every verdict."""
+    if verdict.get("force_block"):
+        return True
+    return (enforce or bool(verdict.get("enforce"))) and verdict.get("action") == "block"
+
+
+def _reason(verdict: dict) -> str:
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    msg = (f"Blocked by Palivane: {cats or 'policy'} — "
+           f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'high')}.")
+    # Surface the fix inline in the IDE, not just the block (in-editor remediation).
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        msg += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return msg
+
+
+def block_output(event_name: str, verdict: dict) -> dict:
+    """Event-appropriate deny verdict for Cursor."""
+    reason = _reason(verdict)
+    if event_name == "beforeSubmitPrompt":
+        return {"continue": False, "user_message": reason}
+    return {"permission": "deny", "user_message": reason, "agent_message": reason}
+
+
+def allow_output(event_name: str) -> dict | None:
+    """Explicit allow so monitor mode never leaves Cursor guessing. afterFileEdit takes
+    no output."""
+    if event_name == "afterFileEdit":
+        return None
+    if event_name == "beforeSubmitPrompt":
+        return {"continue": True}
+    return {"permission": "allow"}
+
+
+def _send_detached(endpoint: str, payload: dict, cfg: dict) -> None:
+    """Report in a detached child so the hook returns instantly (monitor mode)."""
+    p = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--send"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    p.stdin.write(json.dumps({"endpoint": endpoint, "payload": payload, "cfg": cfg}).encode())
+    p.stdin.close()
+
+
+def _event_cwd(event: dict) -> str:
+    """The working directory this hook event happened in — the event's cwd, its tool_input's
+    cwd, else the hook process's own cwd (the project root the CLI was launched in)."""
+    cwd = event.get("cwd")
+    if not cwd and isinstance(event.get("tool_input"), dict):
+        cwd = event["tool_input"].get("cwd")
+    return cwd or os.getcwd()
+
+
+def _is_excluded(cwd: str, exclude: list) -> bool:
+    """True if `cwd` is at/under an excluded dir (PALIVANE_HOOK_EXCLUDE_DIRS) — so developing
+    Palivane itself doesn't flag its own secret fixtures on every tool call."""
+    if not cwd or not exclude:
+        return False
+    try:
+        rp = os.path.realpath(os.path.expanduser(cwd))
+    except OSError:
+        return False
+    return any(rp == d or rp.startswith(d + os.sep) for d in exclude)
+
+
+def main() -> int:
+    if "--send" in sys.argv[1:]:
+        try:
+            job = json.load(sys.stdin)
+            _post(job["endpoint"], job["payload"], job["cfg"])
+        except Exception:
+            pass
+        return 0
+
+    try:
+        event = json.load(sys.stdin)
+    except Exception:
+        return 0
+    if _is_excluded(_event_cwd(event), read_config()["exclude"]):
+        return 0
+    name = event.get("hook_event_name", "")
+
+    if name == "beforeSubmitPrompt":
+        endpoint, payload = "/api/ingest/ai-usage", build_ai_usage(event)
+    else:
+        payload = build_activity(event)
+        endpoint = "/api/ingest/mcp"
+    if payload is None:
+        return 0
+
+    cfg = read_config()
+    if not cfg["url"] or not cfg["token"]:
+        return 0  # not connected to Palivane — nothing to report to
+
+    # Prompts are always scanned inline (even in monitor mode): a confirmed secret/PII
+    # leak (force_block) must be stopped before it leaves the device. Other events scan
+    # inline only under enforce; afterFileEdit can't be enforced (no output channel).
+    inline = name == "beforeSubmitPrompt" or (cfg["enforce"] and name != "afterFileEdit")
+    if inline:
+        verdict = _post(endpoint, payload, cfg)
+        if should_block(verdict, cfg["enforce"]):
+            print(json.dumps(block_output(name, verdict)))
+            return 0
+        out = allow_output(name)
+        if out is not None:
+            print(json.dumps(out))
+        return 0
+
+    _send_detached(endpoint, payload, cfg)
+    out = allow_output(name)
+    if out is not None:
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # fail open — never break the developer's session

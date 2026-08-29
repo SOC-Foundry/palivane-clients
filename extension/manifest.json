@@ -1,0 +1,135 @@
+{
+  "manifest_version": 3,
+  "name": "Palivane, Shadow-AI Guard",
+  "version": "0.7.0",
+  "description": "Inspects prompts sent to external AI tools for secrets, PII, and proprietary data, and warns or blocks before they leave.",
+  "permissions": [
+    "storage",
+    "identity"
+  ],
+  "storage": {
+    "managed_schema": "managed_schema.json"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "host_permissions": [
+    "https://claude.ai/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://gemini.google.com/*",
+    "https://copilot.microsoft.com/*",
+    "https://m365.cloud.microsoft/*",
+    "https://www.bing.com/*",
+    "https://perplexity.ai/*",
+    "https://www.perplexity.ai/*",
+    "https://chat.mistral.ai/*",
+    "https://chat.deepseek.com/*",
+    "https://grok.com/*",
+    "https://aistudio.google.com/*",
+    "https://poe.com/*",
+    "https://meta.ai/*",
+    "https://www.meta.ai/*",
+    "https://chat.qwen.ai/*",
+    "https://kimi.com/*",
+    "https://www.kimi.com/*",
+    "https://notebooklm.google.com/*",
+    "https://github.com/copilot",
+    "https://github.com/copilot/*",
+    "https://v0.dev/*",
+    "https://bolt.new/*",
+    "https://lovable.dev/*",
+    "https://replit.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Palivane, Shadow-AI Guard",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*",
+        "https://m365.cloud.microsoft/*",
+        "https://www.bing.com/*",
+        "https://perplexity.ai/*",
+        "https://www.perplexity.ai/*",
+        "https://chat.mistral.ai/*",
+        "https://chat.deepseek.com/*",
+        "https://grok.com/*",
+        "https://aistudio.google.com/*",
+        "https://poe.com/*",
+        "https://meta.ai/*",
+        "https://www.meta.ai/*",
+        "https://chat.qwen.ai/*",
+        "https://kimi.com/*",
+        "https://www.kimi.com/*",
+        "https://notebooklm.google.com/*",
+        "https://github.com/copilot",
+        "https://github.com/copilot/*",
+        "https://v0.dev/*",
+        "https://bolt.new/*",
+        "https://lovable.dev/*",
+        "https://replit.com/*"
+      ],
+      "js": [
+        "injected.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*",
+        "https://m365.cloud.microsoft/*",
+        "https://www.bing.com/*",
+        "https://perplexity.ai/*",
+        "https://www.perplexity.ai/*",
+        "https://chat.mistral.ai/*",
+        "https://chat.deepseek.com/*",
+        "https://grok.com/*",
+        "https://aistudio.google.com/*",
+        "https://poe.com/*",
+        "https://meta.ai/*",
+        "https://www.meta.ai/*",
+        "https://chat.qwen.ai/*",
+        "https://kimi.com/*",
+        "https://www.kimi.com/*",
+        "https://notebooklm.google.com/*",
+        "https://github.com/copilot",
+        "https://github.com/copilot/*",
+        "https://v0.dev/*",
+        "https://bolt.new/*",
+        "https://lovable.dev/*",
+        "https://replit.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}

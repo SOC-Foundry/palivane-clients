@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""palivane connect — self-serve Claude Code onboarding.
+
+Signs the user in to their Palivane console (login or SSO) in the browser and wires up
+Palivane's local capture planes for Claude Code — no admin token distribution. Equivalent
+of the browser-extension sign-in, for the terminal.
+
+By default Claude Code KEEPS ITS OWN SIGN-IN (Pro/Max subscription or Console) — Palivane
+observes via hooks only. Pass --route-gateway to additionally reroute Claude Code's API
+traffic through the Palivane gateway; note that switches its billing to the org's provider
+key (API credits), not the user's subscription.
+
+Flow: starts a loopback server, opens <console>/extension-connect pointed at it, the
+console mints a per-user tenant-scoped token after auth and redirects it back, then this
+writes ~/.claude/settings.json (with --route-gateway: ANTHROPIC_BASE_URL -> the Palivane
+gateway, ANTHROPIC_AUTH_TOKEN -> the token; without it, any such entries from a previous
+gateway-routed connect are removed). Also wires the local planes when their sibling scripts are available:
+PALIVANE_URL/PALIVANE_TOKEN in the same env block, PreToolUse + UserPromptSubmit hooks
+(palivane-hook — local pre-execution inspection of tool calls and of the typed prompt,
+which nothing else sees under the default subscription sign-in) and a SessionStart hook
+(palivane-posture — device posture on session start). If Cursor is installed (~/.cursor
+present), it also registers palivane-cursor-hook in ~/.cursor/hooks.json and writes
+~/.cursor/palivane.json — covering Cursor's prompts + tool calls locally despite its cert
+pinning. If Gemini CLI is installed (~/.gemini present), it registers palivane-gemini-hook
+(BeforeAgent + BeforeTool) in ~/.gemini/settings.json and writes ~/.gemini/palivane.json —
+covering Gemini's prompts + tool calls locally regardless of its auth mode. If Codex CLI
+is installed (~/.codex present), it registers palivane-codex-hook (UserPromptSubmit +
+PreToolUse) in ~/.codex/hooks.json and writes ~/.codex/palivane.json — covering Codex's
+prompts + tool calls locally despite ChatGPT-subscription auth ignoring OPENAI_BASE_URL.
+If Copilot CLI is installed (~/.copilot present), it registers palivane-copilot-hook
+(preToolUse + userPromptSubmitted) in ~/.copilot/hooks/palivane.json and writes
+~/.copilot/palivane.json — covering Copilot's tool calls (deniable) and prompts
+(observe-only at this plane) locally. Stdlib only.
+
+    palivane-connect                              # hosted SaaS (app.palivane.io)
+    palivane-connect https://palivane.self-hosted   # or set PALIVANE_URL, for self-hosting
+    palivane-connect --route-gateway              # also route API traffic via the gateway
+"""
+
+from __future__ import annotations
+
+import http.server
+import json
+import os
+import secrets
+import shutil
+import socket
+import socketserver
+import sys
+import urllib.parse
+import urllib.request
+import webbrowser
+
+
+# Hosted Palivane SaaS default: every org shares this URL (the tenant is resolved by who
+# signs in), so `palivane connect` alone just works. Override with an arg or PALIVANE_URL/
+# PALIVANE_URL for a self-hosted deployment. (The legacy app.palivane.io host still
+# serves the API, so already-connected devices keep working until they re-run connect.)
+DEFAULT_URL = "https://app.palivane.io"
+
+
+def _console_url(argv) -> str:
+    positional = [a for a in argv[1:] if not a.startswith("-")]
+    url = (positional[0] if positional else os.environ.get("PALIVANE_URL", "")).strip()
+    if not url:
+        url = DEFAULT_URL
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url.rstrip("/")
+
+
+def _capture_token(console: str) -> dict:
+    state = secrets.token_urlsafe(9)
+    got: dict = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != "/cb":
+                self.send_response(404); self.end_headers(); return
+            q = urllib.parse.parse_qs(parsed.query)
+            got.update({k: v[0] for k, v in q.items()})
+            self.send_response(200)
+            self.send_header("content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<h2>Palivane connected. You can close this tab and return to the terminal.</h2>")
+
+        def log_message(self, *a):  # silence
+            pass
+
+    with socketserver.TCPServer(("127.0.0.1", 0), Handler) as srv:
+        port = srv.server_address[1]
+        redirect = f"http://127.0.0.1:{port}/cb"
+        # device = this machine's hostname, so re-running `palivane connect` here rotates one
+        # capture key instead of minting a fresh row every time (console dedups on it).
+        device = socket.gethostname() or "cli"
+        url = (f"{console}/extension-connect"
+               f"?redirect_uri={urllib.parse.quote(redirect, safe='')}&state={state}"
+               f"&device={urllib.parse.quote(device, safe='')}")
+        print("Opening your browser to sign in…")
+        print(f"  If it doesn't open, visit:\n  {url}\n")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        srv.handle_request()  # serve exactly the callback
+
+    if got.get("state") != state:
+        sys.exit("Sign-in failed: state mismatch (possible tampering).")
+    if not got.get("token"):
+        sys.exit("Sign-in failed: no token returned.")
+    return got
+
+
+def _resolve_script(name: str) -> str | None:
+    """Locate a sibling Palivane script: on PATH, else next to this file."""
+    found = shutil.which(name)
+    if found:
+        return found
+    sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    return sibling if os.path.exists(sibling) else None
+
+
+# Canonical install dir (install.sh drops the CLI here and puts it on PATH).
+_MANAGED_BIN = os.path.expanduser("~/.palivane/bin")
+# Capture-plane scripts palivane-connect is responsible for. Refreshed from the console on
+# every connect so a re-run upgrades plane code (e.g. the auth circuit breaker) in place,
+# without a full reinstall. palivane-connect itself and palivane-desktop are excluded on
+# purpose — we don't overwrite the running tool or the proxy manager mid-run.
+_PLANE_SCRIPTS = ["palivane-hook", "palivane-posture", "palivane-cursor-hook",
+                  "palivane-gemini-hook", "palivane-codex-hook", "palivane-copilot-hook",
+                  "palivane-mcp", "palivane-secrets"]
+
+
+def _in_repo_checkout() -> bool:
+    """Running from a source checkout (…/cli/palivane-connect with a .git alongside)? Then the
+    sibling scripts are the source of truth — don't fetch published copies over them."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.isdir(os.path.join(os.path.dirname(here), ".git"))
+
+
+def _download_script(url: str, dest: str) -> None:
+    """Fetch one script and write it atomically (tmp + rename) so a partial download never
+    leaves a half-written, executable plane on disk."""
+    req = urllib.request.Request(url, headers={"User-Agent": "palivane-connect/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = r.read()
+    if not data:
+        raise ValueError("empty script")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, dest)
+
+
+def _refresh_planes(console: str) -> list[str]:
+    """Upgrade the installed capture-plane scripts to the console's current versions so a
+    re-run of `palivane connect` picks up new plane code. Best-effort: on any failure we keep
+    whatever is already installed. Skipped for source checkouts and with --no-update."""
+    if "--no-update" in sys.argv[1:] or os.getenv("PALIVANE_NO_SELF_UPDATE"):
+        return []
+    if _in_repo_checkout():
+        return ["skipped plane self-update (running from a source checkout)"]
+    base = console.rstrip("/")
+    updated, failed = [], []
+    for name in _PLANE_SCRIPTS:
+        try:
+            _download_script(f"{base}/cli/{name}", os.path.join(_MANAGED_BIN, name))
+            updated.append(name)
+        except Exception:
+            failed.append(name)
+    # The egress-proxy addon lives outside bin and only when the proxy is installed — refresh
+    # it in place too (so the proxy gets the breaker), but never create it here.
+    addon = os.path.expanduser("~/.palivane/palivane_addon.py")
+    if os.path.exists(addon):
+        try:
+            _download_script(f"{base}/cli/palivane_addon.py", addon)
+            updated.append("palivane_addon.py")
+        except Exception:
+            failed.append("palivane_addon.py")
+    msgs = []
+    if updated:
+        msgs.append(f"updated {len(updated)} capture-plane script(s) to the latest version")
+    if failed:
+        msgs.append(f"could not update {', '.join(failed)} (kept existing) — see {base}/cli/")
+    return msgs
+
+
+def _merge_hook(data: dict, event: str, command: str, timeout: int | None = None) -> bool:
+    """Add a hook entry for `event` unless one already runs the same script
+    (idempotent across re-runs; a moved script path is treated as already installed)."""
+    script = os.path.basename(command.split()[0])
+    hooks = data.setdefault("hooks", {})
+    entries = hooks.setdefault(event, [])
+    for entry in entries:
+        for h in entry.get("hooks", []) if isinstance(entry, dict) else []:
+            if isinstance(h, dict) and script in str(h.get("command", "")):
+                return False
+    hook: dict = {"type": "command", "command": command}
+    if timeout is not None:
+        hook["timeout"] = timeout
+    entries.append({"matcher": "*", "hooks": [hook]})
+    return True
+
+
+def _write_claude_code(token: str, backend: str, user: str,
+                       route_gateway: bool = False,
+                       enforce: bool | None = None) -> tuple[str, list[str]]:
+    path = os.path.expanduser("~/.claude/settings.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {}
+    if os.path.exists(path):
+        try:
+            data = json.load(open(path))
+        except (ValueError, OSError):
+            data = {}
+    env = data.setdefault("env", {})
+    cleaned = False
+    if route_gateway:
+        # No /v1 suffix — the Anthropic SDK appends /v1/messages itself; {backend}/v1
+        # would resolve to {backend}/v1/v1/messages and 405.
+        env["ANTHROPIC_BASE_URL"] = backend.rstrip("/")
+        env["ANTHROPIC_AUTH_TOKEN"] = token
+    elif env.get("ANTHROPIC_BASE_URL", "").rstrip("/") == backend.rstrip("/"):
+        # A previous connect routed this install through the gateway; undo it so
+        # Claude Code goes back to its own sign-in (subscription or API account).
+        # Only touched when the base URL is OUR gateway — an unrelated custom
+        # ANTHROPIC_BASE_URL the user set themselves is left alone.
+        env.pop("ANTHROPIC_BASE_URL", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        cleaned = True
+    # Palivane's own names — the hook/posture scripts read these; installed even when the
+    # gateway routing above is skipped (org has no model key yet), so the local capture
+    # planes work either way.
+    env["PALIVANE_URL"] = backend.rstrip("/")
+    env["PALIVANE_TOKEN"] = token
+    # Org enforce stance from the console (Settings → Enforcement) — written explicitly
+    # both ways so a reconnect after the org flips the setting updates the device too.
+    # None = older console that didn't send it: leave whatever is there alone.
+    if enforce is not None:
+        env["PALIVANE_ENFORCE"] = "true" if enforce else "false"
+
+    installed: list[str] = []
+    if cleaned:
+        installed.append("removed gateway routing from a previous connect — "
+                         "Claude Code will use its own sign-in again")
+    hook = _resolve_script("palivane-hook")
+    if hook:
+        if _merge_hook(data, "PreToolUse", hook, timeout=10):
+            installed.append("PreToolUse hook (palivane-hook — tool-call inspection)")
+        # Prompt-level coverage: under the default subscription sign-in nothing else
+        # (gateway or proxy) sees the typed prompt — this hook does, before it leaves.
+        if _merge_hook(data, "UserPromptSubmit", hook, timeout=10):
+            installed.append("UserPromptSubmit hook (palivane-hook — prompt data-loss)")
+    else:
+        installed.append("palivane-hook not found — skipped tool-call + prompt hooks")
+    posture = _resolve_script("palivane-posture")
+    if posture:
+        if _merge_hook(data, "SessionStart", f"{posture} --async --quiet"):
+            installed.append("SessionStart hook (palivane-posture — device posture)")
+    else:
+        installed.append("palivane-posture not found — skipped posture hook")
+
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(path, 0o600)
+    return path, installed
+
+
+# Cursor agent-hook events palivane-cursor-hook handles (prompt data-loss + tool calls).
+_CURSOR_EVENTS = ["beforeSubmitPrompt", "beforeShellExecution", "beforeMCPExecution",
+                  "beforeReadFile", "afterFileEdit"]
+
+
+def _merge_cursor_hook(data: dict, event: str, command: str) -> bool:
+    """Add a Cursor hook entry for `event` unless one already runs the same script.
+    Cursor's hooks.json uses a flatter entry shape than Claude Code's: {"command": ...}."""
+    script = os.path.basename(command.split()[0])
+    entries = data.setdefault("hooks", {}).setdefault(event, [])
+    for entry in entries:
+        if isinstance(entry, dict) and script in str(entry.get("command", "")):
+            return False
+    entries.append({"command": command})
+    return True
+
+
+def _write_cursor(token: str, backend: str, user: str,
+                  enforce: bool | None = None) -> tuple[str, list[str]] | None:
+    """Wire palivane-cursor-hook into ~/.cursor/hooks.json + write the creds file it reads.
+    Only when Cursor is actually installed (~/.cursor exists) and the hook is available —
+    Cursor's chat pins its cert, so this local hook is how Palivane sees it."""
+    hook = _resolve_script("palivane-cursor-hook")
+    cdir = os.path.expanduser("~/.cursor")
+    if not hook:
+        return None
+    if not os.path.isdir(cdir):
+        return None, ["Cursor not detected (~/.cursor absent) — skipped Cursor hooks"]
+
+    # Cursor doesn't pass env to hook processes, so the hook reads creds from this file.
+    wj = os.path.join(cdir, "palivane.json")
+    creds = {"url": backend.rstrip("/"), "token": token, "user": user}
+    if enforce is not None:   # org stance from the console; absent on older consoles
+        creds["enforce"] = enforce
+    with open(wj, "w") as f:
+        json.dump(creds, f, indent=2)
+    os.chmod(wj, 0o600)
+
+    hpath = os.path.join(cdir, "hooks.json")
+    data = {}
+    if os.path.exists(hpath):
+        try:
+            data = json.load(open(hpath))
+        except (ValueError, OSError):
+            data = {}
+    if not isinstance(data.get("version"), int):
+        data["version"] = 1
+    added = sum(1 for ev in _CURSOR_EVENTS if _merge_cursor_hook(data, ev, hook))
+    with open(hpath, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(hpath, 0o600)
+    msg = f"Cursor hooks installed ({added} event{'s' if added != 1 else ''})" if added \
+        else "Cursor hooks already present"
+    return hpath, [msg]
+
+
+# Codex CLI hook events palivane-codex-hook handles (prompt data-loss + tool calls).
+# Codex's hooks.json mirrors Claude Code's shape; PreToolUse takes a regex matcher.
+_CODEX_EVENTS = [("UserPromptSubmit", None), ("PreToolUse", ".*")]
+
+
+def _merge_codex_hook(data: dict, event: str, matcher: str | None, command: str) -> bool:
+    """Add a Codex hook entry for `event` unless one already runs the same script."""
+    script = os.path.basename(command.split()[0])
+    entries = data.setdefault("hooks", {}).setdefault(event, [])
+    for entry in entries:
+        for h in entry.get("hooks", []) if isinstance(entry, dict) else []:
+            if isinstance(h, dict) and script in str(h.get("command", "")):
+                return False
+    entry: dict = {}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    entry["hooks"] = [{"type": "command", "command": command, "timeout": 10}]
+    entries.append(entry)
+    return True
+
+
+def _write_codex(token: str, backend: str, user: str,
+                 enforce: bool | None = None) -> tuple[str, list[str]] | None:
+    """Wire palivane-codex-hook into ~/.codex/hooks.json + write the creds file it reads.
+    Only when Codex CLI is actually installed (~/.codex exists) and the hook is available
+    — under ChatGPT-subscription auth Codex ignores OPENAI_BASE_URL, so this local hook
+    is how Palivane sees it. User-level Codex hooks need a one-time trust approval."""
+    hook = _resolve_script("palivane-codex-hook")
+    cdir = os.path.expanduser("~/.codex")
+    if not hook:
+        return None
+    if not os.path.isdir(cdir):
+        return None, ["Codex CLI not detected (~/.codex absent) — skipped Codex hooks"]
+
+    # The hook reads creds from this file so it works however Codex is launched.
+    wj = os.path.join(cdir, "palivane.json")
+    creds = {"url": backend.rstrip("/"), "token": token, "user": user}
+    if enforce is not None:   # org stance from the console; absent on older consoles
+        creds["enforce"] = enforce
+    with open(wj, "w") as f:
+        json.dump(creds, f, indent=2)
+    os.chmod(wj, 0o600)
+
+    hpath = os.path.join(cdir, "hooks.json")
+    data = {}
+    if os.path.exists(hpath):
+        try:
+            data = json.load(open(hpath))
+        except (ValueError, OSError):
+            data = {}
+    added = sum(1 for ev, m in _CODEX_EVENTS if _merge_codex_hook(data, ev, m, hook))
+    with open(hpath, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(hpath, 0o600)
+    if added:
+        msgs = [f"Codex CLI hooks installed ({added} event{'s' if added != 1 else ''})",
+                "note: Codex asks you to trust the hook once — run /hooks inside Codex"]
+    else:
+        msgs = ["Codex CLI hooks already present"]
+    return hpath, msgs
+
+
+# Copilot hook events palivane-copilot-hook handles. Copilot loads every *.json in
+# ~/.copilot/hooks/, so Palivane owns one whole file there (no merging with user hooks).
+# preToolUse is the only deniable event; userPromptSubmitted is observe-only.
+_COPILOT_EVENTS = ["preToolUse", "userPromptSubmitted"]
+
+
+def copilot_hook_config(command: str) -> dict:
+    """The full content of ~/.copilot/hooks/palivane.json — Copilot's schema: version: 1,
+    lowerCamelCase events, a `bash` command string, per-hook timeoutSec."""
+    entry = {"type": "command", "bash": command, "timeoutSec": 10}
+    return {"version": 1, "hooks": {ev: [dict(entry)] for ev in _COPILOT_EVENTS}}
+
+
+def _write_copilot(token: str, backend: str, user: str,
+                   enforce: bool | None = None) -> tuple[str, list[str]] | None:
+    """Wire palivane-copilot-hook into ~/.copilot/hooks/palivane.json + write the creds file
+    it reads. Only when Copilot CLI is actually installed (~/.copilot exists) and the
+    hook is available — Copilot has no base-URL override, so this local hook is how
+    Palivane sees its tool calls. The same script also serves repo-level .github/hooks
+    (VS Code agent mode + the cloud coding agent) via the MDM policy pack."""
+    hook = _resolve_script("palivane-copilot-hook")
+    cdir = os.path.expanduser("~/.copilot")
+    if not hook:
+        return None
+    if not os.path.isdir(cdir):
+        return None, ["Copilot CLI not detected (~/.copilot absent) — skipped Copilot hooks"]
+
+    # The hook reads creds from this file so it works however Copilot is launched.
+    wj = os.path.join(cdir, "palivane.json")
+    creds = {"url": backend.rstrip("/"), "token": token, "user": user}
+    if enforce is not None:   # org stance from the console; absent on older consoles
+        creds["enforce"] = enforce
+    with open(wj, "w") as f:
+        json.dump(creds, f, indent=2)
+    os.chmod(wj, 0o600)
+
+    hpath = os.path.join(cdir, "hooks", "palivane.json")
+    desired = copilot_hook_config(hook)
+    current = None
+    if os.path.exists(hpath):
+        try:
+            current = json.load(open(hpath))
+        except (ValueError, OSError):
+            current = None
+    if current == desired:
+        return hpath, ["Copilot hooks already present"]
+    os.makedirs(os.path.dirname(hpath), exist_ok=True)
+    with open(hpath, "w") as f:
+        json.dump(desired, f, indent=2)
+    os.chmod(hpath, 0o600)
+    return hpath, [f"Copilot hooks installed ({len(_COPILOT_EVENTS)} events; "
+                   "tool calls deniable, prompts observe-only)"]
+
+
+# Gemini CLI hook events palivane-gemini-hook handles (prompt data-loss + tool calls).
+# Entry shape mirrors Claude Code's but hook objects carry a name and ms timeouts.
+_GEMINI_EVENTS = [("BeforeAgent", None), ("BeforeTool", ".*")]
+
+
+def _merge_gemini_hook(data: dict, event: str, matcher: str | None, command: str) -> bool:
+    """Add a Gemini CLI hook entry for `event` unless one already runs the same script."""
+    script = os.path.basename(command.split()[0])
+    entries = data.setdefault("hooks", {}).setdefault(event, [])
+    for entry in entries:
+        for h in entry.get("hooks", []) if isinstance(entry, dict) else []:
+            if isinstance(h, dict) and script in str(h.get("command", "")):
+                return False
+    entry: dict = {}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    entry["hooks"] = [{"name": "palivane", "type": "command", "command": command,
+                       "timeout": 10000}]
+    entries.append(entry)
+    return True
+
+
+def _write_gemini(token: str, backend: str, user: str,
+                  enforce: bool | None = None) -> tuple[str, list[str]] | None:
+    """Wire palivane-gemini-hook into ~/.gemini/settings.json + write the creds file it
+    reads. Only when Gemini CLI is actually installed (~/.gemini exists) and the hook is
+    available — Gemini's endpoint varies by auth mode and the default Google login
+    ignores base-URL overrides, so this local hook is how Palivane sees it."""
+    hook = _resolve_script("palivane-gemini-hook")
+    gdir = os.path.expanduser("~/.gemini")
+    if not hook:
+        return None
+    if not os.path.isdir(gdir):
+        return None, ["Gemini CLI not detected (~/.gemini absent) — skipped Gemini hooks"]
+
+    # The hook reads creds from this file so it works however Gemini CLI is launched.
+    wj = os.path.join(gdir, "palivane.json")
+    creds = {"url": backend.rstrip("/"), "token": token, "user": user}
+    if enforce is not None:   # org stance from the console; absent on older consoles
+        creds["enforce"] = enforce
+    with open(wj, "w") as f:
+        json.dump(creds, f, indent=2)
+    os.chmod(wj, 0o600)
+
+    spath = os.path.join(gdir, "settings.json")
+    data = {}
+    if os.path.exists(spath):
+        try:
+            data = json.load(open(spath))
+        except (ValueError, OSError):
+            data = {}
+    added = sum(1 for ev, m in _GEMINI_EVENTS if _merge_gemini_hook(data, ev, m, hook))
+    with open(spath, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(spath, 0o600)
+    msg = f"Gemini CLI hooks installed ({added} event{'s' if added != 1 else ''})" if added \
+        else "Gemini CLI hooks already present"
+    return spath, [msg]
+
+
+def _upstream_warning(got: dict, console: str) -> str | None:
+    """A 'your org has no provider key yet' note. The console sends upstream=0/1 with the
+    token when it knows whether the gateway can forward Claude Code's calls to a real
+    model; absent (older console) means unknown — stay quiet. On 0 we SKIP the gateway
+    rerouting (Claude Code keeps its own auth/billing) rather than break it with stubs."""
+    if got.get("upstream") != "0":
+        return None
+    return ("⚠ Gateway routing skipped: your org hasn't set a model provider key yet\n"
+            "  (routing without one would answer Claude Code with inspection stubs).\n"
+            "  Claude Code keeps working with its own account; the local capture planes\n"
+            "  (hooks + posture) are active either way.\n"
+            f"  To route through the gateway: an admin adds your Anthropic API key at\n"
+            f"  {console} under Settings → Gateway upstreams, then re-run palivane-connect.")
+
+
+# Hook commands that invoke one of these are Palivane's — used to strip them on --uninstall.
+_PALIVANE_SCRIPT_MARKERS = ("palivane-hook", "palivane-posture", "palivane-cursor-hook",
+                          "palivane-gemini-hook", "palivane-codex-hook", "palivane-copilot-hook")
+
+
+
+def _scrub_hook_entries(hooks: dict, markers: tuple = _PALIVANE_SCRIPT_MARKERS) -> int:
+    """Remove Palivane hook entries from a {event: [entry, …]} map, leaving the user's own
+    hooks untouched. Handles both the Claude-Code/Codex shape ({matcher, hooks:[{command}]})
+    and the flat Cursor shape ({command}); prunes any event left empty. Returns the count."""
+    removed = 0
+    for event in list(hooks.keys()):
+        entries = hooks.get(event)
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for entry in entries:
+            cmds = []
+            if isinstance(entry, dict):
+                if "command" in entry:
+                    cmds.append(str(entry.get("command", "")))
+                inner = entry.get("hooks")
+                if isinstance(inner, list):
+                    cmds += [str(h.get("command", "")) for h in inner if isinstance(h, dict)]
+            if any(m in " ".join(cmds) for m in markers):
+                removed += 1
+            else:
+                kept.append(entry)
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+    return removed
+
+
+
+def _uninstall() -> list[str]:
+    """Reverse what `palivane connect` wrote on this machine: strip the Palivane hooks + env
+    from Claude Code, and the hooks + creds from Cursor / Gemini / Codex. Leaves the CLI in
+    ~/.palivane/bin and the egress proxy alone — those are removed separately (see the printed
+    note). Best-effort and idempotent: missing files are simply skipped."""
+    out: list[str] = []
+    claude = os.path.expanduser("~/.claude/settings.json")
+    if os.path.exists(claude):
+        try:
+            data = json.load(open(claude))
+        except (ValueError, OSError):
+            data = {}
+        n = _scrub_hook_entries(data["hooks"]) if isinstance(data.get("hooks"), dict) else 0
+        if isinstance(data.get("hooks"), dict) and not data["hooks"]:
+            data.pop("hooks", None)
+        env = data.get("env")
+        if isinstance(env, dict):
+            tok = env.get("PALIVANE_TOKEN")
+            # Undo gateway routing only if it's ours (auth token == our capture key).
+            if tok and env.get("ANTHROPIC_AUTH_TOKEN") == tok:
+                env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                env.pop("ANTHROPIC_BASE_URL", None)
+            for k in ("PALIVANE_URL", "PALIVANE_TOKEN", "PALIVANE_ENFORCE", "PALIVANE_USER"):
+                env.pop(k, None)
+            if not env:
+                data.pop("env", None)
+        with open(claude, "w") as f:
+            json.dump(data, f, indent=2)
+        out.append(f"Claude Code: removed {n} hook(s) + Palivane env — {claude}")
+    for label, hrel, wrel in (("Cursor", "~/.cursor/hooks.json", "~/.cursor/palivane.json"),
+                              ("Gemini CLI", "~/.gemini/settings.json", "~/.gemini/palivane.json"),
+                              ("Codex CLI", "~/.codex/hooks.json", "~/.codex/palivane.json")):
+        hpath = os.path.expanduser(hrel)
+        if os.path.exists(hpath):
+            try:
+                d = json.load(open(hpath))
+            except (ValueError, OSError):
+                d = {}
+            n = _scrub_hook_entries(d["hooks"]) if isinstance(d.get("hooks"), dict) else 0
+            with open(hpath, "w") as f:
+                json.dump(d, f, indent=2)
+            out.append(f"{label}: removed {n} hook(s) — {hpath}")
+        wpath = os.path.expanduser(wrel)
+        if os.path.exists(wpath):
+            os.remove(wpath)
+            out.append(f"{label}: removed creds — {wpath}")
+    # Copilot owns a whole hook file (Copilot loads every *.json in ~/.copilot/hooks/),
+    # so uninstall is deletion, not scrubbing.
+    for label, path in (("Copilot", "~/.copilot/hooks/palivane.json"),
+                        ("Copilot", "~/.copilot/palivane.json")):
+        p = os.path.expanduser(path)
+        if os.path.exists(p):
+            os.remove(p)
+            what = "hook file" if "hooks" in path else "creds"
+            out.append(f"{label}: removed {what} — {p}")
+    return out
+
+
+def main() -> None:
+    if "--uninstall" in sys.argv[1:]:
+        items = _uninstall()
+        print("✓ Palivane disconnected from this machine")
+        for it in items:
+            print(f"  {it}")
+        if not items:
+            print("  (nothing to remove — no Palivane hooks found)")
+        print("  next: 'palivane-desktop uninstall' removes the egress proxy + CA + CLI shims,")
+        print("        then 'rm -rf ~/.palivane' and drop the ~/.palivane/bin line from your shell rc.")
+        return
+    want_gateway = "--route-gateway" in sys.argv[1:]
+    console = _console_url(sys.argv)
+    got = _capture_token(console)
+    backend = got.get("backend") or console
+    # Gateway rerouting is opt-in: it moves Claude Code's billing to the org's provider
+    # key. Without the flag, Claude Code keeps its own sign-in (Pro/Max subscription or
+    # API account) and Palivane observes via the local hooks. Even with the flag, skip when
+    # the console says the org has no upstream key (upstream == "0") — routing would only
+    # return inspection stubs.
+    route_gateway = want_gateway and got.get("upstream") != "0"
+    # Org enforce stance for the local planes (console Settings → Enforcement). Sent as
+    # enforce=0/1 with the token; absent (older console) = leave device config unchanged.
+    enforce = {"1": True, "0": False}.get(got.get("enforce", ""))
+    # Upgrade the installed plane scripts first, so the hooks we (re)register below point at
+    # current code (e.g. the auth circuit breaker) rather than a stale install.
+    plane_updates = _refresh_planes(console)
+    path, installed = _write_claude_code(got["token"], backend, got.get("user", ""),
+                                         route_gateway=route_gateway, enforce=enforce)
+    who = got.get("user") or "you"
+    print(f"✓ Claude Code connected as {who}")
+    for item in plane_updates:
+        print(f"  {item}")
+    if route_gateway:
+        print(f"  routed through the Palivane gateway: {backend.rstrip('/')}/v1")
+        print("  note: API calls now bill the org's provider key, not personal Pro/Max plans")
+    else:
+        print("  Claude Code keeps its own sign-in (Pro/Max subscription or API account)")
+    for item in installed:
+        print(f"  {item}")
+    print(f"  wrote {path}")
+    if want_gateway:
+        warning = _upstream_warning(got, console)
+        if warning:
+            print(warning)
+
+    if enforce is not None:
+        print(f"  org enforcement: {'ON — high-risk verdicts block' if enforce else 'monitor (confirmed secret/PII leaks still block)'}")
+
+    for extra in (_write_cursor(got["token"], backend, got.get("user", ""), enforce=enforce),
+                  _write_gemini(got["token"], backend, got.get("user", ""), enforce=enforce),
+                  _write_codex(got["token"], backend, got.get("user", ""), enforce=enforce),
+                  _write_copilot(got["token"], backend, got.get("user", ""), enforce=enforce)):
+        if extra:
+            epath, eitems = extra
+            for item in eitems:
+                print(f"  {item}")
+            if epath:
+                print(f"  wrote {epath}")
+    print("  Start (or restart) Claude Code / Cursor / Gemini / Codex / Copilot to apply.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Palivane GitHub scan plane — sweep whole GitHub repos (or entire orgs/users) for secrets & PII.
+
+Reads repositories over the GitHub API and detects HERE, on the machine running the scan,
+then reports only what it found to `POST /api/scan/code`: category, label, line number, and
+a masked preview. Your source never reaches Palivane. This used to POST every text blob of
+every repo — an `--org` sweep uploaded an entire private codebase for the privilege of being
+told it held a key, which is the opposite of what this product is for. Detection is shared
+with palivane-secrets and palivane-s3-scan (palivane_detect.py) so the three cannot drift.
+
+Nothing is written back to GitHub — this is a read-only audit. Stdlib only.
+
+Config (env):
+  PALIVANE_URL     Palivane backend base URL                    (or --url)
+  PALIVANE_TOKEN   a per-tenant API key (ak_…)                 (env only, never a CLI flag)
+  GITHUB_TOKEN   a GitHub PAT for the API                    (env only)
+
+Usage:
+  palivane-github-scan --org acme                     # every repo in an org
+  palivane-github-scan --user octocat                 # every repo for a user
+  palivane-github-scan --repo acme/api --repo acme/web # explicit repos (repeatable)
+  palivane-github-scan --org acme --include-archived  # also scan archived/fork repos
+  palivane-github-scan --org acme --github-api https://ghe.corp/api/v3  # GitHub Enterprise
+
+Exit codes: 0 = clean/allowed, 1 = a blocking finding. A GitHub or backend error fails OPEN
+(exit 0) unless --fail-closed is given. A GitHub rate-limit stops the scan (fail-closed => 1).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+MAX_CONTENT = 200_000        # cap on how much of one blob we scan locally
+BATCH = 200                  # files per /api/scan/code request — findings-only, so a batch
+                             # is now metadata and can be far larger than the old 50 blobs
+GITHUB_API = "https://api.github.com"
+
+# scan_blob's third answer. "Clean" and "could not read this as text" are both "nothing to
+# report", but only the first means a file was actually scanned, and the summary line has to
+# tell the truth about which happened.
+UNREADABLE = object()
+
+
+# Detection is shared with palivane-secrets and palivane-s3-scan and lives beside this
+# script. The CLIs are downloaded individually, so fall back to fetching it from the same
+# deployment this scanner reports to rather than failing with an ImportError.
+def _load_detect():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "palivane_detect.py")
+    if not os.path.exists(path):
+        base = (os.environ.get("PALIVANE_URL") or "").rstrip("/")
+        if not base:
+            sys.exit("palivane_detect.py not found next to this script and PALIVANE_URL "
+                     "is unset, so it cannot be fetched. Download it from "
+                     "<your-palivane-url>/cli/palivane_detect.py into the same directory.")
+        try:
+            with urllib.request.urlopen(base + "/cli/palivane_detect.py", timeout=20) as r:
+                body = r.read()
+            path = os.path.join(tempfile.gettempdir(), "palivane_detect.py")
+            with open(path, "wb") as fh:
+                fh.write(body)
+        except Exception as e:                                    # noqa: BLE001
+            sys.exit(f"could not fetch palivane_detect.py from {base}: {e}")
+    spec = importlib.util.spec_from_file_location("palivane_detect", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+detect = _load_detect()
+
+# Obvious-binary paths we never fetch (the content scan can't read them anyway). The tree
+# already gives us sizes; this trims the blob-fetch fan-out before we spend an API call.
+_BINARY_EXTS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg", ".pdf",
+    ".zip", ".gz", ".tar", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi",
+    ".so", ".dylib", ".dll", ".class", ".wasm", ".o", ".a", ".bin", ".exe",
+    ".pyc", ".lock",
+)
+
+
+def _is_binary_path(path: str) -> bool:
+    return path.lower().endswith(_BINARY_EXTS)
+
+
+def _gh_request(path: str, token: str, api: str) -> tuple[dict | list, dict]:
+    """One GitHub API GET. `path` may be a full URL (pagination `next`) or an api-relative
+    path. Returns (parsed-json, response-headers). Raises urllib.error.HTTPError on non-2xx."""
+    url = path if path.startswith("http") else api.rstrip("/") + path
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "palivane-github-scan/1.0",
+    })
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read()), dict(r.headers)
+
+
+def _gh_get(path: str, token: str, api: str) -> dict | list:
+    """JSON body of a single GitHub GET (no pagination). See _gh_paged for list endpoints."""
+    body, _ = _gh_request(path, token, api)
+    return body
+
+
+def _next_link(link_header: str) -> str | None:
+    """Extract the rel="next" URL from a GitHub Link header, if present."""
+    for part in link_header.split(","):
+        seg = part.split(";")
+        if len(seg) >= 2 and 'rel="next"' in seg[1] and "<" in seg[0]:
+            return seg[0].strip().strip("<>")
+    return None
+
+
+def _gh_paged(path: str, token: str, api: str) -> list:
+    """Follow Link rel="next" and concatenate every page of a list endpoint."""
+    out: list = []
+    url = path
+    while url:
+        body, headers = _gh_request(url, token, api)
+        if isinstance(body, list):
+            out.extend(body)
+        url = _next_link(headers.get("Link", ""))
+    return out
+
+
+def _is_ratelimited(e: urllib.error.HTTPError) -> bool:
+    """A 403 with X-RateLimit-Remaining: 0 is the abuse/rate-limit stop signal."""
+    return e.code == 403 and str(e.headers.get("X-RateLimit-Remaining", "")).strip() == "0"
+
+
+def enumerate_repos(args, token: str, api: str) -> list[dict]:
+    """Repos to scan: --org / --user list endpoints (paginated) + each explicit --repo. Skips
+    archived and fork repos unless --include-archived."""
+    repos: list[dict] = []
+    if args.org:
+        repos += _gh_paged(f"/orgs/{args.org}/repos?per_page=100", token, api)
+    if args.user:
+        repos += _gh_paged(f"/users/{args.user}/repos?per_page=100", token, api)
+    for full in args.repo or []:
+        owner, _, name = full.partition("/")
+        if owner and name:
+            r = _gh_get(f"/repos/{owner}/{name}", token, api)
+            if isinstance(r, dict):
+                repos.append(r)
+    if not args.include_archived:
+        repos = [r for r in repos if not r.get("archived") and not r.get("fork")]
+    return repos
+
+
+def repo_blobs(repo: dict, args, token: str, api: str) -> list[dict]:
+    """Tree entries worth scanning for one repo: type==blob, size <= --max-file-bytes, not an
+    obvious-binary path. Each item carries the blob sha + path for the later blob fetch."""
+    owner = (repo.get("owner") or {}).get("login", "")
+    name = repo.get("name", "")
+    branch = args.branch or repo.get("default_branch") or "HEAD"
+    tree = _gh_get(f"/repos/{owner}/{name}/git/trees/{branch}?recursive=1", token, api)
+    entries = tree.get("tree", []) if isinstance(tree, dict) else []
+    kept = []
+    for e in entries:
+        if e.get("type") != "blob":
+            continue
+        if int(e.get("size", 0) or 0) > args.max_file_bytes:
+            continue
+        path = e.get("path", "")
+        if _is_binary_path(path):
+            continue
+        kept.append({"owner": owner, "repo": name, "branch": branch,
+                     "path": path, "sha": e.get("sha", "")})
+    return kept
+
+
+def scan_blob(item: dict, token: str, api: str) -> dict | None:
+    """Fetch a blob, decode it, and scan it locally. Returns the file's findings labelled
+    owner/repo@branch:path, None if it scanned clean (a clean file is not reported at all —
+    "we looked and found nothing" needs no evidence sent anywhere), or UNREADABLE if it
+    could not be decoded as text.
+
+    The blob's text is read into memory here and dropped here. It is never returned to the
+    caller, so there is no path by which it reaches the request body."""
+    blob = _gh_get(f"/repos/{item['owner']}/{item['repo']}/git/blobs/{item['sha']}", token, api)
+    if not isinstance(blob, dict) or blob.get("encoding") != "base64":
+        return UNREADABLE
+    try:
+        raw = base64.b64decode(blob.get("content", ""))
+        text = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return UNREADABLE    # binary — skip
+    found = detect.scan_all(text[:MAX_CONTENT])
+    if not found:
+        return None
+    label = f"{item['owner']}/{item['repo']}@{item['branch']}:{item['path']}"
+    return {"path": label, "findings": [{"category": c, "label": lbl, "line": ln, "masked": mk}
+                                        for c, lbl, ln, mk in found]}
+
+
+def scan_batch(url: str, token: str, files: list[dict], record: bool) -> dict:
+    """POST a batch of findings to the Palivane backend. Raises on HTTP/network error."""
+    payload = json.dumps({"files": files, "record": record}).encode()
+    req = urllib.request.Request(
+        url.rstrip("/") + "/api/scan/code", data=payload, method="POST",
+        headers={"content-type": "application/json", "X-Palivane-Token": token},
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def _print_flagged(flagged: list[dict]) -> bool:
+    """Print each flagged file; return True if any is a block-level finding."""
+    blocking = False
+    for f in flagged:
+        mark = "🔴 BLOCK" if f["action"] == "block" else "🟠 WARN "
+        cats = ", ".join(dict.fromkeys(s["category"] for s in f.get("signals", [])))
+        print(f"    {mark}  {f['path']}  [{cats}]")
+        if f["action"] == "block":
+            blocking = True
+    return blocking
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Scan whole GitHub repos/orgs for secrets & PII via Palivane.")
+    ap.add_argument("--org", help="scan every repo in this GitHub org")
+    ap.add_argument("--user", help="scan every repo owned by this GitHub user")
+    ap.add_argument("--repo", action="append", help="explicit repo owner/name (repeatable)")
+    ap.add_argument("--branch", help="branch to scan (default: each repo's default branch)")
+    ap.add_argument("--max-file-bytes", type=int, default=1_000_000, help="skip blobs larger than this")
+    ap.add_argument("--max-files", type=int, default=5000, help="overall cap on files scanned")
+    ap.add_argument("--url", default=os.getenv("PALIVANE_URL", "http://localhost:8088"))
+    ap.add_argument("--github-api", default=os.getenv("GITHUB_API_URL", GITHUB_API),
+                    help="GitHub API base URL (for GitHub Enterprise)")
+    ap.add_argument("--include-archived", action="store_true", help="also scan archived and fork repos")
+    ap.add_argument("--record", action="store_true", help="persist findings in Palivane")
+    ap.add_argument("--fail-closed", action="store_true", help="fail if GitHub/backend is unreachable")
+    args = ap.parse_args()
+
+    if not (args.org or args.user or args.repo):
+        print("palivane: give at least one of --org / --user / --repo.", file=sys.stderr)
+        return 2
+
+    token = os.getenv("PALIVANE_TOKEN", "")
+    gh_token = os.getenv("GITHUB_TOKEN", "")
+    if not token:
+        print("palivane: PALIVANE_TOKEN is not set — skipping scan.", file=sys.stderr)
+        return 1 if args.fail_closed else 0
+    if not gh_token:
+        print("palivane: GITHUB_TOKEN is not set — cannot reach the GitHub API.", file=sys.stderr)
+        return 1 if args.fail_closed else 0
+
+    api = args.github_api
+    try:
+        repos = enumerate_repos(args, gh_token, api)
+    except urllib.error.HTTPError as e:
+        if _is_ratelimited(e):
+            print("palivane: GitHub rate limit hit — stopping.", file=sys.stderr)
+            return 1 if args.fail_closed else 0
+        print(f"palivane: GitHub returned HTTP {e.code} enumerating repos.", file=sys.stderr)
+        return 1 if args.fail_closed else 0
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"palivane: could not reach GitHub ({e}).", file=sys.stderr)
+        return 1 if args.fail_closed else 0
+
+    if not repos:
+        print("palivane: no repos to scan.")
+        return 0
+
+    total_scanned, total_flagged, total_binary, blocking = 0, 0, 0, False
+    remaining = args.max_files
+
+    for repo in repos:
+        label = f"{(repo.get('owner') or {}).get('login', '')}/{repo.get('name', '')}"
+        if remaining <= 0:
+            print(f"palivane: --max-files ({args.max_files}) reached — stopping.", file=sys.stderr)
+            break
+        try:
+            items = repo_blobs(repo, args, gh_token, api)[:remaining]
+            # Every blob is read and scanned here; only the ones with findings survive
+            # into `files`, and they carry findings rather than text.
+            files: list[dict] = []
+            for it in items:
+                hit = scan_blob(it, gh_token, api)
+                if hit is UNREADABLE:
+                    total_binary += 1
+                    continue
+                total_scanned += 1
+                if hit is not None:
+                    files.append(hit)
+            remaining -= len(items)
+        except urllib.error.HTTPError as e:
+            if _is_ratelimited(e):
+                print("palivane: GitHub rate limit hit — stopping.", file=sys.stderr)
+                return 1 if args.fail_closed else 0
+            print(f"palivane: GitHub HTTP {e.code} on {label} — skipping repo.", file=sys.stderr)
+            continue
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print(f"palivane: GitHub error on {label} ({e}) — skipping repo.", file=sys.stderr)
+            continue
+
+        if not files:
+            # Nothing sensitive in this repo, so there is nothing to report — no request
+            # is made at all, rather than one saying "here are N clean files".
+            print(f"  {label}: clean ✓" if items else f"  {label}: no scannable files.")
+            continue
+
+        repo_flagged: list[dict] = []
+        try:
+            for i in range(0, len(files), BATCH):
+                result = scan_batch(args.url, token, files[i:i + BATCH], args.record)
+                repo_flagged.extend(result.get("files", []))
+        except urllib.error.HTTPError as e:
+            print(f"palivane: backend returned HTTP {e.code} on {label}.", file=sys.stderr)
+            if args.fail_closed:
+                return 1
+            continue
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print(f"palivane: could not reach backend ({e}) on {label}.", file=sys.stderr)
+            if args.fail_closed:
+                return 1
+            continue
+
+        total_flagged += len(repo_flagged)
+        if repo_flagged:
+            print(f"\n  ⚠ {label}: sensitive data in {len(repo_flagged)} file(s):")
+            blocking = _print_flagged(repo_flagged) or blocking
+        else:
+            print(f"  {label}: clean ✓")
+
+    binary = f", skipped {total_binary} binary/unreadable" if total_binary else ""
+    print(f"\npalivane: scanned {total_scanned} file(s) across {len(repos)} repo(s) "
+          f"locally{binary} — {total_flagged} flagged. No file contents left this machine.")
+    return 1 if blocking else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

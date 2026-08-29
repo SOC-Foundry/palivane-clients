@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""palivane-mcp — inline inspection wrapper for local stdio MCP servers.
+
+Local stdio MCP servers never touch the network, so the egress proxy can't see them —
+until now their only governance was the config-level allowlist. This wrapper closes the
+gap: it sits between the MCP client (Claude Code, Cursor, VS Code, Copilot) and the real
+server, pumping JSON-RPC through untouched while reporting each tool call, resource read, and
+advertised tool description to Palivane — the same MCP-guard pipeline (dangerous commands,
+sensitive resources, tool poisoning, secrets in arguments) that inspects remote servers.
+
+Wrap any server by prefixing its command in the MCP config:
+
+    {"mcpServers": {"github": {
+        "command": "palivane-mcp",
+        "args": ["--", "npx", "-y", "@modelcontextprotocol/server-github"]}}}
+
+Monitor by default (report only, zero interference). Set PALIVANE_MCP_ENFORCE=true to
+block: a risky request is not forwarded — the client receives a JSON-RPC error naming
+the reason — and a poisoned tools/list result is replaced the same way. Fail-open: if
+the backend is down, everything passes through untouched. Framing is preserved exactly
+(original bytes are forwarded, never re-serialized); non-JSON lines pass through as-is.
+
+Monitor mode batches its reports (one request per PALIVANE_MCP_BATCH tool calls or every
+PALIVANE_MCP_FLUSH_MS) so a busy session doesn't hammer the backend; enforce mode scans
+each request inline. The backend also drops benign tool calls from storage and meters
+sensor ingest separately from the gateway, so this traffic can't starve real LLM calls.
+
+Supply-chain verification: on start the wrapped server's resolved binary is hashed and
+pinned on first use (~/.palivane/mcp-pins.json, keyed by the exact command line). A later
+hash mismatch is reported to Palivane as an mcp_integrity finding; in enforce mode the
+server is refused until re-vetted (PALIVANE_MCP_REPIN=1 accepts the new version).
+
+Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key). Optional: --name / PALIVANE_MCP_SERVER
+(server name for the org allowlist; else guessed from the command), PALIVANE_USER,
+PALIVANE_MCP_TIMEOUT, PALIVANE_MCP_BATCH (default 20), PALIVANE_MCP_FLUSH_MS (default 2000).
+Stdlib only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+_MAX_ARGS_TEXT = 20000
+_PIN_PATH = os.path.expanduser("~/.palivane/mcp-pins.json")
+
+
+def server_fingerprint(cmd: list[str]) -> dict:
+    """Supply-chain fingerprint of the wrapped server: the command line plus the sha256
+    of the resolved executable. For interpreter-launched servers (npx/uvx/node/python)
+    this pins the launcher, not the package — coarse, but it still catches a swapped
+    binary and gives the org an attested record of what ran."""
+    binary = shutil.which(cmd[0]) or cmd[0]
+    digest = ""
+    try:
+        h = hashlib.sha256()
+        with open(binary, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        digest = h.hexdigest()
+    except OSError:
+        pass
+    return {"command": " ".join(cmd)[:1024], "binary": binary, "sha256": digest}
+
+
+def check_pin(fp: dict) -> str:
+    """Trust-on-first-use pin for this exact command line. Returns new|ok|mismatch
+    (or "" when the binary couldn't be hashed). PALIVANE_MCP_REPIN=1 re-records."""
+    if not fp["sha256"]:
+        return ""
+    pins = {}
+    try:
+        pins = json.load(open(_PIN_PATH))
+    except (OSError, ValueError):
+        pass
+    key = fp["command"]
+    old = pins.get(key)
+    if old == fp["sha256"]:
+        return "ok"
+    if old is not None and os.getenv("PALIVANE_MCP_REPIN", "") not in ("1", "true", "yes"):
+        return "mismatch"
+    pins[key] = fp["sha256"]
+    try:
+        os.makedirs(os.path.dirname(_PIN_PATH), exist_ok=True)
+        with open(_PIN_PATH, "w") as f:
+            json.dump(pins, f, indent=2)
+        os.chmod(_PIN_PATH, 0o600)
+    except OSError:
+        pass
+    return "new"
+
+
+def _harvest_strings(obj, out: list[str]) -> None:
+    """Recursively collect string *values* from an arbitrary JSON structure."""
+    if isinstance(obj, str):
+        if len(obj) >= 2:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _harvest_strings(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _harvest_strings(v, out)
+
+
+def parse_jsonrpc(line: bytes) -> dict | None:
+    """Decode one stdio frame; None for anything that isn't a JSON object."""
+    try:
+        obj = json.loads(line.decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def extract_request_activity(obj: dict) -> dict | None:
+    """Normalize a client→server JSON-RPC request into Palivane's MCP-activity shape."""
+    method = obj.get("method", "")
+    params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+    if method == "tools/call":
+        harvested: list[str] = []
+        _harvest_strings(params.get("arguments"), harvested)
+        return {"method": "tools/call", "tool": str(params.get("name", "")),
+                "args_text": "\n".join(harvested)[:_MAX_ARGS_TEXT]}
+    if method == "resources/read":
+        uri = params.get("uri", "")
+        return {"method": "resources/read", "resource": uri if isinstance(uri, str) else ""}
+    if method == "initialize":
+        return {"method": "initialize"}
+    return None
+
+
+def extract_response_activity(obj: dict) -> dict | None:
+    """Normalize a server→client result: tools/list results carry the descriptions
+    scanned for tool poisoning. Other results aren't inspected."""
+    result = obj.get("result")
+    if not isinstance(result, dict) or "method" in obj:
+        return None
+    tools = result.get("tools")
+    if isinstance(tools, list):
+        descs = [t.get("description", "") for t in tools
+                 if isinstance(t, dict) and isinstance(t.get("description"), str)]
+        if descs:
+            return {"method": "tools/list.result", "tool_descriptions": descs}
+    return None
+
+
+def server_info_name(obj: dict) -> str | None:
+    """The server's self-declared name from an initialize result (upgrades the guess)."""
+    result = obj.get("result")
+    if isinstance(result, dict):
+        info = result.get("serverInfo")
+        if isinstance(info, dict) and isinstance(info.get("name"), str) and info["name"]:
+            return info["name"]
+    return None
+
+
+def guess_server_name(argv: list[str]) -> str:
+    """Best-effort server name from the wrapped command — the last non-flag token,
+    minus any path or npm scope (`npx -y @x/some-server` → `some-server`)."""
+    name = ""
+    for tok in argv:
+        if tok and not tok.startswith("-"):
+            name = tok
+    return name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
+def block_reply(req_id, verdict: dict) -> bytes:
+    """JSON-RPC error frame returned to the client instead of the risky request/result."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    msg = (f"Blocked by Palivane: risky MCP activity ({cats or 'policy'}) — "
+           f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'high')}.")
+    return (json.dumps({"jsonrpc": "2.0", "id": req_id,
+                        "error": {"code": -32001, "message": msg}}) + "\n").encode()
+
+
+# --- Auth circuit breaker -------------------------------------------------------------
+# HTTP 401/403 means THIS token is dead (revoked or invalid) — a permanent signal, so we
+# stop calling out on every tool call. We fingerprint the token, stand down (fail open, no
+# network) for _DEAUTH_SECS, and re-probe hourly in case the 401 was transient. A fresh
+# token from `palivane connect` has a different fingerprint, so a stale marker never
+# suppresses it. Repeated transient errors (timeouts/5xx) trip a shorter cooldown so we
+# don't retry-storm an unreachable backend either.
+_DEAUTH_SECS = 3600
+_COOLDOWN_SECS = 300
+_FAIL_THRESHOLD = 3
+
+
+def _breaker_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, "mcp-breaker.json")
+
+
+def _token_fp(token: str) -> str:
+    return hashlib.sha256((token or "").encode()).hexdigest()[:16]
+
+
+def _breaker_load() -> dict:
+    try:
+        with open(_breaker_path()) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _breaker_save(state: dict) -> None:
+    try:
+        path = _breaker_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _breaker_skip(token: str) -> str:
+    """Reason to skip the network and fail open, or '' to proceed."""
+    st, fp, now = _breaker_load(), _token_fp(token), time.time()
+    if st.get("deauth_fp") == fp and now < st.get("deauth_until", 0):
+        return "deauthorized"
+    if now < st.get("cooldown_until", 0):
+        return "backoff"
+    return ""
+
+
+def _breaker_record(token: str, status) -> None:
+    """status: 200 healthy | 401/403 revoked | None transient error."""
+    st, fp, now = _breaker_load(), _token_fp(token), time.time()
+    if status == 200:
+        if st:
+            _breaker_save({})                       # healthy — clear breaker state
+        return
+    if status in (401, 403):
+        first = st.get("deauth_fp") != fp
+        _breaker_save({"deauth_fp": fp, "deauth_until": now + _DEAUTH_SECS})
+        if first:
+            sys.stderr.write("palivane: capture key rejected (revoked or invalid) — standing "
+                             "down; re-run `palivane connect` to re-issue.\n")
+        return
+    fails = int(st.get("fails", 0)) + 1
+    if fails >= _FAIL_THRESHOLD:
+        st.update(fails=0, cooldown_until=now + _COOLDOWN_SECS)
+    else:
+        st["fails"] = fails
+    _breaker_save(st)
+
+
+def scan_mcp(activity: dict, server: str, url: str, token: str,
+             user: str = "", timeout: float = 8.0) -> dict:
+    """Call the Palivane MCP ingest endpoint; fail open (action=allow) on any error. A revoked
+    key trips the circuit breaker so we stop hammering the backend on every tool call."""
+    skip = _breaker_skip(token)
+    if skip:
+        return {"action": "allow", "reason": f"scan-skipped:{skip}"}
+    try:
+        payload = {"method": "", "server": server, "tool": "", "args_text": "",
+                   "resource": "", "tool_descriptions": [], "transport": "stdio",
+                   "user": user}
+        payload.update(activity)
+        req = urllib.request.Request(
+            url.rstrip("/") + "/api/ingest/mcp", method="POST",
+            data=json.dumps(payload).encode(),
+            headers={"content-type": "application/json", "User-Agent": "palivane-mcp/1.0", "X-Palivane-Token": token},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = json.loads(r.read())
+        _breaker_record(token, 200)
+        return out
+    except urllib.error.HTTPError as e:
+        _breaker_record(token, e.code)
+        return {"action": "allow", "reason": f"scan-failed:{e.code}"}
+    except Exception:
+        _breaker_record(token, None)
+        return {"action": "allow", "reason": "scan-failed"}
+
+
+def scan_mcp_batch(items: list[dict], cfg: dict) -> None:
+    """Report a batch of activities to the batch ingest endpoint; fail open (silent).
+    Respects the same circuit breaker so a revoked key stops the batch telemetry too."""
+    token = cfg["token"]
+    if _breaker_skip(token):
+        return
+    try:
+        payload = {"items": [{"method": "", "server": "", "tool": "", "args_text": "",
+                              "resource": "", "tool_descriptions": [], "transport": "stdio",
+                              "user": cfg["user"], **it} for it in items]}
+        req = urllib.request.Request(
+            cfg["url"].rstrip("/") + "/api/ingest/mcp/batch", method="POST",
+            data=json.dumps(payload).encode(),
+            headers={"content-type": "application/json", "User-Agent": "palivane-mcp/1.0", "X-Palivane-Token": token},
+        )
+        urllib.request.urlopen(req, timeout=cfg["timeout"]).read()
+        _breaker_record(token, 200)
+    except urllib.error.HTTPError as e:
+        _breaker_record(token, e.code)
+    except Exception:
+        _breaker_record(token, None)  # monitor telemetry — never affects the pipe
+
+
+class _Reporter:
+    """Monitor-mode batcher: queues activities and flushes them to the batch endpoint
+    when the queue reaches PALIVANE_MCP_BATCH items or PALIVANE_MCP_FLUSH_MS elapses — one
+    request for many tool calls instead of one per call. Fully fail-open."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.batch = max(1, int(os.getenv("PALIVANE_MCP_BATCH", "20")))
+        self.flush_s = max(0.1, float(os.getenv("PALIVANE_MCP_FLUSH_MS", "2000")) / 1000.0)
+        self.q: list[dict] = []
+        self.cv = threading.Condition()
+        self.stopped = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def enqueue(self, activity: dict, server: str) -> None:
+        item = dict(activity)
+        item["server"] = server
+        with self.cv:
+            self.q.append(item)
+            if len(self.q) >= self.batch:
+                self.cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self.cv:
+                if not self.q and not self.stopped:
+                    self.cv.wait(self.flush_s)
+                items, self.q = self.q, []
+                done = self.stopped and not items
+            if items:
+                scan_mcp_batch(items, self.cfg)
+            if done:
+                return
+
+    def close(self) -> None:
+        with self.cv:
+            self.stopped = True
+            self.cv.notify()
+        self.thread.join(timeout=self.cfg["timeout"] + 1)
+
+
+def _pump_child_to_client(child, cfg: dict, state: dict, lock: threading.Lock,
+                          reporter: "_Reporter | None") -> None:
+    """Forward server→client frames; inspect tools/list results (tool poisoning)."""
+    out = sys.stdout.buffer
+    for line in iter(child.stdout.readline, b""):
+        replaced = None
+        try:
+            obj = parse_jsonrpc(line)
+            if obj is not None:
+                name = server_info_name(obj)
+                if name:
+                    state["server"] = name
+                activity = extract_response_activity(obj)
+                if activity is not None:
+                    if cfg["enforce"] and cfg["url"] and cfg["token"]:
+                        v = scan_mcp(activity, state["server"], cfg["url"],
+                                     cfg["token"], cfg["user"], cfg["timeout"])
+                        if v.get("action") == "block":
+                            replaced = block_reply(obj.get("id"), v)
+                    elif reporter is not None:
+                        reporter.enqueue(activity, state["server"])
+        except Exception:
+            pass  # inspection must never break the pipe
+        with lock:
+            out.write(replaced if replaced is not None else line)
+            out.flush()
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    name_override = ""
+    while argv and argv[0] != "--":
+        if argv[0] == "--name" and len(argv) > 1:
+            name_override, argv = argv[1], argv[2:]
+        else:
+            sys.exit(f"palivane-mcp: unknown argument {argv[0]!r} "
+                     "(usage: palivane-mcp [--name NAME] -- <command> [args…])")
+    cmd = argv[1:]  # everything after "--"
+    if not cmd:
+        sys.exit("usage: palivane-mcp [--name NAME] -- <command> [args…]")
+
+    cfg = {
+        "url": os.getenv("PALIVANE_URL", "").rstrip("/"),
+        "token": os.getenv("PALIVANE_TOKEN", ""),
+        "enforce": os.getenv("PALIVANE_MCP_ENFORCE", "").lower() in ("1", "true", "yes"),
+        "user": os.getenv("PALIVANE_USER", ""),
+        "timeout": float(os.getenv("PALIVANE_MCP_TIMEOUT", "8")),
+    }
+    state = {"server": name_override or os.getenv("PALIVANE_MCP_SERVER", "") or guess_server_name(cmd)}
+
+    # Supply-chain verification: fingerprint the wrapped server and compare to the pin
+    # recorded on first use. Enforce mode refuses to start a changed binary (re-vet, then
+    # PALIVANE_MCP_REPIN=1 to accept); monitor mode reports it and continues.
+    fp = server_fingerprint(cmd)
+    pin_status = check_pin(fp)
+    if cfg["url"] and cfg["token"]:
+        scan_mcp({"method": "initialize", "command": fp["command"],
+                  "binary_sha256": fp["sha256"], "pin_status": pin_status},
+                 state["server"], cfg["url"], cfg["token"], cfg["user"], cfg["timeout"])
+    if pin_status == "mismatch" and cfg["enforce"]:
+        sys.exit(f"palivane-mcp: refusing to start '{state['server']}' — its binary no longer "
+                 f"matches the pinned hash ({fp['binary']}). Re-vet the server, then re-run "
+                 "with PALIVANE_MCP_REPIN=1 to accept the new version.")
+
+    child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             bufsize=0)  # stderr inherited
+    lock = threading.Lock()
+    # Monitor mode batches reports; enforce mode scans inline (needs the verdict now).
+    reporter = _Reporter(cfg) if (not cfg["enforce"] and cfg["url"] and cfg["token"]) else None
+    threading.Thread(target=_pump_child_to_client, args=(child, cfg, state, lock, reporter),
+                     daemon=True).start()
+
+    out = sys.stdout.buffer
+    try:
+        for line in iter(sys.stdin.buffer.readline, b""):
+            blocked = None
+            try:
+                obj = parse_jsonrpc(line)
+                if obj is not None:
+                    activity = extract_request_activity(obj)
+                    if activity is not None:
+                        if cfg["enforce"] and cfg["url"] and cfg["token"] and obj.get("id") is not None:
+                            v = scan_mcp(activity, state["server"], cfg["url"],
+                                         cfg["token"], cfg["user"], cfg["timeout"])
+                            if v.get("action") == "block":
+                                blocked = block_reply(obj.get("id"), v)
+                        elif reporter is not None:
+                            reporter.enqueue(activity, state["server"])
+            except Exception:
+                pass  # inspection must never break the pipe
+            if blocked is not None:
+                with lock:
+                    out.write(blocked)
+                    out.flush()
+                continue  # not forwarded to the server
+            child.stdin.write(line)
+            child.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        try:
+            child.stdin.close()
+        except OSError:
+            pass
+        if reporter is not None:
+            reporter.close()  # flush any queued reports
+    return child.wait()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

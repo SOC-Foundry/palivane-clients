@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""palivane-otel — bridge Claude Code's OpenTelemetry stream into Palivane (optional add-on).
+
+Companion to `claude-otel` (github.com/SOC-Foundry/claude-otel): that project runs
+a local OTEL collector that captures Claude Code's native telemetry — user prompts, tool
+calls, MCP connections, api requests — into an append-only `logs.jsonl`. This tails that
+file and forwards the security-relevant events to Palivane's ingest API, so an org already
+running claude-otel gets a Palivane capture plane with **no proxy, no CA, no hook** — just the
+telemetry Claude Code already emits.
+
+    user_prompt          -> POST /api/ingest/ai-usage   (injection / secrets / PII in prompts)
+    tool_result          -> POST /api/ingest/mcp        (dangerous commands, sensitive paths,
+                                                          secrets in tool args)
+    mcp_server_connection-> POST /api/ingest/mcp        (untrusted-server allowlist)
+
+**Monitor-only.** OTEL is post-hoc — a tool_result fires *after* the tool ran — so this
+plane observes and records; it cannot block. Pair it with the inline hook/gateway for
+enforcement. Its richness scales with the claude-otel privacy profile: `minimal` = coverage
+only (no content), `standard` = prompt DLP, `full` = tool-argument DLP.
+
+Run as a sidecar next to the collector (systemd/launchd), or `--once` from cron. Fail-open:
+a Palivane outage never affects the collector or Claude Code. Attribution comes from the OTEL
+`user.email` on each event. Stdlib only.
+
+Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key), else read from ~/.claude/settings.json
+(as palivane-hook does). PALIVANE_OTEL_LOGS overrides the logs.jsonl path; PALIVANE_OTEL_INTERVAL
+the follow poll seconds (default 5).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.request
+
+# Claude Code emits its events under this OTEL instrumentation scope.
+_CC_SCOPE = "com.anthropic.claude_code.events"
+_MAX_ARGS_TEXT = 20000
+_STATE_PATH = "~/.palivane/otel-state.json"
+_BATCH = 50
+
+
+def _default_logs_path() -> str:
+    """claude-otel's collector log file, per its documented data roots."""
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/claude-otel/logs/logs.jsonl")
+    return os.path.expanduser("~/.local/share/claude-otel/logs/logs.jsonl")
+
+
+# --- config (env, then ~/.claude/settings.json — mirrors palivane-hook) ------------------
+
+def _settings_env(path: str = "~/.claude/settings.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            env = json.load(f).get("env")
+        return env if isinstance(env, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_config() -> dict:
+    senv = _settings_env()
+    url = os.getenv("PALIVANE_URL") or senv.get("PALIVANE_URL", "")
+    token = os.getenv("PALIVANE_TOKEN") or senv.get("PALIVANE_TOKEN", "")
+    if not token:
+        gw = senv.get("ANTHROPIC_AUTH_TOKEN", "")
+        if isinstance(gw, str) and gw.startswith("ak_"):
+            token = gw
+    if not url:
+        base = senv.get("ANTHROPIC_BASE_URL", "")
+        if isinstance(base, str) and base:
+            url = base.rstrip("/")
+            if url.endswith("/v1"):
+                url = url[: -len("/v1")]
+    return {
+        "url": url.rstrip("/"), "token": token,
+        "logs": os.getenv("PALIVANE_OTEL_LOGS", "") or _default_logs_path(),
+        "interval": float(os.getenv("PALIVANE_OTEL_INTERVAL", "5")),
+        "timeout": float(os.getenv("PALIVANE_OTEL_TIMEOUT", "8")),
+    }
+
+
+# --- OTLP parsing ----------------------------------------------------------------------
+
+def _scalar(value: dict):
+    """Unwrap an OTLP attribute/anyvalue to a Python scalar/str."""
+    if not isinstance(value, dict):
+        return value
+    for k in ("stringValue", "boolValue"):
+        if k in value:
+            return value[k]
+    for k in ("intValue", "doubleValue"):
+        if k in value:
+            return value[k]
+    return ""
+
+
+def _attrs(items) -> dict:
+    return {a.get("key"): _scalar(a.get("value", {})) for a in (items or []) if isinstance(a, dict)}
+
+
+def iter_events(line: str):
+    """Yield (event_name, attrs, body_text) for each Claude Code log record in one OTLP
+    JSON line. Non-JSON / non-Claude-Code lines yield nothing."""
+    try:
+        doc = json.loads(line)
+    except (ValueError, TypeError):
+        return
+    if not isinstance(doc, dict):
+        return
+    for rl in doc.get("resourceLogs", []) or []:
+        for sl in rl.get("scopeLogs", []) or []:
+            if (sl.get("scope") or {}).get("name") != _CC_SCOPE:
+                continue
+            for rec in sl.get("logRecords", []) or []:
+                attrs = _attrs(rec.get("attributes"))
+                name = attrs.get("event.name") or attrs.get("event_name") or ""
+                body = _scalar(rec.get("body", {})) if isinstance(rec.get("body"), dict) else ""
+                if name:
+                    yield name, attrs, body
+
+
+# --- event -> Palivane mapping -----------------------------------------------------------
+
+def _harvest_strings(obj, out: list[str]) -> None:
+    if isinstance(obj, str):
+        if len(obj) >= 2:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _harvest_strings(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _harvest_strings(v, out)
+
+
+def _coerce(val) -> object:
+    """A tool_input/parameters attr is often a JSON string — parse it when we can."""
+    if isinstance(val, str):
+        s = val.strip()
+        if s and s[0] in "{[":
+            try:
+                return json.loads(s)
+            except ValueError:
+                return val
+    return val
+
+
+def build_ai_usage(attrs: dict) -> dict | None:
+    """A user_prompt event -> an ai-usage ingest body (prompt DLP). None if no content
+    (minimal privacy profile: prompt text redacted — nothing to scan)."""
+    prompt = attrs.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    return {"content": prompt, "destination": "claude-code", "tool": "claude-code",
+            "user": attrs.get("user.email", "") or ""}
+
+
+def build_mcp(event_name: str, attrs: dict) -> dict | None:
+    """A tool_result or mcp_server_connection event -> an mcp ingest body. Mirrors the
+    palivane-hook mapping (built-ins send server="" so the allowlist doesn't fire)."""
+    user = attrs.get("user.email", "") or ""
+    if event_name == "mcp_server_connection":
+        server = attrs.get("server_name", "") or ""
+        if not server:
+            return None
+        return {"method": "initialize", "server": server, "tool": "",
+                "transport": attrs.get("transport_type", "") or "otel", "user": user}
+
+    if event_name != "tool_result":
+        return None
+    tool = attrs.get("tool_name", "") or ""
+    if not tool:
+        return None
+    act = {"method": "tools/call", "server": "", "tool": tool,
+           "args_text": "", "resource": "", "transport": "otel", "user": user}
+    tool_input = _coerce(attrs.get("tool_input"))
+    params = _coerce(attrs.get("tool_parameters"))
+
+    if tool.startswith("mcp__"):
+        parts = tool.split("__", 2)  # mcp__<server>__<tool>
+        act["server"] = parts[1] if len(parts) > 1 else ""
+        act["tool"] = parts[2] if len(parts) > 2 else ""
+    elif tool == "Read" and isinstance(tool_input, dict) and tool_input.get("file_path"):
+        act["method"] = "resources/read"
+        act["resource"] = str(tool_input["file_path"])
+        return act
+    elif tool == "Bash" and isinstance(tool_input, dict) and tool_input.get("command"):
+        act["args_text"] = str(tool_input["command"])[:_MAX_ARGS_TEXT]
+        return act
+
+    harvested: list[str] = []
+    _harvest_strings(tool_input, harvested)
+    _harvest_strings(params, harvested)
+    act["args_text"] = "\n".join(harvested)[:_MAX_ARGS_TEXT]
+    return act
+
+
+# --- posting (fail-open) ---------------------------------------------------------------
+
+def _post(cfg: dict, path: str, payload: dict) -> None:
+    try:
+        req = urllib.request.Request(
+            cfg["url"].rstrip("/") + path, method="POST",
+            data=json.dumps(payload).encode(),
+            headers={"content-type": "application/json", "User-Agent": "palivane-otel/1.0", "X-Palivane-Token": cfg["token"]},
+        )
+        urllib.request.urlopen(req, timeout=cfg["timeout"]).read()
+    except Exception:
+        pass  # telemetry bridge — never raise
+
+
+def flush(cfg: dict, prompts: list[dict], mcp: list[dict]) -> None:
+    for p in prompts:
+        _post(cfg, "/api/ingest/ai-usage", p)
+    for i in range(0, len(mcp), _BATCH):
+        _post(cfg, "/api/ingest/mcp/batch", {"items": mcp[i:i + _BATCH]})
+
+
+def process_line(line: str, prompts: list[dict], mcp: list[dict]) -> None:
+    for name, attrs, _body in iter_events(line):
+        if name == "user_prompt":
+            b = build_ai_usage(attrs)
+            if b:
+                prompts.append(b)
+        elif name in ("tool_result", "mcp_server_connection"):
+            b = build_mcp(name, attrs)
+            if b:
+                mcp.append(b)
+
+
+# --- tail with offset/inode state (survives restarts, handles rotation) ----------------
+
+def load_state(path: str) -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(path: str, state: dict) -> None:
+    p = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, p)
+    os.chmod(p, 0o600)
+
+
+def _head_sig(logs: str, n: int = 200) -> str:
+    """A short fingerprint of the file's first bytes — detects a *different* file even when
+    the OS reuses the inode number (so we don't resume at a stale offset into new content)."""
+    try:
+        with open(logs, "rb") as f:
+            return hashlib.sha256(f.read(n)).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def _start_offset(logs: str, state: dict) -> int:
+    """Resume from the saved offset only if it's the same file — same inode, not truncated,
+    and same head fingerprint (guards inode reuse). Otherwise start at 0."""
+    try:
+        st = os.stat(logs)
+    except OSError:
+        return 0
+    if state.get("inode") != st.st_ino or state.get("offset", 0) > st.st_size:
+        return 0
+    if state.get("head") and state["head"] != _head_sig(logs):
+        return 0   # inode reused by a different file
+    return state.get("offset", 0)
+
+
+def drain(cfg: dict, state: dict) -> dict:
+    """Forward complete new lines since the last offset; return the updated state. Reads in
+    binary and only advances past the last newline, so a partial trailing line (the collector
+    mid-write) is left for the next pass — byte-accurate, unlike text-mode line iteration."""
+    logs = cfg["logs"]
+    try:
+        st = os.stat(logs)
+    except OSError:
+        return state  # collector not writing yet
+    offset = _start_offset(logs, state)
+    with open(logs, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    head = _head_sig(logs)
+    nl = data.rfind(b"\n")
+    if nl == -1:
+        return {"inode": st.st_ino, "offset": offset, "head": head}  # no complete line yet
+    prompts: list[dict] = []
+    mcp: list[dict] = []
+    for line in data[:nl + 1].decode("utf-8", "replace").splitlines():
+        if line.strip():
+            process_line(line, prompts, mcp)
+    if prompts or mcp:
+        flush(cfg, prompts, mcp)
+    return {"inode": st.st_ino, "offset": offset + nl + 1, "head": head}
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    cfg = read_config()
+    if not cfg["url"] or not cfg["token"]:
+        if "--quiet" not in args:
+            print("palivane-otel: not connected (set PALIVANE_URL/PALIVANE_TOKEN or run palivane-connect)")
+        return 0
+
+    once = "--once" in args
+    state = load_state(_STATE_PATH)
+    while True:
+        try:
+            state = drain(cfg, state)
+            save_state(_STATE_PATH, state)
+        except Exception:
+            pass  # fail-open; try again next tick
+        if once:
+            return 0
+        time.sleep(cfg["interval"])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception:
+        sys.exit(0)  # fail open

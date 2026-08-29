@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""palivane-copilot-hook — GitHub Copilot hook adapter: local, pre-execution inspection.
+
+Copilot's agentic surfaces (Copilot CLI, VS Code agent mode, the cloud coding agent) act
+through tools — shell commands, file edits, MCP calls — that the network planes can't see
+semantically: the egress proxy sees TLS to GitHub, not tool calls, and Copilot offers no
+base-URL override for the gateway. Copilot's lifecycle hooks (GA with Copilot CLI; the
+same .github/hooks files also drive VS Code agent mode and the cloud coding agent) close
+that gap from inside: Copilot runs this script with JSON on stdin and honors a
+permissionDecision verdict on stdout for preToolUse.
+
+Two events, dispatched on the event's shape (Copilot's stdin carries no event-name
+field — a tool call has `toolName`, a prompt has `prompt`):
+
+  preToolUse          -> tool call (shell, edit, MCP) before execution
+                         -> /api/ingest/mcp (dangerous commands, server allowlist,
+                         secrets/PII in arguments)
+  userPromptSubmitted -> the user's typed prompt — OBSERVE-ONLY: Copilot ignores hook
+                         output here -> /api/ingest/ai-usage (shadow-AI/data-loss record)
+
+The blocking geometry is the INVERSE of the other agent hooks: prompts cannot be blocked
+at this plane (output ignored), so they are reported by a detached child with zero added
+latency — the egress proxy/gateway remain Copilot's prompt-DLP backstop. Tool calls are
+the one event Copilot lets us deny, so they are scanned inline even in monitor mode:
+every verdict carries the org's live enforce stance (console Settings → Enforcement,
+stageable per user/tool via policy overrides), so a centrally-flipped enforcement denies
+high-risk tool calls here immediately — no device re-config. `force_block` is honored
+too, though the MCP surface deliberately doesn't emit it today (a secret in a local
+shell command isn't a confirmed egress the way a prompt is). Set PALIVANE_ENFORCE=true to
+deny high-risk verdicts based on device-local stance as well.
+
+Fail-open discipline needs care here: Copilot treats a NON-ZERO EXIT as deny (fail-
+closed) and a timeout as allow, so this script always exits 0 — Palivane being down never
+breaks the developer. (Known upstream gap: Copilot CLI may not fire preToolUse for
+subagent tool calls — github/copilot-cli#2392 — so don't claim subagent coverage.)
+
+Register in ~/.copilot/hooks/palivane.json (Copilot CLI, per device — palivane-connect
+writes this) or .github/hooks/palivane.json (per repo — also covers VS Code agent mode
+and the cloud coding agent; see the MDM policy pack):
+
+  {"version": 1, "hooks": {
+     "preToolUse": [{"type": "command",
+                     "bash": "/usr/local/bin/palivane-copilot-hook", "timeoutSec": 10}],
+     "userPromptSubmitted": [{"type": "command",
+                     "bash": "/usr/local/bin/palivane-copilot-hook", "timeoutSec": 10}]}}
+
+Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key) from the environment, else from
+~/.copilot/palivane.json ({"url","token","user","enforce"} — written by palivane-connect),
+else the pair palivane-connect wrote to ~/.claude/settings.json. Stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+
+# Reported in the User-Agent so the console can inventory client builds per device.
+VERSION = "1.0.0"
+_MAX_ARGS_TEXT = 20000
+
+
+def _harvest_strings(obj, out: list[str]) -> None:
+    """Recursively collect string *values* from an arbitrary JSON structure (dict keys
+    ignored) — scans unknown tool-input shapes without a per-tool parser."""
+    if isinstance(obj, str):
+        if len(obj) >= 2:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _harvest_strings(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _harvest_strings(v, out)
+
+
+def _cap(text: str) -> str:
+    return text[:_MAX_ARGS_TEXT]
+
+
+def _tool_args(event: dict):
+    """Copilot passes `toolArgs` as a JSON *string*; tolerate an object or garbage too.
+    Returns a dict when parseable, the raw string otherwise (still scanned whole)."""
+    raw = event.get("toolArgs")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else raw
+        except ValueError:
+            return raw
+    return {}
+
+
+def build_ai_usage(event: dict) -> dict | None:
+    """userPromptSubmitted -> ai-usage payload (the typed prompt on its way to the model)."""
+    prompt = event.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    return {"content": _cap(prompt), "destination": "copilot", "tool": "copilot"}
+
+
+def build_activity(event: dict) -> dict | None:
+    """preToolUse -> Palivane's MCP-activity shape (POST /api/ingest/mcp).
+
+    MCP tools carrying the mcp__<server>__<tool> prefix get the server split out so the
+    org allowlist applies; every other tool (shell, edit, Copilot built-ins) sends
+    server="" — they aren't MCP servers, so the untrusted-server signal must not fire
+    for them. Copilot's exact MCP tool-naming isn't documented; anything unprefixed is
+    still fully scanned via string harvest."""
+    tool_name = event.get("toolName", "")
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    args = _tool_args(event)
+
+    activity = {"method": "tools/call", "server": "", "tool": tool_name,
+                "args_text": "", "resource": "", "transport": "stdio"}
+
+    if isinstance(args, str):
+        # toolArgs that wasn't a JSON object — scan it whole.
+        activity["args_text"] = _cap(args)
+        return activity
+
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__", 2)  # mcp__<server>__<tool>; tool may contain __
+        activity["server"] = parts[1] if len(parts) > 1 else ""
+        activity["tool"] = parts[2] if len(parts) > 2 else ""
+        harvested: list[str] = []
+        _harvest_strings(args, harvested)
+        activity["args_text"] = _cap("\n".join(harvested))
+    elif isinstance(args.get("command"), str) and args.get("command"):
+        # The shell tool (whatever Copilot names it this release): command + any context.
+        cmd = args.get("command", "")
+        cwd = args.get("cwd", "")
+        activity["args_text"] = _cap("\n".join(
+            p for p in (cmd, cwd) if isinstance(p, str) and p))
+    else:
+        # Unknown built-in — harvest all string values (paths land in args_text for the
+        # sensitive-path check; content is scanned for secrets/PII).
+        harvested = []
+        _harvest_strings(args, harvested)
+        activity["args_text"] = _cap("\n".join(harvested))
+    return activity
+
+
+def _copilot_config(path: str = "~/.copilot/palivane.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _claude_settings_env(path: str = "~/.claude/settings.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            env = json.load(f).get("env")
+        return env if isinstance(env, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_config() -> dict:
+    """Resolve backend URL/token/mode: environment, then ~/.copilot/palivane.json, then the
+    pair palivane-connect wrote to ~/.claude/settings.json (PALIVANE_URL/PALIVANE_TOKEN, or the
+    gateway pair — the ak_ token doubles as ingest auth)."""
+    cc = _copilot_config()
+    url = os.getenv("PALIVANE_URL") or cc.get("url", "")
+    token = os.getenv("PALIVANE_TOKEN") or cc.get("token", "")
+    enforce_raw = os.getenv("PALIVANE_ENFORCE")
+    enforce = (enforce_raw if enforce_raw is not None else str(cc.get("enforce", ""))).lower() in ("1", "true", "yes")
+    user = os.getenv("PALIVANE_USER") or cc.get("user", "")
+
+    if not url or not token:
+        senv = _claude_settings_env()
+        url = url or senv.get("PALIVANE_URL", "")
+        if not token:
+            tok = senv.get("PALIVANE_TOKEN", "") or senv.get("ANTHROPIC_AUTH_TOKEN", "")
+            if isinstance(tok, str) and tok.startswith("ak_"):
+                token = tok
+        if not url:
+            base = senv.get("ANTHROPIC_BASE_URL", "")
+            if isinstance(base, str) and base:
+                url = base.rstrip("/")
+                if url.endswith("/v1"):
+                    url = url[: -len("/v1")]
+    try:
+        timeout = float(os.getenv("PALIVANE_HOOK_TIMEOUT", "5"))
+    except ValueError:
+        timeout = 5.0
+    # Directories to NOT inspect (e.g. the Palivane repo, whose fixtures look like real secrets)
+    # — PALIVANE_HOOK_EXCLUDE_DIRS, os.pathsep- or comma-separated, from env or settings.json env.
+    raw_excl = (os.getenv("PALIVANE_HOOK_EXCLUDE_DIRS")
+                or _claude_settings_env().get("PALIVANE_HOOK_EXCLUDE_DIRS", ""))
+    exclude = [os.path.realpath(os.path.expanduser(p)) for p in
+               raw_excl.replace(",", os.pathsep).split(os.pathsep) if p.strip()]
+    return {"url": url, "token": token, "enforce": enforce, "timeout": timeout,
+            "user": user, "exclude": exclude}
+
+
+def _post(endpoint: str, payload: dict, cfg: dict) -> dict:
+    """POST to a Palivane ingest endpoint; fail open (action=allow) on any error."""
+    try:
+        body = dict(payload)
+        body["user"] = cfg.get("user", "")
+        req = urllib.request.Request(
+            cfg["url"].rstrip("/") + endpoint, method="POST",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "User-Agent": f"palivane-copilot-hook/{VERSION}", "X-Palivane-Token": cfg["token"]},
+        )
+        with urllib.request.urlopen(req, timeout=cfg.get("timeout", 5.0)) as r:
+            return json.loads(r.read())
+    except Exception:
+        return {"action": "allow", "reason": "scan-failed"}
+
+
+def should_block(verdict: dict, enforce: bool) -> bool:
+    """Mirror of the proxy's rule: a confirmed secret/PII leak (force_block) is blocked
+    even in monitor mode — block the certain, monitor the fuzzy. Everything else blocks
+    under enforce — local, or the org's stance from the console (Settings → Enforcement),
+    which the server returns on every verdict."""
+    if verdict.get("force_block"):
+        return True
+    return (enforce or bool(verdict.get("enforce"))) and verdict.get("action") == "block"
+
+
+def _reason(verdict: dict, what: str) -> str:
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    msg = (f"Blocked by Palivane: {cats or 'policy'} in this {what} — "
+           f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'high')}.")
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        msg += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return msg
+
+
+def block_output(verdict: dict) -> dict:
+    """Copilot's preToolUse verdict: a top-level permissionDecision (the reason is
+    reported to the model). Only tool calls can be denied — prompts are observe-only."""
+    return {"permissionDecision": "deny",
+            "permissionDecisionReason": _reason(verdict, "tool call")}
+
+
+def _send_detached(endpoint: str, payload: dict, cfg: dict) -> None:
+    """Report in a detached child so the hook returns instantly (observe-only events)."""
+    p = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--send"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    p.stdin.write(json.dumps({"endpoint": endpoint, "payload": payload, "cfg": cfg}).encode())
+    p.stdin.close()
+
+
+def _event_cwd(event: dict) -> str:
+    """The working directory this hook event happened in — the event's cwd, its toolArgs'
+    cwd, else the hook process's own cwd (the project root Copilot was launched in)."""
+    cwd = event.get("cwd")
+    if not cwd:
+        args = _tool_args(event)
+        if isinstance(args, dict):
+            cwd = args.get("cwd")
+    return cwd or os.getcwd()
+
+
+def _is_excluded(cwd: str, exclude: list) -> bool:
+    """True if `cwd` is at/under an excluded dir (PALIVANE_HOOK_EXCLUDE_DIRS) — so developing
+    Palivane itself doesn't flag its own secret fixtures on every tool call."""
+    if not cwd or not exclude:
+        return False
+    try:
+        rp = os.path.realpath(os.path.expanduser(cwd))
+    except OSError:
+        return False
+    return any(rp == d or rp.startswith(d + os.sep) for d in exclude)
+
+
+def main() -> int:
+    if "--send" in sys.argv[1:]:
+        try:
+            job = json.load(sys.stdin)
+            _post(job["endpoint"], job["payload"], job["cfg"])
+        except Exception:
+            pass
+        return 0
+
+    try:
+        event = json.load(sys.stdin)
+    except Exception:
+        return 0
+    if not isinstance(event, dict):
+        return 0
+    if _is_excluded(_event_cwd(event), read_config()["exclude"]):
+        return 0
+
+    # No event-name field on Copilot's stdin — dispatch on shape.
+    if isinstance(event.get("toolName"), str) and event.get("toolName"):
+        endpoint, payload, blockable = "/api/ingest/mcp", build_activity(event), True
+    elif isinstance(event.get("prompt"), str):
+        endpoint, payload, blockable = "/api/ingest/ai-usage", build_ai_usage(event), False
+    else:
+        return 0
+    if payload is None:
+        return 0
+
+    cfg = read_config()
+    if not cfg["url"] or not cfg["token"]:
+        return 0  # not connected to Palivane — nothing to report to
+
+    # Tool calls are always scanned inline (even in monitor mode): preToolUse is the only
+    # event Copilot lets us deny, and each verdict carries the org's live enforce stance
+    # (stageable per user/tool), so central enforcement applies here without touching the
+    # device. Prompts are observe-only — Copilot ignores hook output on
+    # userPromptSubmitted — so they report via a detached child with zero added latency.
+    # No stdout on allow — Copilot treats exit 0 with no output as proceed.
+    if blockable:
+        verdict = _post(endpoint, payload, cfg)
+        if should_block(verdict, cfg["enforce"]):
+            print(json.dumps(block_output(verdict)))
+        return 0
+
+    _send_detached(endpoint, payload, cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # fail open — Copilot denies on non-zero exit, so never exit non-zero

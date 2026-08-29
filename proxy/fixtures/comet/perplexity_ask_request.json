@@ -1,0 +1,12 @@
+{
+  "params": {
+    "query_str": "SYNTHETIC FIXTURE (not a real capture) — Comet agent task: log in to the vendor portal as jane.doe@example-synthetic.test with password hunter2-SYNTHETIC and download the Q3 invoices",
+    "search_focus": "internet",
+    "mode": "copilot",
+    "sources": ["web"],
+    "attachments": [],
+    "version": "2.13",
+    "frontend_uuid": "00000000-0000-4000-8000-00000000feed"
+  },
+  "query_str": "SYNTHETIC FIXTURE (not a real capture) — Comet agent task: log in to the vendor portal as jane.doe@example-synthetic.test with password hunter2-SYNTHETIC and download the Q3 invoices"
+}

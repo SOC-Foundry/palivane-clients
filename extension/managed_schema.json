@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "backendUrl": {
+      "title": "Palivane backend URL",
+      "type": "string"
+    },
+    "token": {
+      "title": "Ingest token (EXTENSION_INGEST_TOKEN)",
+      "type": "string"
+    },
+    "enrollToken": {
+      "title": "Fleet enrollment token (et_...), extension self-enrolls a per-device key",
+      "type": "string"
+    },
+    "user": {
+      "title": "End-user identity (optional; usually injected from SSO)",
+      "type": "string"
+    },
+    "enforce": {
+      "title": "Block risky prompts (vs warn only)",
+      "type": "boolean"
+    }
+  }
+}

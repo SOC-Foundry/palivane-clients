@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Palivane CI-runner scan plane — audit GitHub Actions workflows for runner risk.
+
+Sends a repo's workflow files to the Palivane backend's `POST /api/scan/ci` (the ci_guard
+detector; no detection logic lives here), which flags pwn-request triggers, unpinned
+third-party actions, write-all permissions, secrets:inherit, self-hosted runners on PR
+triggers, and AI agents running in CI. Read-only; workflow text only, never secret
+values. Stdlib only.
+
+Two ways to run it:
+  * inside a workflow (scans the checkout it's running from):
+        palivane-ci-scan --path .
+    In GitHub Actions with `permissions: id-token: write` it can authenticate with the
+    runner's own OIDC token (--github-oidc) instead of a long-lived PALIVANE_TOKEN.
+  * as a sweep over repos via the GitHub API (like palivane-github-scan):
+        palivane-ci-scan --org acme
+        palivane-ci-scan --repo acme/api --repo acme/web
+
+Config (env):
+  PALIVANE_URL             Palivane backend base URL             (or --url)
+  PALIVANE_TOKEN           a per-tenant API key (ak_…)          (env only, never a flag)
+  GITHUB_TOKEN           GitHub PAT for --org/--user/--repo   (env only)
+  PALIVANE_OIDC_AUDIENCE   audience for --github-oidc           (default: the Palivane URL)
+
+Exit codes: 0 = clean/allowed, 1 = a blocking finding. GitHub/backend errors fail OPEN
+(exit 0) unless --fail-closed is given.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0"
+MAX_CONTENT = 200_000
+GITHUB_API = "https://api.github.com"
+WF_DIR = ".github/workflows"
+
+
+def _gh_request(path: str, token: str, api: str) -> tuple[dict | list, dict]:
+    url = path if path.startswith("http") else api.rstrip("/") + path
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"palivane-ci-scan/{VERSION}",
+    })
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read()), dict(r.headers)
+
+
+def _next_link(link_header: str) -> str | None:
+    for part in link_header.split(","):
+        seg = part.split(";")
+        if len(seg) >= 2 and 'rel="next"' in seg[1] and "<" in seg[0]:
+            return seg[0].strip().strip("<>")
+    return None
+
+
+def _gh_paged(path: str, token: str, api: str) -> list:
+    out: list = []
+    url = path
+    while url:
+        body, headers = _gh_request(url, token, api)
+        if isinstance(body, list):
+            out.extend(body)
+        url = _next_link(headers.get("Link", ""))
+    return out
+
+
+def _is_ratelimited(e: urllib.error.HTTPError) -> bool:
+    return e.code == 403 and str(e.headers.get("X-RateLimit-Remaining", "")).strip() == "0"
+
+
+def github_oidc_token(audience: str) -> str:
+    """Mint the runner's own OIDC token (requires `permissions: id-token: write`).
+    The Palivane backend verifies it like any workload JWT — no long-lived secret needed."""
+    req_url = os.getenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+    req_tok = os.getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+    if not req_url or not req_tok:
+        return ""
+    url = req_url + "&audience=" + urllib.parse.quote(audience, safe="")
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {req_tok}", "User-Agent": f"palivane-ci-scan/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read()).get("value", "")
+
+
+def local_workflows(root: str) -> list[dict]:
+    """Workflow files from a local checkout: <root>/.github/workflows/*.yml|yaml."""
+    wf_dir = os.path.join(root, WF_DIR)
+    out = []
+    if not os.path.isdir(wf_dir):
+        return out
+    for name in sorted(os.listdir(wf_dir)):
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        path = os.path.join(wf_dir, name)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                out.append({"path": f"{WF_DIR}/{name}", "content": f.read()[:MAX_CONTENT]})
+        except OSError as e:
+            print(f"palivane: cannot read {path} ({e}) — skipping.", file=sys.stderr)
+    return out
+
+
+def repo_workflows(full: str, token: str, api: str) -> list[dict]:
+    """Workflow files of one repo via the contents API (small dir; no tree walk needed)."""
+    listing = _gh_request(f"/repos/{full}/contents/{WF_DIR}", token, api)[0]
+    out = []
+    for entry in listing if isinstance(listing, list) else []:
+        name = entry.get("name", "")
+        if entry.get("type") != "file" or not name.endswith((".yml", ".yaml")):
+            continue
+        blob = _gh_request(f"/repos/{full}/contents/{WF_DIR}/{name}", token, api)[0]
+        if isinstance(blob, dict) and blob.get("encoding") == "base64":
+            try:
+                text = base64.b64decode(blob.get("content", "")).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                continue
+            out.append({"path": f"{WF_DIR}/{name}", "content": text[:MAX_CONTENT]})
+    return out
+
+
+def enumerate_repos(args, token: str, api: str) -> list[str]:
+    repos: list[str] = []
+    if args.org:
+        repos += [r.get("full_name", "") for r in
+                  _gh_paged(f"/orgs/{args.org}/repos?per_page=100", token, api)
+                  if not r.get("archived") and not r.get("fork")]
+    if args.user:
+        repos += [r.get("full_name", "") for r in
+                  _gh_paged(f"/users/{args.user}/repos?per_page=100", token, api)
+                  if not r.get("archived") and not r.get("fork")]
+    repos += [r for r in (args.repo or []) if "/" in r]
+    return [r for r in repos if r]
+
+
+def scan(url: str, token: str, repo: str, ref: str, workflows: list[dict],
+         record: bool) -> dict:
+    payload = json.dumps({"repo": repo, "ref": ref, "workflows": workflows,
+                          "record": record}).encode()
+    req = urllib.request.Request(
+        url.rstrip("/") + "/api/scan/ci", data=payload, method="POST",
+        headers={"content-type": "application/json", "X-Palivane-Token": token,
+                 "User-Agent": f"palivane-ci-scan/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+_SEV_RANK = {"benign": 0, "low": 1, "suspicious": 2, "high": 3, "critical": 4}
+
+
+def _print_result(repo: str, result: dict, block_on: str = "") -> bool:
+    """Print flagged workflows; return True if the run should fail.
+
+    The backend's `action` is the authority — it already applied the org's
+    ci_block_severity. `--block-on` is a LOCAL override for a pipeline that wants a
+    stricter gate than org policy; it can only tighten, never loosen."""
+    flagged = result.get("workflows", [])
+    if not flagged:
+        print(f"  {repo or 'workflows'}: clean ✓ ({result.get('scanned', 0)} workflow(s))")
+        return False
+    blocking = result.get("action") == "block"
+    print(f"\n  ⚠ {repo or 'workflows'}: {len(flagged)} risky workflow(s):")
+    for wf in flagged:
+        sev = wf.get("severity", "")
+        local_block = bool(block_on) and _SEV_RANK.get(sev, 0) >= _SEV_RANK.get(block_on, 9)
+        mark = "🔴" if wf.get("action") == "block" or local_block else "🟠"
+        titles = ", ".join(dict.fromkeys(s.get("title", "") for s in wf.get("signals", [])))
+        print(f"    {mark} {wf.get('workflow', '?')}  [{sev}] {titles}")
+        for step in wf.get("remediation", []):
+            print(f"       ↳ {step}")
+        blocking = blocking or local_block
+    return blocking
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Audit GitHub Actions workflows for runner risk via Palivane.")
+    ap.add_argument("--path", help="scan a local checkout (its .github/workflows)")
+    ap.add_argument("--org", help="scan every repo in this GitHub org")
+    ap.add_argument("--user", help="scan every repo owned by this GitHub user")
+    ap.add_argument("--repo", action="append", help="explicit repo owner/name (repeatable)")
+    ap.add_argument("--ref", default=os.getenv("GITHUB_SHA", ""),
+                    help="ref label for findings (default: $GITHUB_SHA)")
+    ap.add_argument("--url", default=os.getenv("PALIVANE_URL", "http://localhost:8088"))
+    ap.add_argument("--github-api", default=os.getenv("GITHUB_API_URL", GITHUB_API),
+                    help="GitHub API base URL (for GitHub Enterprise)")
+    ap.add_argument("--github-oidc", action="store_true",
+                    help="authenticate to Palivane with the runner's GitHub OIDC token")
+    ap.add_argument("--no-record", dest="record", action="store_false",
+                    help="don't persist findings in Palivane (default: record)")
+    ap.add_argument("--block-on", choices=("suspicious", "high", "critical"), default="",
+                    help="fail on this severity or worse, even if org policy is laxer "
+                         "(default: follow the org's CI block threshold)")
+    ap.add_argument("--fail-closed", action="store_true",
+                    help="fail if GitHub/backend is unreachable")
+    args = ap.parse_args()
+
+    if not (args.path or args.org or args.user or args.repo):
+        args.path = "." if os.path.isdir(WF_DIR) else None
+        if args.path is None:
+            print("palivane: give --path, or one of --org / --user / --repo.", file=sys.stderr)
+            return 2
+
+    token = os.getenv("PALIVANE_TOKEN", "")
+    if args.github_oidc:
+        try:
+            token = github_oidc_token(
+                os.getenv("PALIVANE_OIDC_AUDIENCE", args.url.rstrip("/"))) or token
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print(f"palivane: could not mint the GitHub OIDC token ({e}).", file=sys.stderr)
+    if not token:
+        print("palivane: PALIVANE_TOKEN is not set (and no OIDC token) — skipping scan.",
+              file=sys.stderr)
+        return 1 if args.fail_closed else 0
+
+    # (repo-label, ref, workflows) units to scan
+    units: list[tuple[str, str, list[dict]]] = []
+    if args.path:
+        repo_label = os.getenv("GITHUB_REPOSITORY", "")
+        units.append((repo_label, args.ref, local_workflows(args.path)))
+    if args.org or args.user or args.repo:
+        gh_token = os.getenv("GITHUB_TOKEN", "")
+        if not gh_token:
+            print("palivane: GITHUB_TOKEN is not set — cannot reach the GitHub API.",
+                  file=sys.stderr)
+            return 1 if args.fail_closed else 0
+        try:
+            for full in enumerate_repos(args, gh_token, args.github_api):
+                try:
+                    units.append((full, "", repo_workflows(full, gh_token, args.github_api)))
+                except urllib.error.HTTPError as e:
+                    if _is_ratelimited(e):
+                        print("palivane: GitHub rate limit hit — stopping.", file=sys.stderr)
+                        return 1 if args.fail_closed else 0
+                    if e.code != 404:   # 404 = repo has no workflows dir; that's clean
+                        print(f"palivane: GitHub HTTP {e.code} on {full} — skipping.",
+                              file=sys.stderr)
+        except urllib.error.HTTPError as e:
+            if _is_ratelimited(e):
+                print("palivane: GitHub rate limit hit — stopping.", file=sys.stderr)
+            else:
+                print(f"palivane: GitHub returned HTTP {e.code} enumerating repos.",
+                      file=sys.stderr)
+            return 1 if args.fail_closed else 0
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print(f"palivane: could not reach GitHub ({e}).", file=sys.stderr)
+            return 1 if args.fail_closed else 0
+
+    blocking, scanned, gate = False, 0, args.block_on
+    for repo, ref, workflows in units:
+        if not workflows:
+            print(f"  {repo or 'local'}: no workflows.")
+            continue
+        try:
+            result = scan(args.url, token, repo, ref, workflows, args.record)
+        except urllib.error.HTTPError as e:
+            print(f"palivane: backend returned HTTP {e.code} on {repo or 'local'}.",
+                  file=sys.stderr)
+            if args.fail_closed:
+                return 1
+            continue
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            print(f"palivane: could not reach backend ({e}).", file=sys.stderr)
+            if args.fail_closed:
+                return 1
+            continue
+        scanned += result.get("scanned", 0)
+        blocking = _print_result(repo, result, args.block_on) or blocking
+        gate = args.block_on or result.get("block_severity", "")
+
+    print(f"\npalivane: scanned {scanned} workflow(s) across {len(units)} repo(s)"
+          + (f" — failing at {gate}+." if scanned and gate else "."))
+    return 1 if blocking else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

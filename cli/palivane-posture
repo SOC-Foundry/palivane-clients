@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""palivane-posture — device posture reporter: IDE extensions + MCP configs.
+
+The CI scan endpoints vet extension lists and MCP configs point-in-time; this script
+turns that into continuous *device* posture without an endpoint agent. It collects what
+is actually installed/configured on this machine and reports it through the existing
+scan APIs, so drift (a new rogue extension, a new unapproved MCP server) surfaces as a
+finding shortly after it happens:
+
+- installed VS Code extensions (`code --list-extensions`) → POST /api/scan/ide-extensions
+- AI coding-assistant settings (Cursor / Claude Code) → POST /api/scan/agent-config, to
+  flag unsafe autonomy (YOLO / auto-apply / auto-run / --dangerously-skip-permissions)
+- MCP server configs → POST /api/scan/mcp-config, from: ~/.claude.json (Claude Code —
+  a minimal {"mcpServers": …} view is synthesized; the raw file holds unrelated user
+  state and is never posted), ./.mcp.json, VS Code, Cursor, and Copilot CLI user configs.
+- agent instruction/rules files → POST /api/scan/agent-rules, to catch hidden-instruction
+  injection (the "rules-file backdoor"): CLAUDE.md / .cursorrules / .cursor/rules/*.mdc /
+  AGENTS.md / .github/copilot-instructions.md / GEMINI.md / skill SKILL.md files.
+
+Credentials are stripped before anything is posted. This runs on every developer machine
+at session start, and an MCP config's `env` block is exactly where a live token sits — it
+used to be shipped verbatim so the backend could scan it. Detection now happens here
+(palivane_detect, shared with palivane-secrets and the at-rest scanners): each secret is
+replaced by «redacted:label» in the content, and reported separately as a category, a
+label, and a masked preview. The vetting the backend does — which servers are declared,
+what they launch, whether they are allowlisted, what a rules file instructs — never needed
+the value.
+
+Runs are cheap and idempotent: a sha256 cache (~/.palivane/posture-cache.json) skips the
+POST when nothing changed, so repeated runs don't spam findings. palivane-connect installs
+a SessionStart hook that fires `palivane-posture --async --quiet` whenever a Claude Code
+session starts; a cron/launchd job works too. Fails open: errors never block anything.
+
+    palivane-posture [--force] [--dry-run] [--quiet] [--async]
+
+Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key) from the environment, else from the
+`env` block of ~/.claude/settings.json (written by palivane-connect). Stdlib only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from datetime import datetime, timezone
+
+CACHE_PATH = "~/.palivane/posture-cache.json"
+
+# Reported in the User-Agent so the console's Fleet view can show which client build each
+# device runs (and flag the stale ones). Bump when the client contract changes.
+VERSION = "1.2.0"
+
+# MCP config files posted raw (path label → filesystem path).
+_RAW_MCP_CONFIGS = (
+    ("./.mcp.json", ".mcp.json"),
+    ("~/.config/Code/User/mcp.json", "~/.config/Code/User/mcp.json"),
+    ("~/.cursor/mcp.json", "~/.cursor/mcp.json"),
+    ("~/.copilot/mcp-config.json", "~/.copilot/mcp-config.json"),
+)
+
+# AI coding-assistant settings scanned for unsafe autonomy (YOLO / auto-apply / auto-run).
+# (label, filesystem path, tool)
+_AGENT_CONFIGS = (
+    ("cursor:settings", "~/.config/Cursor/User/settings.json", "cursor"),
+    ("cursor:settings", "~/Library/Application Support/Cursor/User/settings.json", "cursor"),
+    ("cursor:settings", "~/AppData/Roaming/Cursor/User/settings.json", "cursor"),
+    ("cursor:settings", "~/.cursor/settings.json", "cursor"),
+    ("claude-code:settings", "~/.claude/settings.json", "claude-code"),
+    ("copilot:config", "~/.copilot/config.json", "copilot"),
+)
+
+# Agent INSTRUCTION/RULES files — steering context the agent obeys every turn, scanned for
+# hidden-instruction injection (the "rules-file backdoor"). Repo-relative files are read
+# from the session's cwd; user-level ones are absolute. (label, relative-to, path, tool).
+# "cwd" = the project the agent runs in; "home" = the developer's user config.
+_RULES_FILES = (
+    ("CLAUDE.md", "cwd", "CLAUDE.md", "claude-code"),
+    ("CLAUDE.local.md", "cwd", "CLAUDE.local.md", "claude-code"),
+    ("~/.claude/CLAUDE.md", "home", "~/.claude/CLAUDE.md", "claude-code"),
+    (".cursorrules", "cwd", ".cursorrules", "cursor"),
+    ("AGENTS.md", "cwd", "AGENTS.md", "codex"),
+    (".github/copilot-instructions.md", "cwd", ".github/copilot-instructions.md", "copilot"),
+    ("GEMINI.md", "cwd", "GEMINI.md", "gemini"),
+)
+# Directories whose files are each scanned (Cursor MDC rules, Claude Code skills/memory).
+_RULES_GLOBS = (
+    (".cursor/rules", "cwd", ".cursor/rules", ("*.mdc",), "cursor"),
+    (".claude/skills", "cwd", ".claude/skills", ("SKILL.md",), "claude-code"),
+    ("~/.claude/skills", "home", "~/.claude/skills", ("SKILL.md",), "claude-code"),
+)
+
+
+# Detection is shared with palivane-secrets and the at-rest scanners and is installed
+# beside this script. Fall back to fetching it from the deployment this reports to rather
+# than failing with an ImportError the user cannot act on.
+def _load_detect():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "palivane_detect.py")
+    if not os.path.exists(path):
+        base = (os.environ.get("PALIVANE_URL") or "").rstrip("/")
+        if not base:
+            sys.exit("palivane_detect.py not found next to this script and PALIVANE_URL "
+                     "is unset, so it cannot be fetched. Download it from "
+                     "<your-palivane-url>/cli/palivane_detect.py into the same directory.")
+        try:
+            with urllib.request.urlopen(base + "/cli/palivane_detect.py", timeout=20) as r:
+                body = r.read()
+            path = os.path.join(tempfile.gettempdir(), "palivane_detect.py")
+            with open(path, "wb") as fh:
+                fh.write(body)
+        except Exception as e:                                    # noqa: BLE001
+            sys.exit(f"could not fetch palivane_detect.py from {base}: {e}")
+    spec = importlib.util.spec_from_file_location("palivane_detect", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+detect = _load_detect()
+
+
+def _findings(text: str, server: str = "") -> list[dict]:
+    """What palivane_detect found in `text`, in the metadata form the scan APIs take."""
+    out = [{"category": c, "label": lbl, "line": ln, "masked": mk}
+           for c, lbl, ln, mk in detect.scan_all(text)]
+    if server:
+        for fd in out:
+            fd["server"] = server
+    return out
+
+
+def mcp_findings(content: str) -> list[dict]:
+    """Secrets in an MCP config, attributed to the server they were declared under.
+
+    Mirrors what the backend used to scan per server — the command, its args, and every
+    env VALUE joined together — so moving the detection here changes where it runs and
+    nothing else. A config that will not parse still gets scanned as a whole; those
+    findings carry no server and the backend reports them against the file."""
+    try:
+        j = json.loads(content)
+        servers = j.get("mcpServers") or j.get("servers") or (j.get("mcp") or {}).get("servers")
+    except (ValueError, TypeError, AttributeError):
+        servers = None
+    if not isinstance(servers, dict):
+        return _findings(content)
+    out: list[dict] = []
+    for name, spec in servers.items():
+        if not isinstance(spec, dict):
+            continue
+        env = spec.get("env")
+        args_text = " ".join(
+            [str(spec.get("command", ""))]
+            + [str(a) for a in (spec.get("args") or [])]
+            + [str(v) for v in (env.values() if isinstance(env, dict) else [])])
+        out.extend(_findings(args_text, server=str(name)))
+    return out
+
+
+def _user() -> str:
+    """Best-effort identity for per-user attribution of endpoint findings."""
+    import getpass
+    return os.getenv("PALIVANE_USER") or (getpass.getuser() if hasattr(getpass, "getuser") else "") or ""
+
+
+def collect_agent_rules(cwd: str = ".") -> list[tuple[str, str, str, str]]:
+    """Read agent instruction/rules files present on the device. Returns
+    (label, content, path, tool). Repo-relative files come from `cwd`; user-level ones
+    from home. Bounded read + a cap on directory files so a huge skills tree can't stall
+    a session-start hook."""
+    out: list[tuple[str, str, str, str]] = []
+    seen: set[str] = set()
+
+    def _add(label: str, fspath: str, tool: str) -> None:
+        rp = os.path.realpath(fspath)
+        if rp in seen:
+            return
+        try:
+            with open(fspath, encoding="utf-8", errors="replace") as f:
+                content = f.read(200_000)
+        except Exception:
+            return
+        if content.strip():
+            seen.add(rp)
+            out.append((label, content, label, tool))
+
+    for label, relto, path, tool in _RULES_FILES:
+        base = os.path.join(cwd, path) if relto == "cwd" else os.path.expanduser(path)
+        _add(label, base, tool)
+    for label, relto, path, patterns, tool in _RULES_GLOBS:
+        root = os.path.join(cwd, path) if relto == "cwd" else os.path.expanduser(path)
+        try:
+            import fnmatch
+            hits = 0
+            for dirpath, _dirs, files in os.walk(root):
+                for fn in sorted(files):
+                    if any(fnmatch.fnmatch(fn, pat) for pat in patterns):
+                        rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                        _add(f"{label}/{rel}", os.path.join(dirpath, fn), tool)
+                        hits += 1
+                        if hits >= 100:      # cap: don't walk an enormous skills tree
+                            break
+                if hits >= 100:
+                    break
+        except Exception:
+            continue
+    return out
+
+
+def collect_agent_configs() -> list[tuple[str, str, str]]:
+    """Read AI coding-assistant settings files that exist. Returns (label, content, tool)."""
+    out, seen = [], set()
+    for label, path, tool in _AGENT_CONFIGS:
+        p = os.path.expanduser(path)
+        if p in seen:
+            continue
+        try:
+            with open(p) as f:
+                content = f.read(200_000)
+        except Exception:
+            continue
+        if content.strip():
+            seen.add(p)
+            out.append((label, content, tool))
+    return out
+
+
+def _settings_env(path: str = "~/.claude/settings.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            env = json.load(f).get("env")
+        return env if isinstance(env, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_config() -> dict:
+    """Backend URL/token: environment first, then ~/.claude/settings.json (the gateway
+    ak_ token doubles as the ingest credential, its base URL locates the backend)."""
+    senv = _settings_env()
+    url = os.getenv("PALIVANE_URL") or senv.get("PALIVANE_URL", "")
+    token = os.getenv("PALIVANE_TOKEN") or senv.get("PALIVANE_TOKEN", "")
+    if not token:
+        gw = senv.get("ANTHROPIC_AUTH_TOKEN", "")
+        if isinstance(gw, str) and gw.startswith("ak_"):
+            token = gw
+    if not url:
+        base = senv.get("ANTHROPIC_BASE_URL", "")
+        if isinstance(base, str) and base:
+            url = base.rstrip("/")
+            if url.endswith("/v1"):
+                url = url[: -len("/v1")]
+    return {"url": url.rstrip("/"), "token": token}
+
+
+# --- collection -------------------------------------------------------------------------
+
+def collect_ide_extensions() -> list[str] | None:
+    """Installed VS Code extension ids, or None when `code` isn't available."""
+    code = shutil.which("code")
+    if not code:
+        return None
+    try:
+        out = subprocess.run([code, "--list-extensions"], capture_output=True,
+                             text=True, timeout=5)
+        if out.returncode != 0:
+            return None
+        return sorted({ln.strip() for ln in out.stdout.splitlines() if ln.strip()})
+    except Exception:
+        return None
+
+
+def synthesize_claude_config(raw: str) -> str | None:
+    """A minimal {"mcpServers": …} document from ~/.claude.json — merges the top-level
+    servers with every project's, and carries nothing else from the file."""
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    servers: dict = {}
+    top = data.get("mcpServers")
+    if isinstance(top, dict):
+        servers.update(top)
+    projects = data.get("projects")
+    if isinstance(projects, dict):
+        for proj in projects.values():
+            if isinstance(proj, dict) and isinstance(proj.get("mcpServers"), dict):
+                for name, cfg in proj["mcpServers"].items():
+                    servers.setdefault(name, cfg)
+    if not servers:
+        return None
+    return json.dumps({"mcpServers": servers}, sort_keys=True)
+
+
+def find_mcp_configs(cwd: str = ".") -> list[tuple[str, str]]:
+    """(path-label, canonical content) pairs for every MCP config present on the device."""
+    found: list[tuple[str, str]] = []
+    claude_path = os.path.expanduser("~/.claude.json")
+    if os.path.exists(claude_path):
+        try:
+            synth = synthesize_claude_config(open(claude_path).read())
+            if synth:
+                found.append(("~/.claude.json", synth))
+        except OSError:
+            pass
+    for label, path in _RAW_MCP_CONFIGS:
+        p = os.path.join(cwd, ".mcp.json") if label == "./.mcp.json" else os.path.expanduser(path)
+        if os.path.exists(p):
+            try:
+                found.append((label, open(p).read()))
+            except OSError:
+                pass
+    return found
+
+
+# --- device health (capture-plane collisions & coverage gaps) ---------------------------
+# Raw state only — the device_posture detector server-side decides what's a finding, so
+# the rules update fleet-wide on a backend deploy. Everything here is best-effort and
+# bounded; a check that can't run reports nothing rather than failing the posture run.
+
+def _proxy_port() -> int:
+    try:
+        return int(os.getenv("PALIVANE_PROXY_PORT", "") or 8081)
+    except ValueError:
+        return 8081
+
+
+def _port_listening(port: int) -> bool:
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _listener_name(port: int) -> str:
+    """Best-effort name of the process listening on `port` (ss on Linux, lsof on macOS)."""
+    for cmd in ([shutil.which("ss") or "", "-tlnp"],
+                [shutil.which("lsof") or "", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]):
+        if not cmd[0]:
+            continue
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            continue
+        for line in out.splitlines():
+            if f":{port}" not in line:
+                continue
+            if 'users:(("' in line:                      # ss: users:(("name",pid=…,fd=…))
+                return line.split('users:(("', 1)[1].split('"', 1)[0]
+            if not line.startswith("COMMAND"):           # lsof: first column is the command
+                return line.split()[0]
+    return ""
+
+
+def _strip_cred(url: str) -> str:
+    """Proxy URLs can carry basic-auth credentials — never report those."""
+    scheme, sep, rest = url.partition("://")
+    if sep and "@" in rest:
+        rest = rest.rsplit("@", 1)[1]
+    return f"{scheme}{sep}{rest}"
+
+
+def _breaker_state() -> dict:
+    try:
+        with open(os.path.expanduser("~/.palivane/proxy-breaker.json")) as f:
+            data = json.load(f)
+    except Exception:
+        return {"cooldown_active": False, "deauth_active": False}
+    now = datetime.now(timezone.utc).timestamp()
+    # Booleans only (not the raw timestamps): the report stays byte-stable while a state
+    # holds, so the dedup cache posts on transitions instead of every re-run.
+    return {"cooldown_active": now < (data.get("cooldown_until") or 0),
+            "deauth_active": now < (data.get("deauth_until") or 0)}
+
+
+def _local_llms() -> list[dict]:
+    """Local model runtimes — shadow AI with zero network tell (nothing for the proxy,
+    extension, or gateway to see). Raw presence only; the server decides the finding."""
+    out = []
+    if shutil.which("ollama") or os.path.isdir(os.path.expanduser("~/.ollama")):
+        out.append({"name": "ollama", "listening": _port_listening(11434)})
+    for d in ("~/.lmstudio", "~/.cache/lm-studio",
+              "~/Library/Application Support/LM Studio"):
+        if os.path.isdir(os.path.expanduser(d)):
+            out.append({"name": "lm studio", "listening": _port_listening(1234)})
+            break
+    if shutil.which("llamafile"):
+        out.append({"name": "llamafile", "listening": _port_listening(8080)})
+    for d in ("~/.gpt4all", "~/Library/Application Support/nomic.ai"):
+        if os.path.isdir(os.path.expanduser(d)):
+            out.append({"name": "gpt4all", "listening": _port_listening(4891)})
+            break
+    return out
+
+
+def collect_device_health() -> dict:
+    port = _proxy_port()
+    listening = _port_listening(port)
+    proxy_env = _strip_cred(
+        os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+        or os.getenv("HTTP_PROXY") or os.getenv("http_proxy") or "")
+    points_local = any(f"{h}:{port}" in proxy_env for h in ("127.0.0.1", "localhost"))
+    try:
+        with open("/proc/version") as f:
+            wsl = "microsoft" in f.read().lower()
+    except OSError:
+        wsl = False
+    return {
+        "proxy": {"port": port, "listening": listening,
+                  "listener": _listener_name(port) if listening else "",
+                  "env_proxy": proxy_env, "env_points_local": points_local},
+        "breaker": _breaker_state(),
+        "gaps": {"wsl": wsl, "docker_present": shutil.which("docker") is not None,
+                 "in_container": os.path.exists("/.dockerenv")},
+        "local_llms": _local_llms(),
+    }
+
+
+# --- change-dedup cache -----------------------------------------------------------------
+
+def digest(content: str) -> str:
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def load_cache(path: str) -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            cache = json.load(f)
+        if isinstance(cache, dict) and isinstance(cache.get("entries"), dict):
+            return cache
+    except Exception:
+        pass
+    return {"version": 1, "backend": "", "entries": {}}
+
+
+def save_cache(path: str, cache: dict) -> None:
+    p = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+    with open(p, "w") as f:
+        json.dump(cache, f, indent=2)
+    os.chmod(p, 0o600)
+
+
+def should_post(cache: dict, backend: str, key: str, dig: str) -> bool:
+    """Post when the content changed since the last successful report — or when the
+    backend changed (a new backend has none of our earlier reports)."""
+    if cache.get("backend") != backend:
+        return True
+    entry = cache["entries"].get(key)
+    return not (isinstance(entry, dict) and entry.get("sha256") == dig)
+
+
+def _mark_posted(cache: dict, backend: str, key: str, dig: str) -> None:
+    if cache.get("backend") != backend:
+        cache["backend"] = backend
+        cache["entries"] = {}
+    cache["entries"][key] = {"sha256": dig,
+                             "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+# --- reporting --------------------------------------------------------------------------
+
+def _post(cfg: dict, api_path: str, body: dict, timeout: float = 10.0) -> bool:
+    """POST one report; True only on 2xx (so failures retry next run)."""
+    try:
+        req = urllib.request.Request(
+            cfg["url"] + api_path, method="POST", data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "User-Agent": f"palivane-posture/{VERSION}", "X-Palivane-Token": cfg["token"]},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
+# --- self-update ------------------------------------------------------------------------
+# Palivane's *decisions* are server-side, so detector/policy/judge changes reach every device
+# the moment the backend deploys — nothing here is needed for those. What DOES go stale on
+# disk is the plumbing: these hook scripts, the proxy addon, and palivane-secrets' local
+# patterns. This refreshes those from the backend that already governs the device.
+#
+# Rules, in order of importance:
+#   * Only ever replace files that already exist locally (never install new tools silently).
+#   * Verify the sha256 from the manifest BEFORE swapping; a mismatch aborts that file.
+#   * Swap atomically (temp file in the same dir + os.replace), so a killed process can't
+#     leave a half-written hook — the old one keeps working.
+#   * Skip anything not writable by us (MDM-managed copies under /usr/local/bin stay the
+#     MDM's job) and honor PALIVANE_NO_SELF_UPDATE=1 plus the server's own kill switch.
+#   * Never block a session: throttled to once a day, and every failure is silent.
+_UPDATE_INTERVAL_S = 86400
+# Where installed copies live: the CLI tools in ~/.palivane/bin, the proxy addon in ~/.palivane.
+_UPDATE_DIRS = ("~/.palivane/bin", "~/.palivane")
+
+
+def _self_update_disabled() -> bool:
+    return (os.getenv("PALIVANE_NO_SELF_UPDATE", "") or "").lower() in ("1", "true", "yes")
+
+
+def _fetch(url: str, token: str, timeout: float = 20.0) -> bytes | None:
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": f"palivane-posture/{VERSION}", "X-Palivane-Token": token})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if not (200 <= r.status < 300):
+                return None
+            return r.read()
+    except Exception:
+        return None
+
+
+def _installed_paths(name: str) -> list[str]:
+    """Local copies of `name` we're allowed to touch (existing + writable files only)."""
+    out = []
+    for d in _UPDATE_DIRS:
+        p = os.path.join(os.path.expanduser(d), name)
+        if os.path.isfile(p) and os.access(p, os.W_OK):
+            out.append(p)
+    return out
+
+
+def _replace_atomic(path: str, blob: bytes) -> bool:
+    """Write `blob` over `path` atomically, preserving its executable bit."""
+    tmp = f"{path}.palivane-new"
+    try:
+        mode = os.stat(path).st_mode
+        with open(tmp, "wb") as f:
+            f.write(blob)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)       # atomic within the same filesystem
+        return True
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def self_update(cfg: dict, cache: dict, force: bool = False,
+                dry_run: bool = False, say=print) -> int:
+    """Refresh installed Palivane scripts whose hash differs from the backend's manifest.
+    Returns the number updated (0 on any skip/failure — this never raises)."""
+    if _self_update_disabled():
+        return 0
+    last = cache.get("update_checked_at_epoch") or 0
+    now = int(datetime.now(timezone.utc).timestamp())
+    if not force and (now - last) < _UPDATE_INTERVAL_S:
+        return 0
+    cache["update_checked_at_epoch"] = now
+
+    raw = _fetch(cfg["url"].rstrip("/") + "/cli/manifest.json", cfg["token"])
+    if raw is None:
+        return 0
+    try:
+        manifest = json.loads(raw)
+        files = manifest["files"]
+    except Exception:
+        return 0
+    if manifest.get("self_update") is False:      # server-side kill switch
+        return 0
+
+    updated = 0
+    for name, meta in sorted(files.items()):
+        want = (meta or {}).get("sha256", "")
+        if not want:
+            continue
+        for path in _installed_paths(name):
+            try:
+                with open(path, "rb") as f:
+                    have = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                continue
+            if have == want:
+                continue
+            if dry_run:
+                say(f"would update {name} ({path})")
+                updated += 1
+                continue
+            blob = _fetch(f"{cfg['url'].rstrip('/')}/cli/{name}", cfg["token"])
+            if blob is None:
+                continue
+            if hashlib.sha256(blob).hexdigest() != want:
+                say(f"skipped {name}: hash mismatch (served content != manifest)")
+                continue
+            if _replace_atomic(path, blob):
+                updated += 1
+                say(f"updated {name} -> {manifest.get('version', '?')} ({path})")
+    return updated
+
+
+def run(cfg: dict, cache_path: str = CACHE_PATH, cwd: str = ".",
+        force: bool = False, dry_run: bool = False, quiet: bool = False) -> int:
+    say = (lambda *a: None) if quiet else print
+    cache = load_cache(cache_path)
+    reported = skipped = 0
+
+    items: list[tuple[str, str, dict, str]] = []  # (key, api_path, body, canonical)
+    exts = collect_ide_extensions()
+    if exts is not None:
+        canonical = "\n".join(exts)
+        items.append(("ide-extensions", "/api/scan/ide-extensions",
+                      {"extensions": exts, "record": True}, canonical))
+    # The three file-backed payloads. Each is scanned here and posted REDACTED — the
+    # canonical text kept for the change cache stays the real file, so rotating a token
+    # still reads as drift and re-reports.
+    for label, content in find_mcp_configs(cwd):
+        items.append((f"mcp:{label}", "/api/scan/mcp-config",
+                      {"content": detect.redact(content), "path": label,
+                       "findings": mcp_findings(content), "record": True}, content))
+    user = _user()
+    for label, content, tool in collect_agent_configs():
+        items.append((f"agent:{label}", "/api/scan/agent-config",
+                      {"content": detect.redact(content), "tool": tool, "user": user,
+                       "findings": _findings(content), "record": True}, content))
+    for label, content, path, tool in collect_agent_rules(cwd):
+        items.append((f"rules:{label}", "/api/scan/agent-rules",
+                      {"content": detect.redact(content), "path": path, "tool": tool,
+                       "user": user, "findings": _findings(content), "record": True}, content))
+    health = json.dumps(collect_device_health(), sort_keys=True)
+    items.append(("device-posture", "/api/scan/device-posture",
+                  {"content": health, "user": user, "record": True}, health))
+
+    for key, api_path, body, canonical in items:
+        dig = digest(canonical)
+        if not force and not should_post(cache, cfg["url"], key, dig):
+            skipped += 1
+            continue
+        if dry_run:
+            say(f"would post {key}")
+            reported += 1
+            continue
+        if _post(cfg, api_path, body):
+            _mark_posted(cache, cfg["url"], key, dig)
+            reported += 1
+            say(f"posted {key}")
+        else:
+            say(f"failed {key} (will retry next run)")
+
+    # Pick up new hook/addon/scanner code (throttled, silent on failure). Runs after the
+    # reports so a bad update can never cost this session its posture data — and at session
+    # START, so nothing is swapped underneath a hook that's mid-invocation.
+    updated = self_update(cfg, cache, force=force, dry_run=dry_run, say=say)
+
+    if not dry_run and (reported or updated or cache.get("update_checked_at_epoch")):
+        save_cache(cache_path, cache)
+    tail = f", {updated} updated" if updated else ""
+    say(f"palivane-posture: {reported} reported, {skipped} unchanged{tail}")
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--async" in args:
+        # Detach and return immediately — the SessionStart-hook entrypoint.
+        rest = [a for a in args if a != "--async"]
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), *rest, "--quiet"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return 0
+    cfg = read_config()
+    if not cfg["url"] or not cfg["token"]:
+        if "--quiet" not in args:
+            print("palivane-posture: not connected (set PALIVANE_URL/PALIVANE_TOKEN or run palivane-connect)")
+        return 0
+    return run(cfg, force="--force" in args, dry_run="--dry-run" in args,
+               quiet="--quiet" in args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # fail open
