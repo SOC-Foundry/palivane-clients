@@ -78,8 +78,12 @@ detect = _load_detect()
 
 # Obvious-binary paths we never fetch (the content scan can't read them anyway). The tree
 # already gives us sizes; this trims the blob-fetch fan-out before we spend an API call.
+# .pdf and the OOXML formats are deliberately ABSENT: the extractor reads them, and a
+# design doc or an exported spreadsheet committed to a repo holds the same credentials the
+# source does. Images stay here — OCR needs Pillow and tesseract, which a stdlib scanner
+# will not have; the backend's connector scanning is where images get read.
 _BINARY_EXTS = (
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg", ".pdf",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg",
     ".zip", ".gz", ".tar", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war",
     ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi",
     ".so", ".dylib", ".dll", ".class", ".wasm", ".o", ".a", ".bin", ".exe",
@@ -190,9 +194,13 @@ def scan_blob(item: dict, token: str, api: str) -> dict | None:
         return UNREADABLE
     try:
         raw = base64.b64decode(blob.get("content", ""))
-        text = raw.decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
-        return UNREADABLE    # binary — skip
+    except ValueError:
+        return UNREADABLE
+    # Plain source directly; a PDF or Office document in the repo through the extractor —
+    # design docs and exported spreadsheets get committed, and they hold the same secrets.
+    text = detect.extract_text(item.get("path", ""), raw)
+    if not text:
+        return UNREADABLE
     found = detect.scan_all(text[:MAX_CONTENT])
     if not found:
         return None

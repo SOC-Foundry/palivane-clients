@@ -150,18 +150,18 @@ def list_objects(s3, bucket: str, prefix: str, max_objects: int) -> list[dict]:
 
 
 def read_object(s3, bucket: str, key: str) -> str | None:
-    """Fetch one object's body as utf-8 text, truncated to the backend limit. Returns None on
-    a binary object (UnicodeDecodeError) or a read error — those are simply skipped."""
+    """One object's readable text: plain text directly, and PDFs / Office documents
+    through the shared extractor, since a bucket of exported reports is exactly where a
+    customer record sits. Returns None for what nothing here can open (an image needs OCR,
+    which is not available in a stdlib scanner) — the caller counts those, so an unopened
+    object is never mistaken for a clean one."""
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
         raw = resp["Body"].read()
     except Exception:
         return None
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return None   # binary — not scannable as text
-    return text[:MAX_CONTENT]
+    text = detect.extract_text(key, raw)
+    return text[:MAX_CONTENT] if text else None
 
 
 def read_config(url_flag: str) -> dict:

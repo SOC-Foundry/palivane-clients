@@ -200,6 +200,129 @@ def redact(text: str) -> str:
     return text
 
 
+# --- document text extraction -------------------------------------------------------------
+# A regulated record is more often a PDF or a spreadsheet than a typed sentence, and a
+# scanner that only reads plain text reports those as clean. Stdlib only, so the same code
+# runs in the at-rest scanners (which must not grow dependencies) and on the server.
+#
+# Deliberately narrow: this recovers text that is ALREADY text inside a container. It does
+# not OCR (that needs Pillow + tesseract, and lives server-side) and it does not attempt
+# encrypted PDFs or the pre-2007 binary Office formats. Anything it cannot read returns ""
+# so the caller can report it as unread, which is the whole point — a scanner that silently
+# skipped a file is indistinguishable from one that found nothing in it.
+
+_OOXML_PARTS = {
+    "docx": ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml"),
+    "pptx": None,      # every ppt/slides/slideN.xml, plus notes
+    "xlsx": None,      # xl/sharedStrings.xml carries the strings; sheets carry the numbers
+}
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"[ \t]{2,}")
+_MAX_EXTRACT_CHARS = 500_000
+
+
+def _xml_text(blob: bytes) -> str:
+    """Strip XML tags to their text. Paragraph and row ends become newlines first, so a
+    spreadsheet column does not run into the next one and defeat the line-based scanners."""
+    try:
+        x = blob.decode("utf-8", errors="replace")
+    except Exception:                                             # noqa: BLE001
+        return ""
+    x = re.sub(r"</(w:p|a:p|w:tr|row|si|c)>", "\n", x)
+    x = _TAG_RE.sub(" ", x)
+    for ent, ch in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                    ("&quot;", '"'), ("&apos;", "'"), ("&#xa;", "\n")):
+        x = x.replace(ent, ch)
+    return _WS_RE.sub(" ", x)
+
+
+def _extract_ooxml(data: bytes, kind: str) -> str:
+    """docx / xlsx / pptx are ZIPs of XML, so no parser library is needed."""
+    import io
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:                                             # noqa: BLE001
+        return ""
+    names = zf.namelist()
+    if kind == "docx":
+        want = [n for n in _OOXML_PARTS["docx"] if n in names]
+    elif kind == "pptx":
+        want = sorted(n for n in names
+                      if n.startswith(("ppt/slides/slide", "ppt/notesSlides/notesSlide"))
+                      and n.endswith(".xml"))
+    else:
+        want = [n for n in names
+                if n == "xl/sharedStrings.xml" or n.startswith("xl/worksheets/sheet")]
+    out: list[str] = []
+    for n in want:
+        try:
+            out.append(_xml_text(zf.read(n)))
+        except Exception:                                         # noqa: BLE001
+            continue
+        if sum(len(p) for p in out) > _MAX_EXTRACT_CHARS:
+            break
+    return "\n".join(out)
+
+
+_PDF_STREAM_RE = re.compile(rb"stream\r?\n(.*?)endstream", re.DOTALL)
+_PDF_TJ_RE = re.compile(rb"\((?:\\.|[^\\()])*\)")
+
+
+def _extract_pdf(data: bytes) -> str:
+    """Text from an unencrypted PDF's content streams.
+
+    PDF stores text as show-string operators inside (usually Flate-compressed) streams.
+    Pulling the parenthesised literals gets the words without a font/layout engine: order
+    is right, spacing is approximate. That is exactly enough for pattern detection and not
+    enough to reconstruct the document, which is the right trade for a scanner.
+
+    Encrypted PDFs and ones whose text is CID/Type0-encoded come back empty rather than as
+    mojibake — garbage here would mean garbage findings."""
+    import zlib
+    chunks: list[str] = []
+    for raw in _PDF_STREAM_RE.findall(data):
+        body = raw
+        try:
+            body = zlib.decompress(raw.strip(b"\r\n"))
+        except Exception:                                         # noqa: BLE001
+            pass                      # uncompressed stream, or a filter we do not handle
+        if b"Tj" not in body and b"TJ" not in body:
+            continue
+        for lit in _PDF_TJ_RE.findall(body):
+            t = lit[1:-1]
+            t = (t.replace(b"\\(", b"(").replace(b"\\)", b")")
+                  .replace(b"\\\\", b"\\").replace(b"\\n", b"\n").replace(b"\\t", b"\t"))
+            chunks.append(t.decode("utf-8", errors="replace"))
+        chunks.append("\n")
+        if sum(len(c) for c in chunks) > _MAX_EXTRACT_CHARS:
+            break
+    text = "".join(chunks)
+    # A CID-encoded or encrypted PDF yields bytes that decode to mostly control/replacement
+    # characters. Report nothing rather than feed the detectors noise.
+    printable = sum(1 for c in text if c.isprintable() or c in "\n\t")
+    return text if text and printable / len(text) > 0.8 else ""
+
+
+def extract_text(name: str, data: bytes) -> str:
+    """Readable text from a file's bytes, or "" when the format needs something this cannot
+    do (OCR, a PDF cipher, a pre-2007 Office binary). `name` supplies the extension."""
+    ext = (name or "").rsplit(".", 1)[-1].lower() if "." in (name or "") else ""
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return ""
+    data = bytes(data)
+    if ext in ("docx", "docm", "xlsx", "xlsm", "pptx", "pptm"):
+        return _extract_ooxml(data, {"docm": "docx", "xlsm": "xlsx",
+                                     "pptm": "pptx"}.get(ext, ext))[:_MAX_EXTRACT_CHARS]
+    if ext == "pdf" or data[:5] == b"%PDF-":
+        return _extract_pdf(data)[:_MAX_EXTRACT_CHARS]
+    try:                                    # plain text of any flavour
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    return text[:_MAX_EXTRACT_CHARS]
+
+
 # --- PII / PHI ---------------------------------------------------------------------------
 # Ported from the server's shadow_ai detector so a client-detected finding matches what the
 # server would have said about the same bytes. The discipline there is worth keeping: a
