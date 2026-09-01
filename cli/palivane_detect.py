@@ -284,7 +284,12 @@ def _extract_pdf(data: bytes) -> str:
     for raw in _PDF_STREAM_RE.findall(data):
         body = raw
         try:
-            body = zlib.decompress(raw.strip(b"\r\n"))
+            # decompressobj, not decompress: a PDF stream is followed by an EOL before
+            # "endstream", and the deflate payload itself may END in 0x0a or 0x0d. Stripping
+            # those to remove the delimiter truncates one stream in roughly every few, and
+            # the failure is silent — the file just extracts to nothing. decompressobj stops
+            # at the end of the deflate data and ignores whatever trails it.
+            body = zlib.decompressobj().decompress(raw)
         except Exception:                                         # noqa: BLE001
             pass                      # uncompressed stream, or a filter we do not handle
         if b"Tj" not in body and b"TJ" not in body:
