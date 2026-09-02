@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import re
+import secrets
 from collections import Counter
 
 _STRIP = " (separator stripped — likely bypass)"
@@ -395,44 +396,143 @@ def _valid_ssn9(d: str) -> bool:
     return area not in ("000", "666") and area[0] != "9" and group != "00" and serial != "0000"
 
 
+def _line_pii(line: str) -> list[tuple[str, str, str]]:
+    """(category, label, RAW value) for one line. The raw-value sibling of scan_pii, which
+    masks. Split out so detection lives in exactly one place: tokenize() needs the actual
+    value to substitute, and a second copy of these rules would drift from this one the
+    first time a format changed."""
+    out: list[tuple[str, str, str]] = []
+    cat = "phi_exposure" if _PHI_CONTEXT_RE.search(line) else "pii_exposure"
+    seen: set[tuple[str, str]] = set()
+
+    def add(label: str, value: str) -> None:
+        k = (label, value)
+        if k not in seen:
+            seen.add(k)
+            out.append((cat, label, value))
+
+    for m in SSN_RE.finditer(line):
+        if _valid_ssn9(re.sub(r"\D", "", m.group(0))):
+            add("US Social Security number", m.group(0))
+    if SSN_CONTEXT_RE.search(line):
+        for m in SSN_NODASH_RE.finditer(line):
+            if _valid_ssn9(m.group(0)):
+                add("US Social Security number", m.group(0))
+    illustrative = bool(_TEST_CONTEXT_RE.search(line))
+    for m in CC_CANDIDATE_RE.finditer(line):
+        digits = re.sub(r"\D", "", m.group(0))
+        if len(digits) < 13 or not _luhn_ok(digits):
+            continue
+        if digits in _TEST_CARDS and illustrative:
+            continue
+        add("payment card number", digits)
+    for label, rx in _PII_STRONG:
+        for m in rx.finditer(line):
+            add(label, m.group(0))
+    for label, ctx, rx in _PII_CONTEXT:
+        if not ctx.search(line):
+            continue
+        for m in rx.finditer(line):
+            add(label, m.group(0))
+    return out
+
+
 def scan_pii(text: str) -> list[tuple[str, str, int, str]]:
     """(category, label, line_no, masked) for personal data. Category is pii_exposure, or
     phi_exposure when health context sits on the same line."""
-    out: list[tuple[str, str, int, str]] = []
-    for lineno, line in enumerate(text.splitlines(), 1):
-        cat = "phi_exposure" if _PHI_CONTEXT_RE.search(line) else "pii_exposure"
-        seen: set[tuple[str, str]] = set()
+    return [(cat, label, lineno, mask(val))
+            for lineno, line in enumerate(text.splitlines(), 1)
+            for cat, label, val in _line_pii(line)]
 
-        def add(label: str, value: str) -> None:
-            k = (label, value)
-            if k not in seen:
-                seen.add(k)
-                out.append((cat, label, lineno, mask(value)))
 
-        for m in SSN_RE.finditer(line):
-            if _valid_ssn9(re.sub(r"\D", "", m.group(0))):
-                add("US Social Security number", m.group(0))
-        if SSN_CONTEXT_RE.search(line):
-            for m in SSN_NODASH_RE.finditer(line):
-                if _valid_ssn9(m.group(0)):
-                    add("US Social Security number", m.group(0))
-        illustrative = bool(_TEST_CONTEXT_RE.search(line))
-        for m in CC_CANDIDATE_RE.finditer(line):
-            digits = re.sub(r"\D", "", m.group(0))
-            if len(digits) < 13 or not _luhn_ok(digits):
-                continue
-            if digits in _TEST_CARDS and illustrative:
-                continue
-            add("payment card number", digits)
-        for label, rx in _PII_STRONG:
-            for m in rx.finditer(line):
-                add(label, m.group(0))
-        for label, ctx, rx in _PII_CONTEXT:
-            if not ctx.search(line):
-                continue
-            for m in rx.finditer(line):
-                add(label, m.group(0))
-    return out
+# --- reversible tokenization ---------------------------------------------------------
+# redact() above is one-way: it removes a value and the prompt loses whatever the value was
+# doing. That is right for a secret, which the model should never see in any form, and
+# wrong for personal data the model has to reason OVER: reformat this record, summarise
+# these customers, draft a reply. Redact those and the task fails, so people turn the
+# capture plane off, which costs more than it saved.
+#
+# Tokenizing substitutes a stable placeholder instead, so structure survives and identity
+# does not. The map is RETURNED, never stored:
+#
+#   * not server-side. Palivane would then hold a plaintext-to-token vault, which is the
+#     sensitive data again, in one high-value place, and contradicts the promise that the
+#     verdict is kept and the text is not.
+#   * not on disk client-side either. That is a plaintext PII file on every laptop, which
+#     is precisely the artifact palivane-secrets exists to find and report.
+#   * so: in memory, for one exchange. Tokenize on the way out, detokenize the model's
+#     answer on the way back, drop the map. That closes the only loop that needs closing,
+#     and nothing is left anywhere afterwards.
+#
+# Tokens are random per call rather than derived from the value. A keyed hash would give
+# the same token everywhere with no map at all, which is tempting, but the key would have
+# to sit on every endpoint and a hash of a nine-digit SSN is enumerable the moment it
+# leaks. Correlation across exchanges is already served by content fingerprints, which do
+# not require holding the plaintext to do it.
+
+TOKEN_RE = re.compile(r"PLV_[A-Z0-9]{2,12}_[0-9A-F]{6}")
+
+# Categories worth tokenizing rather than removing. Secrets are deliberately absent: a
+# credential should not reach the model in any form, so redact() stays the answer there.
+TOKENIZABLE = ("pii_exposure", "phi_exposure")
+
+
+def _slug(label: str) -> str:
+    """A short, readable tag for the token so a model can tell two kinds of value apart.
+    Initials of a multi-word label, else the label itself."""
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", label) if w]
+    if len(words) > 1:
+        out = "".join(w[0] for w in words).upper()
+    else:
+        out = (words[0] if words else "PII").upper()
+    return (out[:12] or "PII")
+
+
+def tokenize(text: str, categories: tuple[str, ...] = TOKENIZABLE) -> tuple[str, dict[str, str]]:
+    """`text` with personal data replaced by reversible tokens, and the map to reverse it.
+
+    Returns (tokenized_text, {token: original}). The caller holds the map in memory for the
+    length of one exchange and drops it; writing it anywhere defeats the point (see above).
+
+    The same value gets the same token throughout, so a model can still tell that two
+    mentions are the same person. Longest values are substituted first, for the same reason
+    redact() does it: a short value sitting inside a longer one must not leave a fragment
+    of the longer one behind.
+    """
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        for cat, label, val in _line_pii(line[:4000]):
+            if cat in categories:
+                values.setdefault(val, label)
+    mapping: dict[str, str] = {}
+    for val in sorted(values, key=len, reverse=True):
+        token = f"PLV_{_slug(values[val])}_{secrets.token_hex(3).upper()}"
+        while token in mapping:                       # collision is vanishingly unlikely
+            token = f"PLV_{_slug(values[val])}_{secrets.token_hex(3).upper()}"
+        mapping[token] = val
+        text = text.replace(val, token)
+    return text, mapping
+
+
+def detokenize(text: str, mapping: dict[str, str]) -> str:
+    """Put the real values back into a model's answer.
+
+    Case-insensitive on the token, because models do not always echo one verbatim. Tokens
+    the map does not know are left exactly as they are: a model that invents one is telling
+    you something, and quietly deleting it would hide that.
+    """
+    if not mapping:
+        return text
+    lower = {t.lower(): v for t, v in mapping.items()}
+    return re.sub(TOKEN_RE.pattern,
+                  lambda m: lower.get(m.group(0).lower(), m.group(0)), text, flags=re.I)
+
+
+def unknown_tokens(text: str, mapping: dict[str, str]) -> list[str]:
+    """Tokens in `text` that the map cannot resolve, i.e. ones the model made up."""
+    known = {t.lower() for t in mapping}
+    return sorted({m.group(0) for m in re.finditer(TOKEN_RE.pattern, text, re.I)
+                   if m.group(0).lower() not in known})
 
 
 def scan_all(text: str) -> list[tuple[str, str, int, str]]:
