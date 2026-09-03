@@ -239,6 +239,25 @@ Windows `C:\ProgramData\gemini-cli\`). The policy pack emits a ready-to-merge
 `gemini-settings.json`. Credentials: `PALIVANE_URL` + `PALIVANE_TOKEN` from the environment,
 else `~/.gemini/palivane.json`, else `~/.claude/settings.json`.
 
+## Grok CLI — coverage via the gateway (OpenAI-compatible)
+
+Grok CLI ([superagent-ai/grok-cli](https://github.com/superagent-ai/grok-cli)) has no
+local hook system, but it **is OpenAI-compatible and honors a base-URL override**, so it's
+covered through the gateway rather than a hook adapter — point it at Palivane and set the
+capture key:
+
+```bash
+export GROK_BASE_URL=https://app.palivane.io/v1   # the Palivane gateway (OpenAI-shaped)
+export GROK_API_KEY=<your Palivane capture key>    # from `palivane-connect`
+```
+
+The gateway captures the prompt/response and forwards `grok-*` models to xAI using the
+org's **xAI upstream** — set it in the console under Settings → Gateway upstreams (or
+`GATEWAY_XAI_KEY`). Grok models are routed to xAI automatically; other models on the same
+endpoint still go to OpenAI, so one base URL covers both. Without an xAI upstream key the
+gateway captures the prompt and returns the inspection stub (offline-demoable) rather than
+a real completion.
+
 ## `palivane-mcp` — inline inspection for local stdio MCP servers
 
 Local stdio MCP servers never touch the network, so the egress proxy can't see them.
