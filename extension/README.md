@@ -64,8 +64,10 @@ INGEST_TENANT=<tenant slug, e.g. acme>
 
 ## Install, so users can just install it
 
-Publish the `build.sh` zip to the **Chrome Web Store** (or **Edge Add-ons**) as a
-**private/unlisted** item, or self-host the CRX with an `update_url`. Then either:
+The extension is published publicly on the Chrome Web Store:
+**https://chromewebstore.google.com/detail/fnejondlaacijahdjkhcgiijlnjoapho** (id `fnejondlaacijahdjkhcgiijlnjoapho` — set as `PALIVANE_EXTENSION_ID` on the
+deployment so MDM packs and the console reference it). Self-hosting the CRX with an
+`update_url` remains supported for air-gapped fleets. Then either:
 - users click **Add to Chrome** (one click), or
 - you **force-install** it so it appears automatically, no user action.
 
