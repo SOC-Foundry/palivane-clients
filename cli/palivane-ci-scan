@@ -91,9 +91,18 @@ def github_oidc_token(audience: str) -> str:
 
 
 def local_workflows(root: str) -> list[dict]:
-    """Workflow files from a local checkout: <root>/.github/workflows/*.yml|yaml."""
-    wf_dir = os.path.join(root, WF_DIR)
+    """CI files from a local checkout: <root>/.github/workflows/*.yml|yaml, plus the
+    repo's .gitlab-ci.yml when present — GitLab runners run this same scanner with
+    --local and get the GitLab posture rules (includes, MR-privilege, AI agents)."""
     out = []
+    gl = os.path.join(root, ".gitlab-ci.yml")
+    if os.path.isfile(gl):
+        try:
+            with open(gl, encoding="utf-8", errors="replace") as f:
+                out.append({"path": ".gitlab-ci.yml", "content": f.read()[:MAX_CONTENT]})
+        except OSError as e:
+            print(f"palivane: cannot read {gl} ({e}) — skipping.", file=sys.stderr)
+    wf_dir = os.path.join(root, WF_DIR)
     if not os.path.isdir(wf_dir):
         return out
     for name in sorted(os.listdir(wf_dir)):
