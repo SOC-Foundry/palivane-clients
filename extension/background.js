@@ -89,6 +89,13 @@ async function signIn() {
   return { user: frag.get("user") || "" };
 }
 
+// SHA-256 hex for the justify flow: the override grant is pinned to the exact blocked
+// message, not just its finding (findings fold on violation classes, not text).
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 async function recordVerdict(verdict) {
   // Keep a session block counter + the last verdict for the popup, and reflect blocks
   // on the toolbar badge.
@@ -122,6 +129,37 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg && msg.type === "justify") {
+    (async () => {
+      try {
+        const c = await config();
+        const key = await getIngestKey(c);
+        if (!key) { sendResponse({ ok: false }); return; }
+        const hKey = "blockedHash:" + (msg.payload && msg.payload.finding_id);
+        const stored = await chrome.storage.session.get({ [hKey]: "" });
+        const res = await fetch(c.backendUrl.replace(/\/$/, "") + "/api/ingest/justify", {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Palivane-Token": key },
+          body: JSON.stringify({ ...msg.payload, user: c.user,
+                                 content_hash: stored[hKey] || "" }),
+        });
+        if (!res.ok) {
+          sendResponse({ ok: false, error: res.status === 403 ? "confirmed" : String(res.status) });
+          return;
+        }
+        const data = await res.json();
+        // One pending grant at a time, in session storage: MV3 service workers are torn
+        // down between events, so an in-memory variable would forget the grant before the
+        // user presses send again. The backend binds the token to the finding + actor.
+        await chrome.storage.session.set({ overrideGrant: {
+          token: data.override_token || "",
+          expires: Date.now() + ((data.expires_in || 600) - 30) * 1000,
+        }});
+        sendResponse({ ok: true });
+      } catch (e) { sendResponse({ ok: false, error: String(e) }); }
+    })();
+    return true;
+  }
   if (msg && msg.type === "exception") {
     (async () => {
       try {
@@ -144,10 +182,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const c = await config();
       let key = await getIngestKey(c);
       if (!key) { sendResponse({ action: "allow", reason: "unconfigured" }); return; }
+      // A recorded justification grants exactly one send: attach the token, and clear it
+      // when the backend honored it (verdict.overridden) so it cannot linger.
+      const { overrideGrant } = await chrome.storage.session.get({ overrideGrant: null });
+      const grant = overrideGrant && overrideGrant.expires > Date.now() ? overrideGrant.token : "";
       const call = (k) => fetch(c.backendUrl.replace(/\/$/, "") + "/api/ingest/ai-usage", {
         method: "POST",
         headers: { "content-type": "application/json", "X-Palivane-Token": k },
-        body: JSON.stringify({ content: msg.content, destination: msg.destination, user: c.user }),
+        body: JSON.stringify({ content: msg.content, destination: msg.destination, user: c.user,
+                               ...(grant ? { override_token: grant } : {}) }),
       });
       let res = await call(key);
       // A cached device key can be revoked/rotated server-side. With an enrollToken we can
@@ -162,6 +205,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       // CONFIRMED secret/PII leak (force_block) is hard-blocked regardless: block the
       // certain, monitor the fuzzy.
       if (!c.enforce && verdict.action === "block" && !verdict.force_block) verdict.action = "warn";
+      if (verdict.overridden) await chrome.storage.session.remove("overrideGrant");  // consumed
+      if (verdict.action === "block" && verdict.finding_id && verdict.self_justify) {
+        await chrome.storage.session.set({
+          ["blockedHash:" + verdict.finding_id]: await sha256Hex(msg.content) });
+      }
       await recordVerdict(verdict);
       sendResponse(verdict);
     } catch (e) {

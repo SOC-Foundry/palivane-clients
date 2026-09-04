@@ -121,6 +121,20 @@ function showBlockModal(verdict) {
         risk ${riskText(verdict)} ·
         the AI tool may show a "failed to send" error, that's the block working.
       </div>
+      ${verdict.self_justify && verdict.finding_id ? `
+      <div id="palivane-justify" style="margin-top:14px;padding:11px 13px;
+          background:rgba(184,121,31,.10);border:1px solid rgba(184,121,31,.4);border-radius:10px">
+        <div style="font-weight:700;color:#e8b04b;font-size:13px">Business need to send this anyway?</div>
+        <div style="color:#8a93a6;font-size:12px;margin-top:3px">Your justification is recorded
+          for the security team, then pressing send again delivers this exact message.</div>
+        <textarea id="palivane-justify-text" rows="2" minlength="10" placeholder="Why this needs to go (10+ characters)…"
+          style="width:100%;margin-top:8px;box-sizing:border-box;background:#0f1320;color:#e6e9f0;
+                 border:1px solid #2a3346;border-radius:8px;padding:8px;font:12.5px/1.4 inherit;resize:vertical"></textarea>
+        <button id="palivane-justify-go" style="margin-top:8px;padding:8px 12px;border:none;
+          border-radius:8px;background:#e8b04b;color:#231803;font-weight:700;font-size:12.5px;cursor:pointer">
+          Record justification & unlock send
+        </button>
+      </div>` : ""}
       <div style="display:flex;gap:8px;margin-top:18px">
         <button id="palivane-modal-x" style="
           flex:1;padding:11px;border:none;border-radius:8px;
@@ -140,6 +154,33 @@ function showBlockModal(verdict) {
   const btn = document.getElementById("palivane-modal-x");
   btn.addEventListener("click", close);
   btn.focus();
+
+  // Justified proceed: record the reason, background stores the override token, the
+  // user's next send of the same message goes through (as a warn, audit-logged).
+  document.getElementById("palivane-justify-go")?.addEventListener("click", async (e) => {
+    const b = e.currentTarget;
+    const text = (document.getElementById("palivane-justify-text")?.value || "").trim();
+    if (text.length < 10) {
+      b.textContent = "Add a few more words (10+ characters)";
+      return;
+    }
+    b.disabled = true; b.textContent = "Recording…";
+    try {
+      const r = await chrome.runtime.sendMessage({
+        type: "justify",
+        payload: { finding_id: verdict.finding_id, justification: text },
+      });
+      if (r && r.ok) {
+        b.textContent = "✓ Recorded — press send again to deliver";
+        b.style.background = "#2f9e5f"; b.style.color = "#04140b";
+      } else {
+        b.disabled = false;
+        b.textContent = r && r.error === "confirmed"
+          ? "Confirmed secret/PII — ask an admin via Request exception"
+          : "Couldn't record, try again";
+      }
+    } catch (_) { b.disabled = false; b.textContent = "Couldn't record, try again"; }
+  });
 
   document.getElementById("palivane-modal-exc").addEventListener("click", async (e) => {
     const b = e.currentTarget;
