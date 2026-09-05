@@ -1,5 +1,11 @@
 const $ = (id) => document.getElementById(id);
 
+// Escape before interpolating any server-supplied value into innerHTML — verdict fields,
+// signal categories and the account display name all originate off-box.
+const esc = (s) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
 function render(state) {
   $("blockCount").textContent = state.blockCount || 0;
   const v = state.lastVerdict;
@@ -9,12 +15,12 @@ function render(state) {
     el.textContent = "No prompts inspected yet.";
     return;
   }
-  const sigs = (v.signals || []).map((s) => s.category).join(", ") || "-";
-  const when = v.at ? new Date(v.at).toLocaleTimeString() : "";
+  const sigs = (v.signals || []).map((s) => esc(s.category)).join(", ") || "-";
+  const when = v.at ? esc(new Date(v.at).toLocaleTimeString()) : "";
   el.className = "verdict";
   el.innerHTML =
-    `<div>last verdict, <span class="sev sev-${v.severity}">${v.action} · ${v.severity}</span> ` +
-    `(risk ${v.risk_score ?? "?"})</div>` +
+    `<div>last verdict, <span class="sev sev-${esc(v.severity)}">${esc(v.action)} · ${esc(v.severity)}</span> ` +
+    `(risk ${esc(v.risk_score ?? "?")})</div>` +
     `<div class="sigs">${sigs}</div>` +
     `<div class="muted" style="margin-top:4px;font-size:11px;">${when}</div>`;
 }
@@ -23,7 +29,7 @@ function renderConn(s) {
   const el = $("conn");
   if (s && s.configured) {
     el.className = "conn";
-    el.innerHTML = `<div>Connected${s.user ? ' as <span class="who">' + s.user + "</span>" : ""}` +
+    el.innerHTML = `<div>Connected${s.user ? ' as <span class="who">' + esc(s.user) + "</span>" : ""}` +
       `${s.managed ? " (managed by your organization)" : ""}.</div>`;
   } else {
     el.className = "conn muted";
@@ -39,7 +45,7 @@ function bindSignin() {
     btn.textContent = "Opening sign-in…"; btn.disabled = true;
     const r = await chrome.runtime.sendMessage({ type: "signIn" });
     if (r && r.ok) { loadConn(); return; }
-    $("conn").innerHTML = `<div class="err">Sign-in failed: ${(r && r.error) || "unknown"}</div>` +
+    $("conn").innerHTML = `<div class="err">Sign-in failed: ${esc((r && r.error) || "unknown")}</div>` +
       `<button id="signin">Try again</button>`;
     bindSignin();
   });

@@ -237,6 +237,29 @@ def _xml_text(blob: bytes) -> str:
     return _WS_RE.sub(" ", x)
 
 
+# A ZIP entry can be a decompression bomb: zf.read() inflates the WHOLE entry into memory
+# (a 5 MB deflate of zeros -> ~5 GB) before any char cap is checked. Read at most a bounded
+# number of DECOMPRESSED bytes via the streaming ZipExtFile, and reject entries whose
+# declared uncompressed size is already absurd — so a hostile Office/OpenDocument file
+# (Slack/Drive/SharePoint attachment) can't OOM the worker.
+_MAX_ZIP_MEMBER_BYTES = 4 * _MAX_EXTRACT_CHARS   # ~2 MB decompressed per entry, then truncated
+
+
+def _zip_read_capped(zf, name: str) -> bytes:
+    import zipfile
+    try:
+        info = zf.getinfo(name)
+    except KeyError:
+        return b""
+    if (info.file_size or 0) > 50 * 1024 * 1024:   # declared >50 MB uncompressed: skip
+        return b""
+    try:
+        with zf.open(name) as fh:                    # streams; read() stops at the cap
+            return fh.read(_MAX_ZIP_MEMBER_BYTES)
+    except (zipfile.BadZipFile, OSError, EOFError):
+        return b""
+
+
 def _extract_ooxml(data: bytes, kind: str) -> str:
     """docx / xlsx / pptx are ZIPs of XML, so no parser library is needed."""
     import io
@@ -258,7 +281,7 @@ def _extract_ooxml(data: bytes, kind: str) -> str:
     out: list[str] = []
     for n in want:
         try:
-            out.append(_xml_text(zf.read(n)))
+            out.append(_xml_text(_zip_read_capped(zf, n)))
         except Exception:                                         # noqa: BLE001
             continue
         if sum(len(p) for p in out) > _MAX_EXTRACT_CHARS:
@@ -280,7 +303,7 @@ def _extract_odf(data: bytes) -> str:
     for n in ("content.xml", "styles.xml"):
         if n in names:
             try:
-                out.append(_xml_text(zf.read(n)))
+                out.append(_xml_text(_zip_read_capped(zf, n)))
             except Exception:                                     # noqa: BLE001
                 continue
     return "\n".join(out)
