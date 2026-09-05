@@ -95,6 +95,14 @@ def local_workflows(root: str) -> list[dict]:
     repo's .gitlab-ci.yml when present — GitLab runners run this same scanner with
     --local and get the GitLab posture rules (includes, MR-privilege, AI agents)."""
     out = []
+    for extra in (".circleci/config.yml", "azure-pipelines.yml"):
+        p = os.path.join(root, extra)
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    out.append({"path": extra, "content": f.read()[:MAX_CONTENT]})
+            except OSError as e:
+                print(f"palivane: cannot read {p} ({e}) — skipping.", file=sys.stderr)
     gl = os.path.join(root, ".gitlab-ci.yml")
     if os.path.isfile(gl):
         try:
