@@ -330,6 +330,95 @@ def prompt_block_output(verdict: dict) -> dict:
     return {"decision": "block", "reason": reason}
 
 
+# --- justified proceed (Human Firewall, CLI edition) ---------------------------------------
+# A blocked prompt writes a pending-block record; `palivane-hook justify "reason"` records
+# the business justification with the backend and stores the returned override token; the
+# next submission of the SAME prompt attaches it and goes through (audit-logged). Mirrors
+# the browser extension's flow — confirmed credentials stay non-overridable server-side.
+
+def _state_path(name: str) -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
+
+
+def _save_last_block(content: str, verdict: dict) -> None:
+    import hashlib
+    try:
+        with open(_state_path("last-block.json"), "w") as f:
+            json.dump({"finding_id": verdict.get("finding_id"),
+                       "content_hash": hashlib.sha256(content.encode()).hexdigest(),
+                       "at": time.time()}, f)
+    except OSError:
+        pass
+
+
+def _load_override_token() -> str:
+    try:
+        with open(_state_path("override-token.json")) as f:
+            blob = json.load(f)
+        if blob.get("expires", 0) > time.time():
+            return str(blob.get("token") or "")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def _clear_override_token() -> None:
+    try:
+        os.unlink(_state_path("override-token.json"))
+    except OSError:
+        pass
+
+
+def cmd_justify(reason: str) -> int:
+    """`palivane-hook justify "reason"` — record a business justification for the last
+    blocked prompt and unlock resending it once."""
+    cfg = read_config()
+    if not cfg["url"] or not cfg["token"]:
+        print("palivane: not connected (no backend url/token).", file=sys.stderr)
+        return 1
+    try:
+        with open(_state_path("last-block.json")) as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        print("palivane: no blocked prompt on record — nothing to justify.", file=sys.stderr)
+        return 1
+    if not last.get("finding_id"):
+        print("palivane: the last block carried no finding id.", file=sys.stderr)
+        return 1
+    req = urllib.request.Request(
+        cfg["url"].rstrip("/") + "/api/ingest/justify", method="POST",
+        data=json.dumps({"finding_id": last["finding_id"], "justification": reason,
+                         "content_hash": last.get("content_hash", ""),
+                         "user": cfg["user"]}).encode(),
+        headers={"content-type": "application/json",
+                 "User-Agent": f"palivane-hook/{VERSION}",
+                 "X-Palivane-Token": cfg["token"]})
+    try:
+        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
+            out = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            print("palivane: not self-overridable (confirmed credential, or the org has "
+                  "justified-proceed off) — use Request exception in the console.",
+                  file=sys.stderr)
+        else:
+            print(f"palivane: justify failed (HTTP {e.code}).", file=sys.stderr)
+        return 1
+    except Exception:
+        print("palivane: justify failed (backend unreachable).", file=sys.stderr)
+        return 1
+    try:
+        with open(_state_path("override-token.json"), "w") as f:
+            json.dump({"token": out.get("override_token", ""),
+                       "expires": time.time() + int(out.get("expires_in", 600)) - 30}, f)
+    except OSError:
+        pass
+    print("palivane: justification recorded — resubmit the same prompt to send it.")
+    return 0
+
+
 def _send_detached(endpoint: str, payload: dict, cfg: dict) -> None:
     """Report in a detached child so the hook returns instantly (monitor mode)."""
     p = subprocess.Popen(
@@ -345,6 +434,13 @@ def _send_detached(endpoint: str, payload: dict, cfg: dict) -> None:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "justify":
+        reason = " ".join(sys.argv[2:]).strip()
+        if len(reason) < 10:
+            print("usage: palivane-hook justify \"why this needs to go (10+ chars)\"",
+                  file=sys.stderr)
+            return 1
+        return cmd_justify(reason)
     if "--send" in sys.argv[1:]:
         # Worker mode (spawned by the monitor path): post the report and exit.
         try:
@@ -373,10 +469,22 @@ def main() -> int:
             return 0  # not connected to Palivane — nothing to report to
         # Prompts are always scanned inline (even in monitor mode): a confirmed
         # secret/PII leak (force_block) must be stopped before it leaves the device.
+        grant = _load_override_token()
+        if grant:
+            payload["override_token"] = grant
         verdict = scan("/api/ingest/ai-usage", payload, cfg["url"], cfg["token"],
                        cfg["user"], cfg["timeout"])
+        if verdict.get("overridden"):
+            _clear_override_token()               # one grant, one send
         if should_block(verdict, cfg["enforce"]):
-            print(json.dumps(prompt_block_output(verdict)))
+            out = prompt_block_output(verdict)
+            if verdict.get("self_justify") and verdict.get("finding_id"):
+                _save_last_block(payload.get("content", ""), verdict)
+                out["reason"] += ("\nBusiness need to send this anyway? Run:\n"
+                                  "  palivane-hook justify \"why this needs to go\"\n"
+                                  "It is recorded for the security team; then resubmit "
+                                  "this exact prompt.")
+            print(json.dumps(out))
         return 1 if _auth_rejected(verdict) else 0
 
     activity = build_activity(event.get("tool_name", ""), event.get("tool_input") or {})
