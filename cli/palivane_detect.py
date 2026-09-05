@@ -229,7 +229,7 @@ def _xml_text(blob: bytes) -> str:
         x = blob.decode("utf-8", errors="replace")
     except Exception:                                             # noqa: BLE001
         return ""
-    x = re.sub(r"</(w:p|a:p|w:tr|row|si|c)>", "\n", x)
+    x = re.sub(r"</(w:p|a:p|w:tr|row|si|c|text:p|text:h|table:table-row)>", "\n", x)
     x = _TAG_RE.sub(" ", x)
     for ent, ch in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
                     ("&quot;", '"'), ("&apos;", "'"), ("&#xa;", "\n")):
@@ -264,6 +264,58 @@ def _extract_ooxml(data: bytes, kind: str) -> str:
         if sum(len(p) for p in out) > _MAX_EXTRACT_CHARS:
             break
     return "\n".join(out)
+
+
+def _extract_odf(data: bytes) -> str:
+    """OpenDocument (odt/ods/odp) is the same trick as OOXML: a ZIP whose content.xml (plus
+    styles.xml for headers/footers) holds the text. No parser library, stdlib zipfile."""
+    import io
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:                                             # noqa: BLE001
+        return ""
+    names = set(zf.namelist())
+    out: list[str] = []
+    for n in ("content.xml", "styles.xml"):
+        if n in names:
+            try:
+                out.append(_xml_text(zf.read(n)))
+            except Exception:                                     # noqa: BLE001
+                continue
+    return "\n".join(out)
+
+
+_RTF_GROUP_RE = re.compile(r"\\\*[^{}]*")
+
+
+def _extract_rtf(data: bytes) -> str:
+    """Rich Text Format is text, not a binary container: control words, groups, and the
+    literal characters between them. Strip the control layer and keep the words — enough
+    for pattern detection, not a faithful render (which a scanner does not need)."""
+    try:
+        s = data.decode("latin-1", errors="replace")
+    except Exception:                                             # noqa: BLE001
+        return ""
+    if "\\rtf" not in s[:20].replace("\r", "\\r") and not s.lstrip().startswith("{\\rtf"):
+        # be lenient: some producers omit the leading brace, but require the rtf signature
+        if "rtf1" not in s[:40]:
+            return ""
+    # Drop destination groups that carry no body text (fonts, colors, embedded objects).
+    s = re.sub(r"\{\\\*.*?\}", " ", s, flags=re.DOTALL)
+    # Paragraph / line / tab breaks -> real whitespace before the control words go.
+    s = re.sub(r"\\pard?\b", "\n", s)
+    s = re.sub(r"\\(par|line)\b", "\n", s)
+    s = re.sub(r"\\tab\b", "\t", s)
+    # \'hh hex escapes and \uNNNN unicode, BEFORE the generic control-word strip eats them.
+    s = re.sub(r"\\'([0-9a-fA-F]{2})",
+               lambda m: bytes([int(m.group(1), 16)]).decode("latin-1", "replace"), s)
+    s = re.sub(r"\\u(-?\d+)\??", lambda m: chr(int(m.group(1)) % 0x10000), s)
+    # Escaped literals, then any remaining control word (\word optionally with a number).
+    s = s.replace("\\{", "{").replace("\\}", "}").replace("\\\\", "\\")
+    s = re.sub(r"\\[a-zA-Z]+-?\d* ?", " ", s)
+    s = s.replace("{", " ").replace("}", " ")
+    return _WS_RE.sub(" ", s)
 
 
 _PDF_STREAM_RE = re.compile(rb"stream\r?\n(.*?)endstream", re.DOTALL)
@@ -320,6 +372,10 @@ def extract_text(name: str, data: bytes) -> str:
     if ext in ("docx", "docm", "xlsx", "xlsm", "pptx", "pptm"):
         return _extract_ooxml(data, {"docm": "docx", "xlsm": "xlsx",
                                      "pptm": "pptx"}.get(ext, ext))[:_MAX_EXTRACT_CHARS]
+    if ext in ("odt", "ods", "odp"):
+        return _extract_odf(data)[:_MAX_EXTRACT_CHARS]
+    if ext == "rtf" or data[:5] == b"{\\rtf":
+        return _extract_rtf(data)[:_MAX_EXTRACT_CHARS]
     if ext == "pdf" or data[:5] == b"%PDF-":
         return _extract_pdf(data)[:_MAX_EXTRACT_CHARS]
     try:                                    # plain text of any flavour
