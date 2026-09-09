@@ -50,7 +50,11 @@ import urllib.error
 import urllib.request
 
 _MAX_ARGS_TEXT = 20000
-_PIN_PATH = os.path.expanduser("~/.palivane/mcp-pins.json")
+
+
+def _pin_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, "mcp-pins.json")
 
 
 def server_fingerprint(cmd: list[str]) -> dict:
@@ -78,7 +82,7 @@ def check_pin(fp: dict) -> str:
         return ""
     pins = {}
     try:
-        pins = json.load(open(_PIN_PATH))
+        pins = json.load(open(_pin_path()))
     except (OSError, ValueError):
         pass
     key = fp["command"]
@@ -89,10 +93,11 @@ def check_pin(fp: dict) -> str:
         return "mismatch"
     pins[key] = fp["sha256"]
     try:
-        os.makedirs(os.path.dirname(_PIN_PATH), exist_ok=True)
-        with open(_PIN_PATH, "w") as f:
+        path = _pin_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
             json.dump(pins, f, indent=2)
-        os.chmod(_PIN_PATH, 0o600)
+        os.chmod(path, 0o600)
     except OSError:
         pass
     return "new"
