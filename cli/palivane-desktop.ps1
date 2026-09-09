@@ -85,21 +85,62 @@ $SecretsCmd      = Join-Path $ShimDir "palivane-secrets.cmd"
 $SecretsEngine   = if ($env:PALIVANE_SECRETS_ENGINE) { $env:PALIVANE_SECRETS_ENGINE } else { "" }
 $InetKey     = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 $ShimMarker  = "palivane-desktop CLI capture shim"
-# Corporate-proxy chaining. On a fleet behind a mandatory egress proxy (Zscaler/Netskope/
-# corp SWG) mitmdump can't reach the internet directly — it must forward through that proxy.
-# Set PALIVANE_UPSTREAM_PROXY=http://corp:port to run mitmdump in `--mode upstream:`; point
-# PALIVANE_UPSTREAM_CA at the corp root bundle if it TLS-inspects. When unset, Invoke-Install
-# auto-adopts the machine's existing WinINET / HTTPS_PROXY setting.
+# Coexistence with a corporate proxy or a TLS-inspecting VPN/ZTNA client — two INDEPENDENT
+# axes, set either, both, or neither:
+#   1. Reaching the internet. Behind a mandatory egress proxy (Zscaler/Netskope/corp SWG)
+#      mitmdump must forward through it: PALIVANE_UPSTREAM_PROXY=http://corp:port runs
+#      `--mode upstream:`, PALIVANE_UPSTREAM_AUTH=user:pass if it authenticates. When unset,
+#      Invoke-Install auto-adopts the machine's existing WinINET / HTTPS_PROXY setting.
+#   2. Trusting an inspected upstream leg. Anything terminating TLS between us and the AI
+#      host makes mitmdump's upstream verification fail — every AI tool then dies with a cert
+#      error. That includes L3 interceptors with no proxy to chain to (Cloudflare WARP with
+#      Gateway HTTP inspection, Netskope/Prisma tunnel mode, Umbrella roaming client).
+#      PALIVANE_UPSTREAM_CA=C:\path\their-root.pem fixes it and is NOT gated on axis 1.
+#      PALIVANE_UPSTREAM_INSECURE=1 skips verification entirely (last resort).
 $UpstreamProxy    = $env:PALIVANE_UPSTREAM_PROXY
 $UpstreamAuth     = $env:PALIVANE_UPSTREAM_AUTH
 $UpstreamCA       = $env:PALIVANE_UPSTREAM_CA
 $UpstreamInsecure = $env:PALIVANE_UPSTREAM_INSECURE
 
-# Extra mitmdump flags for corporate-proxy chaining, appended to the launcher command line.
+# mitmproxy's ssl_verify_upstream_trusted_ca REPLACES the default trust store, so pointing it
+# at a lone corporate/ZTNA root would break every upstream host that root didn't sign.
+# Concatenate: their root + the machine's trusted roots, exported from the Windows cert store
+# (there is no /etc/ssl/cert.pem here). Rewrites $UpstreamCA to the merged bundle.
+function Resolve-UpstreamCA {
+    if (-not $UpstreamCA) { return }
+    if (-not (Test-Path $UpstreamCA)) { Die "PALIVANE_UPSTREAM_CA=$UpstreamCA was not found." }
+    New-Item -ItemType Directory -Force -Path $WDir | Out-Null
+    $bundle = Join-Path $WDir "upstream-ca-bundle.pem"
+    try {
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine(((Get-Content -Raw $UpstreamCA).TrimEnd()))
+        $roots = @(Get-ChildItem Cert:\LocalMachine\Root -ErrorAction Stop)
+        foreach ($c in $roots) {
+            [void]$sb.AppendLine("-----BEGIN CERTIFICATE-----")
+            [void]$sb.AppendLine([Convert]::ToBase64String($c.RawData, 'InsertLineBreaks'))
+            [void]$sb.AppendLine("-----END CERTIFICATE-----")
+        }
+        Set-Content -Path $bundle -Value $sb.ToString() -Encoding ascii
+        Log "upstream trust: your CA + $($roots.Count) Windows root certs -> $bundle"
+        $script:UpstreamCA = $bundle
+    } catch {
+        Log "warning: couldn't export the Windows root store ($($_.Exception.Message)); using"
+        Log "         $UpstreamCA as the ONLY upstream trust root. Upstream hosts it didn't"
+        Log "         sign will fail cert verification."
+    }
+}
+
+# Extra mitmdump flags, appended to the launcher command line. The two blocks are
+# independent: upstream-proxy chaining, and upstream trust. A TLS-inspecting L3 client like
+# Cloudflare WARP (Gateway HTTP inspection) needs ONLY the trust half — it is not an HTTP
+# proxy, so there is nothing to chain to — hence the CA/insecure flags are not gated on
+# $UpstreamProxy.
 function Get-UpstreamArgs {
-    if (-not $UpstreamProxy) { return "" }
-    $a = " --mode upstream:$UpstreamProxy"
-    if ($UpstreamAuth)     { $a += " --upstream-auth $UpstreamAuth" }
+    $a = ""
+    if ($UpstreamProxy) {
+        $a += " --mode upstream:$UpstreamProxy"
+        if ($UpstreamAuth) { $a += " --upstream-auth $UpstreamAuth" }
+    }
     if ($UpstreamCA)       { $a += ' --set "ssl_verify_upstream_trusted_ca=' + $UpstreamCA + '"' }
     if ($UpstreamInsecure) { $a += " --ssl-insecure" }
     return $a
@@ -610,9 +651,10 @@ function Invoke-Install {
             Log "detected an existing egress proxy ($amb) — chaining through it."
         }
     }
-    if ($UpstreamProxy) {
-        Log "chaining egress through upstream proxy: $UpstreamProxy$(if ($UpstreamCA) { " (trusting $UpstreamCA upstream)" })"
-    }
+    Resolve-UpstreamCA        # merges a corp/ZTNA root into a bundle; must precede Write-Launcher
+    if ($UpstreamProxy)   { Log "chaining egress through upstream proxy: $UpstreamProxy" }
+    if ($UpstreamCA)      { Log "trusting $UpstreamCA on the upstream leg (TLS-inspecting proxy/VPN)" }
+    if ($UpstreamInsecure) { Log "warning: upstream cert verification DISABLED (PALIVANE_UPSTREAM_INSECURE)" }
     $enforce = Write-Launcher $mitmdump $palivaneUrl $settings.Token $settings.User
     Start-ProxyTask           # dies (and rolls the task back) if the proxy never comes up
     if (-not $CliOnly) { Set-UserProxy }   # only after the proxy is confirmed listening

@@ -72,6 +72,82 @@ AI_HOST_SUFFIXES = (
 
 _ACTION_RANK = {"benign": 0, "low": 1, "suspicious": 2, "high": 3, "critical": 4}
 
+# --- TLS-inspecting VPN/ZTNA diagnosis ------------------------------------------------
+#
+# When something terminates TLS between us and the AI host, our *upstream* handshake fails:
+# mitmproxy verifies against the public roots, which never contain a Zero-Trust vendor's
+# private root. The visible symptom is every AI tool on the device dying with an opaque
+# "certificate verify failed", which reads like Palivane broke the network. It didn't — the
+# fix is to trust that vendor's root on the upstream leg (PALIVANE_UPSTREAM_CA) or to exempt
+# the AI hosts from their inspection. Naming the vendor turns a support ticket into a
+# one-line config change, so map the issuer strings we can recognize.
+ZTNA_CA_VENDORS = (
+    ("cloudflare", "Cloudflare WARP / Zero Trust Gateway"),
+    ("zscaler", "Zscaler"),
+    ("netskope", "Netskope"),
+    ("palo alto", "Palo Alto Prisma Access"),
+    ("prisma", "Palo Alto Prisma Access"),
+    ("umbrella", "Cisco Umbrella"),
+    ("opendns", "Cisco Umbrella"),
+    ("forcepoint", "Forcepoint"),
+    ("fortinet", "Fortinet / FortiGate"),
+    ("fortigate", "Fortinet / FortiGate"),
+    ("sophos", "Sophos"),
+    ("mcafee", "Skyhigh / McAfee Web Gateway"),
+    ("skyhigh", "Skyhigh / McAfee Web Gateway"),
+    ("bluecoat", "Broadcom / Symantec (Blue Coat)"),
+    ("blue coat", "Broadcom / Symantec (Blue Coat)"),
+    ("broadcom", "Broadcom / Symantec (Blue Coat)"),
+    ("menlo", "Menlo Security"),
+    ("iboss", "iboss"),
+    ("check point", "Check Point"),
+    ("barracuda", "Barracuda"),
+)
+
+# OpenSSL/mitmproxy phrasings for "I don't trust the cert the peer presented".
+_VERIFY_FAIL_MARKERS = (
+    "certificate verify failed", "unable to get local issuer",
+    "self signed certificate", "self-signed certificate",
+    "certificate is not trusted", "unknown ca",
+)
+
+
+def ztna_vendor(text: str) -> str | None:
+    """The ZTNA/SWG vendor named anywhere in `text` (a cert issuer, subject, or error
+    string), or None. Substring match on purpose: issuer DNs vary by version and tenant
+    ("Cloudflare for Teams ECC Certificate Authority", "Zscaler Root CA")."""
+    low = (text or "").lower()
+    for needle, label in ZTNA_CA_VENDORS:
+        if needle in low:
+            return label
+    return None
+
+
+def upstream_tls_hint(host: str, error: str,
+                      issuers: tuple[str, ...] | list[str] = ()) -> str | None:
+    """Actionable one-liner for an upstream TLS failure, or None if this isn't a trust
+    problem we can explain (a genuine network error, an expired cert, a real MITM).
+
+    Kept pure so it is unit-testable without mitmproxy: the hook below just feeds it what
+    it scraped off the failed connection.
+    """
+    if not is_ai_host(host):
+        return None
+    err = error or ""
+    if not any(m in err.lower() for m in _VERIFY_FAIL_MARKERS):
+        return None
+    vendor = ztna_vendor(" ".join(issuers)) or ztna_vendor(err)
+    who = vendor or "a TLS-inspecting proxy or VPN/ZTNA client"
+    return (
+        f"palivane: upstream TLS to {host} failed certificate verification — {who} appears "
+        f"to be inspecting this connection, and its private root is not in the public trust "
+        f"store. AI tools on this device will fail until this is resolved. Fix EITHER side: "
+        f"(a) exempt the AI hosts from that product's TLS inspection (a Cloudflare Gateway "
+        f'"Do Not Inspect" rule, a Zscaler/Netskope SSL-bypass entry), or (b) trust its root '
+        f"on our upstream leg: PALIVANE_UPSTREAM_CA=/path/to/their-root.pem, then reinstall "
+        f"with palivane-desktop install. Underlying error: {err.strip()[:200]}"
+    )
+
 
 def is_ai_host(host: str) -> bool:
     host = (host or "").lower()
@@ -817,6 +893,7 @@ def mcp_block_body(verdict: dict) -> bytes:
 class PalivaneGuard:
     def __init__(self) -> None:
         self.enforce = os.getenv("PALIVANE_PROXY_ENFORCE", "").lower() in ("1", "true", "yes")
+        self._tls_warned: set[str] = set()   # hosts we've already explained a TLS failure for
 
     def running(self) -> None:
         """Scope TLS interception to the hosts we actually inspect. Everything else is
@@ -834,6 +911,36 @@ class PalivaneGuard:
         logging.info("palivane: TLS interception scoped to %d host suffixes (other traffic "
                      "tunnels un-decrypted; PALIVANE_PROXY_INTERCEPT_ALL=true to widen)",
                      len(intercept_hosts()))
+
+    def tls_failed_server(self, data) -> None:
+        """Upstream handshake failed. If it's a trust failure on a host we inspect, say who
+        is intercepting and how to fix it — once per host, so a retry storm doesn't bury the
+        message. Diagnostic only: nothing is blocked, retried, or changed here.
+
+        `tls_failed_server` is a mitmproxy >= 9 hook; on anything older it simply never
+        fires and we're back to the bare TLS error. Every field access is defensive because
+        the hook's data shape has moved between versions and a diagnostic must not be able
+        to take the proxy down."""
+        import logging
+
+        host = ""
+        try:
+            host = data.context.server.address[0] or ""
+        except Exception:      # hook data shape varies across mitmproxy versions
+            pass
+        if not host or host in self._tls_warned:
+            return
+        conn = getattr(data, "conn", None)
+        issuers: list[str] = []
+        try:
+            for cert in (getattr(conn, "certificate_list", None) or ()):
+                issuers.append(str(getattr(cert, "issuer", "")))
+        except Exception:
+            pass
+        hint = upstream_tls_hint(host, str(getattr(conn, "error", "") or ""), issuers)
+        if hint:
+            self._tls_warned.add(host)
+            logging.error(hint)
 
     def responseheaders(self, flow) -> None:
         """AI responses are long-lived SSE streams the response() hook never inspects —

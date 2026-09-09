@@ -184,7 +184,15 @@ one: apps → Palivane (inspects AI hosts) → corporate proxy → internet.
 - `PALIVANE_UPSTREAM_CA=/path/to/corp-root.pem` — when the corporate proxy TLS-inspects,
   point this at its root bundle so mitmproxy trusts the *upstream* leg
   (`ssl_verify_upstream_trusted_ca`). Without it, chained HTTPS to an inspecting proxy
-  fails cert verification.
+  fails cert verification. **Independent of `PALIVANE_UPSTREAM_PROXY`** — set it alone for a
+  client that inspects TLS at L3 with no proxy to chain to (Cloudflare WARP with Gateway
+  HTTP policies, Netskope/Prisma tunnel mode, Umbrella's roaming client). The installer
+  concatenates your root with the system public roots into
+  `~/.palivane/upstream-ca-bundle.pem`, because the underlying mitmproxy option *replaces*
+  the trust store rather than extending it — a lone corporate root would break every
+  upstream host it didn't sign. When the upstream handshake fails anyway, the addon names
+  the intercepting vendor and both fixes in its log instead of emitting a bare
+  "certificate verify failed".
 - `PALIVANE_UPSTREAM_AUTH=user:pass` — for an authenticated proxy.
 - `PALIVANE_UPSTREAM_INSECURE=1` — skip upstream cert verification (last resort; prefer
   `PALIVANE_UPSTREAM_CA`).

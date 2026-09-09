@@ -31,13 +31,26 @@ WDIR="${HOME_DIR}/.palivane"
 # install time with PALIVANE_PROXY_NO_PROXY_EXTRA (comma-separated).
 NO_PROXY_BASE="localhost,127.0.0.1,::1,.ts.net,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10"
 NO_PROXY_ALL="${NO_PROXY_BASE}${PALIVANE_PROXY_NO_PROXY_EXTRA:+,${PALIVANE_PROXY_NO_PROXY_EXTRA}}"
-# Corporate-proxy chaining. On fleets behind a mandatory egress proxy / PAC (Zscaler,
-# Netskope, corp SWG) mitmdump can't reach the internet directly — it must forward through
-# that proxy. Set PALIVANE_UPSTREAM_PROXY=http://corp-proxy:port (MDM-pushed) to run mitmdump
-# in `--mode upstream:`; if the corp proxy TLS-inspects, point PALIVANE_UPSTREAM_CA at its
-# root bundle so mitmproxy trusts the upstream leg. When unset, we auto-adopt an ambient
-# https_proxy at install time (below) so a machine already configured for the corp proxy
-# just works. PALIVANE_UPSTREAM_AUTH=user:pass for an authenticated proxy.
+# Coexistence with a corporate proxy or a TLS-inspecting VPN/ZTNA client. These are TWO
+# INDEPENDENT axes — set either, both, or neither:
+#
+#   1. Reaching the internet. On fleets behind a mandatory egress proxy / PAC (Zscaler,
+#      Netskope, corp SWG) mitmdump can't connect out directly — it must forward through
+#      that proxy. PALIVANE_UPSTREAM_PROXY=http://corp-proxy:port (MDM-pushed) runs mitmdump
+#      in `--mode upstream:`; PALIVANE_UPSTREAM_AUTH=user:pass if it authenticates. When
+#      unset we auto-adopt an ambient https_proxy at install time (below), so a machine
+#      already configured for the corp proxy just works.
+#
+#   2. Trusting an inspected upstream leg. Anything that terminates TLS between us and the
+#      AI host makes mitmdump's upstream verification fail against the default public roots
+#      — every AI tool on the box then dies with a cert error. That includes explicit
+#      proxies AND clients that intercept at L3 with no proxy to chain to: Cloudflare WARP
+#      with Gateway HTTP inspection, Netskope/Prisma in tunnel mode, Umbrella's roaming
+#      client. PALIVANE_UPSTREAM_CA=/path/to/their-root.pem fixes it, and is deliberately
+#      NOT gated on axis 1 — an L3 interceptor has no upstream proxy to name. We merge it
+#      with the system public roots (resolve_upstream_ca) so adding their CA doesn't
+#      *replace* normal trust. PALIVANE_UPSTREAM_INSECURE=1 skips verification entirely
+#      (last resort; prefer the CA).
 UPSTREAM_PROXY="${PALIVANE_UPSTREAM_PROXY:-}"
 UPSTREAM_AUTH="${PALIVANE_UPSTREAM_AUTH:-}"
 UPSTREAM_CA="${PALIVANE_UPSTREAM_CA:-}"
@@ -265,10 +278,48 @@ nss_untrust_ca() {
   done
 }
 
+# The macOS network service to hang the system proxy off. Two traps here, both hit in the
+# field: `-listnetworkserviceorder` opens with the sentence "An asterisk (*) denotes that a
+# network service is disabled.", which contains ") " and so parsed as a service NAME under
+# the old `awk -F') ' | head -1` — networksetup was handed that sentence and silently
+# configured nothing. And the first entry in the order is not necessarily the one carrying
+# traffic: a VPN/ZTNA adapter (CloudflareWARP, a SASE client) often sits at the top, and a
+# proxy set on it applies only while that tunnel is up. So: match only true order entries
+# ("(1) Wi-Fi" — disabled ones render as "(*) Name" and are skipped), then take the first
+# that actually holds an address. Falls back to the first enabled service if none does
+# (e.g. installing while offline).
+macos_primary_service() {
+  command -v networksetup >/dev/null 2>&1 || return 1
+  local line svc first=""
+  while IFS= read -r line; do
+    case "$line" in
+      '('[0-9]*') '*) svc="${line#*') '}" ;;
+      *) continue ;;
+    esac
+    [ -n "$svc" ] || continue
+    [ -n "$first" ] || first="$svc"
+    if networksetup -getinfo "$svc" 2>/dev/null \
+         | grep -qE '^(IP address: [0-9]|IPv6 IP address: [0-9a-fA-F])'; then
+      printf '%s\n' "$svc"; return 0
+    fi
+  done < <(networksetup -listnetworkserviceorder 2>/dev/null)
+  [ -n "$first" ] && { printf '%s\n' "$first"; return 0; }
+  return 1
+}
+
 set_proxy() {
   case "$OS" in
     Darwin)
-      local svc; svc="$(networksetup -listnetworkserviceorder | awk -F') ' '/\) /{print $2}' | head -1)"
+      # No usable service (no network services at all, or networksetup missing) is not fatal:
+      # start_service already succeeded and wire_cli_capture still has to run — the CLI shims
+      # are the fail-open coverage path. Warn and let the install finish.
+      local svc; svc="$(macos_primary_service || true)"
+      if [ -z "$svc" ]; then
+        log "warning: couldn't determine the active network service — system proxy NOT set."
+        log "         Set the HTTPS proxy to 127.0.0.1:$PORT by hand (System Settings ->"
+        log "         Network -> Proxies). CLI capture is unaffected."
+        return 0
+      fi
       log "pointing system HTTPS proxy at 127.0.0.1:$PORT (service: $svc)…"
       sudo networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$PORT"
       sudo networksetup -setsecurewebproxystate "$svc" on ;;
@@ -472,12 +523,48 @@ cmd_watchdog_tick() {
   flush_kde_launcher_env
 }
 
-# Extra mitmdump flags for corporate-proxy chaining, as a plain space-separated string
-# (for the systemd ExecStart line). Empty when no upstream proxy is configured.
+# First readable system bundle of public roots. Used to *extend* trust rather than replace
+# it (see resolve_upstream_ca).
+public_ca_bundle() {
+  local p
+  for p in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt \
+           /etc/pki/tls/certs/ca-bundle.crt /usr/local/etc/openssl/cert.pem; do
+    [ -r "$p" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+# mitmproxy's ssl_verify_upstream_trusted_ca REPLACES the default trust store, so handing it
+# a lone corporate/ZTNA root would break every upstream host that root didn't sign — the
+# same outage in a new place. Concatenate instead: their root + the system public roots,
+# into a file the service reads at every (re)start. Rewrites UPSTREAM_CA in place.
+resolve_upstream_ca() {
+  [ -n "$UPSTREAM_CA" ] || return 0
+  [ -r "$UPSTREAM_CA" ] || die "PALIVANE_UPSTREAM_CA=$UPSTREAM_CA is not readable."
+  local pub bundle="${WDIR}/upstream-ca-bundle.pem"
+  mkdir -p "$WDIR"
+  if pub="$(public_ca_bundle)"; then
+    cat "$UPSTREAM_CA" "$pub" > "$bundle"
+    chmod 600 "$bundle"
+    log "upstream trust: $(basename "$UPSTREAM_CA") + system public roots -> $bundle"
+    UPSTREAM_CA="$bundle"
+  else
+    log "warning: no system public CA bundle found — using $UPSTREAM_CA as the ONLY upstream"
+    log "         trust root. Upstream hosts it didn't sign will fail cert verification;"
+    log "         concatenate the public roots into it if that bites."
+  fi
+  return 0
+}
+
+# Extra mitmdump flags, as a plain space-separated string (for the systemd ExecStart line).
+# The two blocks are independent: upstream-proxy chaining (axis 1) and upstream trust
+# (axis 2). A TLS-inspecting L3 client like Cloudflare WARP needs ONLY the second, so the
+# CA/insecure flags must not be gated on UPSTREAM_PROXY being set.
 mitm_upstream_flags() {
-  [ -n "$UPSTREAM_PROXY" ] || return 0
-  printf ' --mode upstream:%s' "$UPSTREAM_PROXY"
-  [ -n "$UPSTREAM_AUTH" ] && printf ' --upstream-auth %s' "$UPSTREAM_AUTH"
+  if [ -n "$UPSTREAM_PROXY" ]; then
+    printf ' --mode upstream:%s' "$UPSTREAM_PROXY"
+    [ -n "$UPSTREAM_AUTH" ] && printf ' --upstream-auth %s' "$UPSTREAM_AUTH"
+  fi
   [ -n "$UPSTREAM_CA" ] && printf ' --set ssl_verify_upstream_trusted_ca=%s' "$UPSTREAM_CA"
   [ -n "$UPSTREAM_INSECURE" ] && printf ' --ssl-insecure'
   return 0
@@ -485,9 +572,10 @@ mitm_upstream_flags() {
 
 # Same flags as launchd <string> elements (one XML line per token).
 mitm_upstream_plist() {
-  [ -n "$UPSTREAM_PROXY" ] || return 0
-  printf '    <string>--mode</string><string>upstream:%s</string>\n' "$UPSTREAM_PROXY"
-  [ -n "$UPSTREAM_AUTH" ] && printf '    <string>--upstream-auth</string><string>%s</string>\n' "$UPSTREAM_AUTH"
+  if [ -n "$UPSTREAM_PROXY" ]; then
+    printf '    <string>--mode</string><string>upstream:%s</string>\n' "$UPSTREAM_PROXY"
+    [ -n "$UPSTREAM_AUTH" ] && printf '    <string>--upstream-auth</string><string>%s</string>\n' "$UPSTREAM_AUTH"
+  fi
   [ -n "$UPSTREAM_CA" ] && printf '    <string>--set</string><string>ssl_verify_upstream_trusted_ca=%s</string>\n' "$UPSTREAM_CA"
   [ -n "$UPSTREAM_INSECURE" ] && printf '    <string>--ssl-insecure</string>\n'
   return 0
@@ -496,9 +584,12 @@ mitm_upstream_plist() {
 start_service() {
   local tok; tok="$1"
   local up_flags up_plist
+  resolve_upstream_ca
   up_flags="$(mitm_upstream_flags)"
   up_plist="$(mitm_upstream_plist)"
-  [ -n "$UPSTREAM_PROXY" ] && log "chaining egress through upstream proxy: ${UPSTREAM_PROXY}$([ -n "$UPSTREAM_CA" ] && printf ' (trusting %s upstream)' "$UPSTREAM_CA")"
+  [ -n "$UPSTREAM_PROXY" ] && log "chaining egress through upstream proxy: $UPSTREAM_PROXY"
+  [ -n "$UPSTREAM_CA" ] && log "trusting $UPSTREAM_CA on the upstream leg (TLS-inspecting proxy/VPN)"
+  [ -n "$UPSTREAM_INSECURE" ] && log "warning: upstream cert verification DISABLED (PALIVANE_UPSTREAM_INSECURE)"
   case "$OS" in
     Darwin)
       local plist="${HOME_DIR}/Library/LaunchAgents/io.palivane.proxy.plist"
@@ -671,8 +762,8 @@ cmd_uninstall() {
   unwire_cli_capture
   case "$OS" in
     Darwin)
-      local svc; svc="$(networksetup -listnetworkserviceorder | awk -F') ' '/\) /{print $2}' | head -1)"
-      sudo networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
+      local svc; svc="$(macos_primary_service || true)"
+      [ -n "$svc" ] && sudo networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
       local pl
       for pl in io.palivane.proxy.plist; do
         launchctl unload "${HOME_DIR}/Library/LaunchAgents/$pl" 2>/dev/null || true
@@ -720,10 +811,14 @@ cmd_status() {
   [ -n "$active" ] && echo "cli shims:$active" || echo "cli shims: none"
 }
 
-case "${1:-install}" in
-  install)       shift 2>/dev/null || true; cmd_install "$@" ;;
-  uninstall)     cmd_uninstall ;;
-  status)        cmd_status ;;
-  watchdog-tick) cmd_watchdog_tick ;;   # invoked by the systemd user timer, not by hand
-  *) die "usage: palivane-desktop [install [--cli-only]|uninstall|status]" ;;
-esac
+# Dispatch only when executed. Sourcing the file defines the functions without running an
+# install, which is how the unit tests exercise macos_primary_service / the upstream flags.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-install}" in
+    install)       shift 2>/dev/null || true; cmd_install "$@" ;;
+    uninstall)     cmd_uninstall ;;
+    status)        cmd_status ;;
+    watchdog-tick) cmd_watchdog_tick ;;   # invoked by the systemd user timer, not by hand
+    *) die "usage: palivane-desktop [install [--cli-only]|uninstall|status]" ;;
+  esac
+fi
