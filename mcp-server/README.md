@@ -43,11 +43,60 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Auth (env):
 
+### Use a console API key (recommended)
+
+In the console: **Connections → Console API key**. Give it a label, pick a scope, mint,
+and copy the `ak_…` value — it is shown once.
+
+| Scope | Gets you |
+|-------|----------|
+| **Read only** | Every read tool: `list_findings`, `get_finding`, `ai_tool_inventory`, `list_connectors`, `gateway_usage`, `compliance_report`. |
+| **Read + triage/sync** | The above, plus `set_finding_status` and `sync_connector`. |
+
+```bash
+claude mcp add palivane \
+  --env PALIVANE_API_KEY=ak_... \
+  -- /abs/path/mcp-server/.venv/bin/python /abs/path/mcp-server/palivane_mcp.py
+```
+
+It does not expire, holds no password, works with MFA enabled, and is revocable from the
+same screen. The key acts as **the person who minted it** — it can reach exactly what
+their role can, and *never* org settings, user management, or minting another key, whatever
+their role. Revoke it and it is dead immediately; deactivate that user and it dies with
+them.
+
+### Full env reference
+
 | Var | Meaning |
 |-----|---------|
 | `PALIVANE_BASE_URL` | Console origin. Default `https://app.palivane.io`. |
-| `PALIVANE_API_TOKEN` | A bearer JWT (from `POST /api/auth/login`). Preferred for automation. |
-| `PALIVANE_EMAIL` / `PALIVANE_PASSWORD` | Fallback login (auto-refreshes the token). Ignored if `PALIVANE_API_TOKEN` is set. **MFA accounts must use a token.** |
+| `PALIVANE_API_KEY` | **Preferred.** A console-scoped API key (`ak_…`) from Connections. Long-lived and revocable. |
+| `PALIVANE_API_TOKEN` | A bearer JWT from `POST /api/auth/login`. Works, but it is a *session* token — see below. |
+| `PALIVANE_EMAIL` / `PALIVANE_PASSWORD` | Last-resort login (auto-refreshes the token). Ignored if either credential above is set. **MFA accounts cannot use this path.** |
+| `PALIVANE_ORG` | Org slug. Email/password path only, and needed **only** if your email belongs to more than one org — the API refuses to guess between them, and login returns `409` until you name one. |
+
+<details>
+<summary>If you use a session token or a password instead</summary>
+
+```bash
+curl -s https://app.palivane.io/api/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@corp.com","password":"..."}' | jq -r .access_token
+# add "org":"your-slug" if the email is in more than one org
+```
+
+`PALIVANE_API_TOKEN` is a console **session** token: it expires on the server's
+`AUTH_TOKEN_TTL` (**~12h** by default) and is invalidated by a password change or a
+sign-out-everywhere. So either set `PALIVANE_EMAIL` + `PALIVANE_PASSWORD` and let the
+server re-login when it lapses (the cost being a password in your client config), or
+re-mint the token by hand. MFA accounts can't auto-refresh at all — login returns a
+challenge, not a token. **A console API key avoids all of this**; prefer it.
+
+An ingest-scoped `ak_…` key — the default scope, and what every key minted before console
+scopes is — is **not** accepted by the console API. That is deliberate: it keeps keys
+issued for the gateway/SIEM planes from silently gaining console reach.
+
+</details>
 
 Every tool calls the same API the console does, so a caller only sees their own tenant, and
 admin-gated actions (e.g. dismissing a finding) return the API's own `403`.
@@ -58,7 +107,7 @@ admin-gated actions (e.g. dismissing a finding) return the API's own `403`.
 
 ```bash
 claude mcp add palivane \
-  --env PALIVANE_API_TOKEN=eyJ... \
+  --env PALIVANE_API_KEY=ak_... \
   -- /abs/path/mcp-server/.venv/bin/python /abs/path/mcp-server/palivane_mcp.py
 ```
 
@@ -70,7 +119,7 @@ claude mcp add palivane \
     "palivane": {
       "command": "/abs/path/mcp-server/.venv/bin/python",
       "args": ["/abs/path/mcp-server/palivane_mcp.py"],
-      "env": { "PALIVANE_API_TOKEN": "eyJ..." }
+      "env": { "PALIVANE_API_KEY": "ak_..." }
     }
   }
 }
