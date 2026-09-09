@@ -12,9 +12,13 @@ audit it before you deploy it:
 | [`extension/`](extension/) | Browser extension (Chrome/Edge, MV3): inspects prompts to AI sites *before* they leave, warns or blocks per your org's policy. [Chrome Web Store listing](https://chromewebstore.google.com/detail/fnejondlaacijahdjkhcgiijlnjoapho). |
 | [`cli/`](cli/) | Capture hooks for AI coding tools (Claude Code, Cursor, Codex, Copilot, Gemini CLI), device posture + at-rest secrets scanning, MCP config wrapping, CI scanning, and the `palivane-connect` self-serve enrollment. |
 | [`proxy/`](proxy/) | The egress proxy addon (mitmproxy-based) covering desktop AI apps and anything else that won't take a base-URL override. |
+| [`mcp-server/`](mcp-server/) | Palivane *as* an MCP server: query findings, work the triage queue, inspect shadow-AI usage, run connector syncs and pull a compliance report from your AI assistant, on a long-lived console API key. |
 
-Every component is fail-open by design: if the backend is unreachable, your AI tools keep
-working — a down security control must never take engineering down with it.
+Every *capture* component is fail-open by design: if the backend is unreachable, your AI
+tools keep working — a down security control must never take engineering down with it. The
+MCP server is the exception by nature rather than by design: it is an operator's client for
+the console, not an inline control, so when the backend is unreachable its tools return an
+error and nothing else is affected.
 
 ## Where the verdicts come from
 
