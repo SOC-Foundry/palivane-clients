@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -50,6 +51,31 @@ import urllib.request
 
 # Reported in the User-Agent so the console can inventory client builds per device.
 VERSION = "1.1.0"
+
+
+_VER_RE = re.compile(r"^[A-Za-z0-9._+-]{1,24}$")
+
+
+def agent_ua(event: dict | None = None) -> str:
+    """Our User-Agent with the HOST agent's build in a parenthetical, e.g.
+    "palivane-codex-hook/1.0 (codex-cli/1.2.3)". The console already inventories our build; this
+    says which vendor build was live when a shape changed under us. Reported without a
+    version when the host does not expose one — never guessed."""
+    ver = ""
+    if isinstance(event, dict):
+        v = event.get("version") or event.get("cli_version")
+        if isinstance(v, str) and _VER_RE.match(v):
+            ver = v
+    return f"palivane-codex-hook/{VERSION} (codex-cli{'/' + ver if ver else ''})"
+
+
+def prompt_parse_miss(event: dict) -> bool:
+    """True when the prompt-bearing event carries no `prompt` STRING at all.
+
+    An empty prompt is a user who sent nothing. A missing field means the contract moved:
+    the hook still fires and still returns 0, so the heartbeat stays green while every
+    prompt goes unscanned. Fail-open cannot tell you about that; this can."""
+    return not isinstance(event.get("prompt"), str)
 _MAX_ARGS_TEXT = 20000
 
 
@@ -181,7 +207,7 @@ def _post(endpoint: str, payload: dict, cfg: dict) -> dict:
         req = urllib.request.Request(
             cfg["url"].rstrip("/") + endpoint, method="POST",
             data=json.dumps(body).encode(),
-            headers={"content-type": "application/json", "User-Agent": f"palivane-codex-hook/{VERSION}", "X-Palivane-Token": cfg["token"]},
+            headers={"content-type": "application/json", "User-Agent": agent_ua(), "X-Palivane-Token": cfg["token"]},
         )
         with urllib.request.urlopen(req, timeout=cfg.get("timeout", 5.0)) as r:
             return json.loads(r.read())
@@ -278,6 +304,9 @@ def main() -> int:
     else:
         return 0
     if payload is None:
+        if endpoint.endswith("/ai-usage") and prompt_parse_miss(event):
+            _post(endpoint, {"content": "[palivane parse-miss]", "tool": "codex-cli",
+                             "destination": "codex-cli", "parse_miss": True}, cfg)
         return 0
 
     cfg = read_config()
