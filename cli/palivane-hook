@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -52,6 +53,30 @@ import urllib.request
 # Tool calls with no security surface — pure agent bookkeeping. Never reported.
 # Reported in the User-Agent so the console can inventory client builds per device.
 VERSION = "1.1.0"
+_VER_RE = re.compile(r"^[A-Za-z0-9._+-]{1,24}$")
+
+
+def agent_ua(event: dict | None = None) -> str:
+    """Our User-Agent, with the HOST agent's build in a parenthetical:
+
+        palivane-hook/1.1.0 (claude-code/2.1.4)
+
+    The server already inventories OUR build; this says which vendor build was live. When a
+    shape changes under us the first question is "since which release", and a date is a much
+    worse answer than a version. Claude Code does not currently put its version in the hook
+    payload, so this reads it where it may appear and reports the agent without a version
+    otherwise — never a guess."""
+    ver = ""
+    if isinstance(event, dict):
+        v = event.get("version") or event.get("claude_code_version")
+        if isinstance(v, str) and _VER_RE.match(v):
+            ver = v
+    if not ver:
+        v = os.environ.get("CLAUDE_CODE_VERSION", "")
+        if _VER_RE.match(v or ""):
+            ver = v
+    return f"palivane-hook/{VERSION} (claude-code{'/' + ver if ver else ''})"
+
 
 SKIP_TOOLS = {"TodoWrite", "Task", "ExitPlanMode", "AskUserQuestion"}
 
@@ -168,6 +193,17 @@ def build_activity(tool_name: str, tool_input: dict) -> dict | None:
     return activity
 
 
+def prompt_parse_miss(event: dict) -> bool:
+    """True when a UserPromptSubmit carries no `prompt` STRING at all.
+
+    The distinction that matters: an empty prompt is a user who submitted nothing, and is
+    silence we should keep. A missing or non-string field means the contract moved under us
+    — the hook still fires, still returns 0, and the heartbeat stays green while every typed
+    prompt goes unscanned. That is the failure fail-open cannot tell you about, so it is the
+    one we report."""
+    return not isinstance(event.get("prompt"), str)
+
+
 def build_prompt_usage(event: dict) -> dict | None:
     """UserPromptSubmit -> ai-usage payload (the typed prompt on its way to the model)."""
     prompt = event.get("prompt")
@@ -250,7 +286,7 @@ def _breaker_record(token: str, status) -> None:
 
 
 def scan(endpoint: str, payload: dict, url: str, token: str,
-         user: str = "", timeout: float = 5.0) -> dict:
+         user: str = "", timeout: float = 5.0, ua: str = "") -> dict:
     """Call a Palivane ingest endpoint; fail open (action=allow) on any error. A revoked key
     trips the circuit breaker so we stop hammering the backend on every call."""
     skip = _breaker_skip(token)
@@ -262,7 +298,7 @@ def scan(endpoint: str, payload: dict, url: str, token: str,
         req = urllib.request.Request(
             url.rstrip("/") + endpoint, method="POST",
             data=json.dumps(body).encode(),
-            headers={"content-type": "application/json", "User-Agent": f"palivane-hook/{VERSION}", "X-Palivane-Token": token},
+            headers={"content-type": "application/json", "User-Agent": ua or agent_ua(), "X-Palivane-Token": token},
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
             out = json.loads(r.read())
@@ -274,6 +310,29 @@ def scan(endpoint: str, payload: dict, url: str, token: str,
     except Exception:
         _breaker_record(token, None)
         return {"action": "allow", "reason": "scan-failed"}
+
+
+def report_parse_miss(endpoint: str, tool: str, cfg: dict, event: dict) -> None:
+    """Tell the backend the extractor recognised an event and got nothing out of it.
+
+    The content field carries a marker rather than being empty — the ingest schema requires
+    a non-empty body, and the proxy already reports drift this way ("[comet parse-miss] ").
+    It is never scored: the endpoint short-circuits on the flag.
+
+    Deliberately cheap and deliberately silent: a short timeout, failure ignored, no output
+    to the host. It exists to move one counter on the sensor heartbeat, which is what turns
+    "this device is quiet" into "this device has been blind since claude-code 2.1.4"."""
+    if not cfg.get("url") or not cfg.get("token"):
+        return
+    try:
+        body = ({"method": "tools/call", "tool": tool, "transport": "stdio",
+                 "parse_miss": True} if endpoint.endswith("/mcp")
+                else {"content": "[palivane parse-miss]", "tool": tool, "destination": tool,
+                       "parse_miss": True})
+        scan(endpoint, body, cfg["url"], cfg["token"], cfg.get("user", ""),
+             min(cfg.get("timeout", 5.0), 3.0), ua=agent_ua(event))
+    except Exception:
+        pass
 
 
 def scan_mcp(activity: dict, url: str, token: str, user: str = "", timeout: float = 5.0) -> dict:
@@ -464,6 +523,8 @@ def main() -> int:
     if event.get("hook_event_name") == "UserPromptSubmit":
         payload = build_prompt_usage(event)
         if payload is None:
+            if prompt_parse_miss(event):
+                report_parse_miss("/api/ingest/ai-usage", "claude-code", cfg, event)
             return 0
         if not cfg["url"] or not cfg["token"]:
             return 0  # not connected to Palivane — nothing to report to
@@ -486,6 +547,14 @@ def main() -> int:
                                   "this exact prompt.")
             print(json.dumps(out))
         return 1 if _auth_rejected(verdict) else 0
+
+    # A PreToolUse that carries no tool_name string is the tool-call equivalent of a
+    # prompt with no prompt: the contract moved. Scoped to PreToolUse deliberately — any
+    # other event reaching here is a config question, not vendor drift, and reporting it
+    # would turn this counter into noise.
+    if event.get("hook_event_name") == "PreToolUse" and not isinstance(event.get("tool_name"), str):
+        report_parse_miss("/api/ingest/mcp", "claude-code", cfg, event)
+        return 0
 
     activity = build_activity(event.get("tool_name", ""), event.get("tool_input") or {})
     if activity is None:

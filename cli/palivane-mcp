@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""palivane-mcp — inline inspection wrapper for local stdio MCP servers.
+"""palivane-mcp-guard — inline inspection wrapper for local stdio MCP servers.
+
+Installed under BOTH names: palivane-mcp-guard (clearer) and palivane-mcp (original, kept
+so configs already in the field keep working). Not to be confused with the Palivane MCP
+*server*, which exposes Palivane's own tools to an assistant — this is the opposite
+direction, and the two shared a name for months.
 
 Local stdio MCP servers never touch the network, so the egress proxy can't see them —
 until now their only governance was the config-level allowlist. This wrapper closes the
@@ -11,7 +16,7 @@ sensitive resources, tool poisoning, secrets in arguments) that inspects remote 
 Wrap any server by prefixing its command in the MCP config:
 
     {"mcpServers": {"github": {
-        "command": "palivane-mcp",
+        "command": "palivane-mcp-guard",
         "args": ["--", "npx", "-y", "@modelcontextprotocol/server-github"]}}}
 
 Monitor by default (report only, zero interference). Set PALIVANE_MCP_ENFORCE=true to
