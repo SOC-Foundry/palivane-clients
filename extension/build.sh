@@ -11,6 +11,18 @@ cd "$(dirname "$0")"
 
 ver=$(grep -o '"version": *"[^"]*"' manifest.json | head -1 | sed 's/.*"\([0-9.]*\)"/\1/')
 saas="${PALIVANE_SAAS_URL:-}"
+
+# Guard against shipping a dev (localhost) build to a store. The published Chrome Web Store
+# package was once a dev build (backendUrl=http://localhost:8090, no app.palivane.io host
+# permission), so it could never reach the SaaS backend — no captures, sign-in broken. Refuse
+# to build unless a SaaS URL is given OR a dev build is explicitly requested.
+if [ -z "$saas" ] && [ "${PALIVANE_DEV:-}" != "1" ]; then
+  echo "ERROR: refusing to build without PALIVANE_SAAS_URL (would default to localhost:8090)." >&2
+  echo "  Store/prod build:  PALIVANE_SAAS_URL=https://app.palivane.io ./build.sh" >&2
+  echo "  Local dev build:   PALIVANE_DEV=1 ./build.sh   (localhost:8090 defaults, dev only)" >&2
+  exit 1
+fi
+
 suffix=""; [ -n "$saas" ] && suffix="-prod"
 out="palivane-shadow-ai-guard-${ver}${suffix}.zip"
 out_abs="$PWD/$out"
