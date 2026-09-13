@@ -23,13 +23,18 @@ set -euo pipefail
 PALIVANE_URL="${PALIVANE_URL:-https://app.palivane.io}"
 PORT="${PALIVANE_PROXY_PORT:-8081}"
 HOME_DIR="${HOME}"
+# The Palivane backend host the addon scores against. It must NEVER route back through this
+# proxy — otherwise the addon's own /api/ingest call loops through mitmproxy (added latency at
+# best, a hang/fail-open at worst). Kept in NO_PROXY, and the proxy service also clears its
+# own http(s)_proxy so its backend calls go direct.
+PV_BACKEND_HOST="${PALIVANE_URL#*://}"; PV_BACKEND_HOST="${PV_BACKEND_HOST%%/*}"; PV_BACKEND_HOST="${PV_BACKEND_HOST%%:*}"
 WDIR="${HOME_DIR}/.palivane"
 # Hosts that must never route through the local proxy: loopback, tailnets (MagicDNS +
 # CGNAT range), and private ranges — so intranet/VPC traffic on VPN'd machines (Zscaler,
 # Tailscale, corp networks) skips the proxy hop entirely. CIDR entries are honored by
 # curl/Go/requests and harmlessly ignored by clients that don't parse them. Extend at
 # install time with PALIVANE_PROXY_NO_PROXY_EXTRA (comma-separated).
-NO_PROXY_BASE="localhost,127.0.0.1,::1,.ts.net,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10"
+NO_PROXY_BASE="localhost,127.0.0.1,::1,${PV_BACKEND_HOST},.ts.net,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10"
 NO_PROXY_ALL="${NO_PROXY_BASE}${PALIVANE_PROXY_NO_PROXY_EXTRA:+,${PALIVANE_PROXY_NO_PROXY_EXTRA}}"
 # Coexistence with a corporate proxy or a TLS-inspecting VPN/ZTNA client. These are TWO
 # INDEPENDENT axes — set either, both, or neither:
@@ -629,14 +634,26 @@ Environment=PALIVANE_TOKEN=${tok}
 Environment=PALIVANE_PROXY_ENFORCE=${PALIVANE_PROXY_ENFORCE:-false}
 Environment=PALIVANE_PROXY_INTERCEPT_EXTRA=${PALIVANE_PROXY_INTERCEPT_EXTRA:-}
 Environment=PALIVANE_PROXY_INTERCEPT_ALL=${PALIVANE_PROXY_INTERCEPT_ALL:-}
+# The proxy must NOT route its own backend scan calls through itself. The graphical session
+# exports http(s)_proxy=127.0.0.1:PORT (environment.d) which the service would otherwise
+# inherit and loop on; clear it here and pin NO_PROXY so /api/ingest goes direct.
+Environment=http_proxy=
+Environment=https_proxy=
+Environment=HTTP_PROXY=
+Environment=HTTPS_PROXY=
+Environment=no_proxy=${NO_PROXY_ALL}
+Environment=NO_PROXY=${NO_PROXY_ALL}
 ExecStart=$(command -v mitmdump) -q -s ${ADDON} --listen-port ${PORT}${up_flags}
 Restart=always
 [Install]
 WantedBy=default.target
 UNIT
       systemctl --user daemon-reload
-      systemctl --user enable --now palivane-proxy.service
-      log "systemd --user service started (palivane-proxy)." ;;
+      # restart (not just enable --now): a reinstall must replace a RUNNING proxy, which may
+      # still hold a stale backend URL/token from a previous install and silently fail open.
+      systemctl --user enable palivane-proxy.service 2>/dev/null || true
+      systemctl --user restart palivane-proxy.service
+      log "systemd --user service (re)started (palivane-proxy)." ;;
   esac
 }
 
@@ -716,6 +733,46 @@ unwire_cli_capture() {
   [ -n "$removed" ] && log "removed CLI capture shims:$removed" || true
 }
 
+# Chromium/Electron desktop AI apps (Claude/ChatGPT Desktop) ignore BOTH the DE proxy config
+# and the http(s)_proxy env vars — the only reliable way to route them is Chromium's
+# --proxy-server flag. For each such app on the system (matched by its Exec binary, not a
+# guessable .desktop name), write a USER-LOCAL .desktop override that adds the flag. User
+# overrides shadow the system entry and are deleted on uninstall, so nothing system-wide is
+# touched. Best-effort: a purely D-Bus-activated launch can still bypass it (we flip
+# DBusActivatable off in the override to prevent that), so verify capture in the console.
+ELECTRON_EXEC_BINS="claude-desktop"
+wire_electron_apps() {
+  [ "$OS" = "Linux" ] || return 0
+  local apps="${HOME_DIR}/.local/share/applications"; mkdir -p "$apps"
+  local d src base dst bin
+  for d in /usr/share/applications /usr/local/share/applications /var/lib/flatpak/exports/share/applications; do
+    [ -d "$d" ] || continue
+    for src in "$d"/*.desktop; do
+      [ -f "$src" ] || continue
+      bin="$(awk -F= '/^Exec=/{split($2,a," "); n=split(a[1],p,"/"); print p[n]; exit}' "$src")"
+      case " $ELECTRON_EXEC_BINS " in *" $bin "*) : ;; *) continue ;; esac
+      base="$(basename "$src")"; dst="${apps}/${base}"
+      awk -v flag="--proxy-server=http://127.0.0.1:${PORT}" '
+        /^DBusActivatable[ \t]*=/ { print "DBusActivatable=false"; next }
+        /^Exec=/ && $0 !~ /--proxy-server=/ { sub(/^Exec=[^ ]+/, "& " flag) }
+        { print }
+      ' "$src" > "$dst"
+      printf "X-Palivane-Managed=true\n" >> "$dst"
+      log "wired ${base} with --proxy-server (Electron desktop capture)"
+    done
+  done
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps" >/dev/null 2>&1 || true
+}
+unwire_electron_apps() {
+  [ "$OS" = "Linux" ] || return 0
+  local apps="${HOME_DIR}/.local/share/applications" f
+  for f in "$apps"/*.desktop; do
+    [ -f "$f" ] || continue
+    grep -q "X-Palivane-Managed=true" "$f" 2>/dev/null && { rm -f "$f"; log "removed .desktop override: $(basename "$f")"; }
+  done
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps" >/dev/null 2>&1 || true
+}
+
 cmd_install() {
   local cli_only=0 a
   for a in "$@"; do [ "$a" = "--cli-only" ] && cli_only=1; done
@@ -744,6 +801,7 @@ cmd_install() {
   if [ "$cli_only" != "1" ]; then
     set_proxy
     install_watchdog    # fail the system proxy open if the proxy process stays dead
+    wire_electron_apps  # --proxy-server override for Electron AI apps (they ignore env/DE proxy)
   fi
   wire_cli_capture      # PATH shims for Node CLIs (needed in both modes — Node ignores the OS proxy/trust)
   if [ "$cli_only" = "1" ]; then
@@ -751,15 +809,16 @@ cmd_install() {
     log "Verify: open a NEW terminal and run 'claude'; check findings in the console."
   else
     log "done. CLIs route through Palivane now. Enforce mode: ${PALIVANE_PROXY_ENFORCE:-false} (monitor)."
-    log "Desktop apps (Claude/ChatGPT) route AFTER YOU LOG OUT AND BACK IN: the desktop shell"
-    log "keeps its login-time env and injects it into taskbar/menu launches, so until re-login"
-    log "those launches can silently bypass the proxy. Quit+reopen may work for some launch"
-    log "paths — verify in the Palivane console (traffic visible = captured); don't assume."
+    log "Electron desktop apps (Claude/ChatGPT) got a --proxy-server .desktop override — QUIT"
+    log "AND REOPEN them (fully; they cache the launch env) and they route through Palivane."
+    log "Other GUI apps pick up the proxy after you log out and back in. Verify in the console"
+    log "(traffic visible = captured)."
   fi
 }
 
 cmd_uninstall() {
   unwire_cli_capture
+  unwire_electron_apps
   case "$OS" in
     Darwin)
       local svc; svc="$(macos_primary_service || true)"
