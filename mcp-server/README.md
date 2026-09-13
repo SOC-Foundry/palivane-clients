@@ -48,6 +48,7 @@ Read-only, deliberately:
 | `ai_tool_inventory` | Shadow-AI inventory: tools in use, sanctioned or not, and the exposure |
 | `list_connectors` | SaaS connectors and their sync status |
 | `gateway_usage` | LLM-gateway usage against the limit |
+| `investigate_finding` | Runs the read-only analyst on a finding and returns a written investigation with a recommended action (never applies one) |
 
 Triage and sync tools (`set_finding_status`, `sync_connector`) are **not** here yet. The
 REST API gates writes with an explicit route allowlist, and MCP puts every call — reads
@@ -74,9 +75,10 @@ claude mcp add palivane \
   -- /abs/path/mcp-server/.venv/bin/python /abs/path/mcp-server/palivane_mcp.py
 ```
 
-It exposes the five tools above plus `health`, `compliance_report`, `set_finding_status`
-and `sync_connector`. A key scoped *Read + triage/sync* is required for the last two; a
-read-only key gets a refusal that says so.
+It exposes every tool above (`list_findings`, `get_finding`, `ai_tool_inventory`,
+`list_connectors`, `gateway_usage`, `investigate_finding`) plus `health`,
+`compliance_report`, `set_finding_status` and `sync_connector`. A key scoped *Read +
+triage/sync* is required for the last two; a read-only key gets a refusal that says so.
 
 ### Environment
 
