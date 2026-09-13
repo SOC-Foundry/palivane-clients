@@ -188,6 +188,15 @@ def compliance_report() -> dict:
     return _api.request("GET", "/api/compliance/report")
 
 
+@mcp.tool()
+def investigate_finding(finding_id: int) -> dict:
+    """Run the read-only analyst on a finding: it gathers the finding's context and the
+    actor's other recent findings and returns a written investigation with a RECOMMENDED
+    action (it never applies one — use set_finding_status to act). Uses the tenant's LLM
+    providers, the same as the judge; the report is saved on the finding."""
+    return _api.request("POST", f"/api/findings/{finding_id}/investigate")
+
+
 # --- write tools (actions) ------------------------------------------------------------
 
 @mcp.tool()
