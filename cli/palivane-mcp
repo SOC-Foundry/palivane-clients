@@ -428,8 +428,9 @@ def main() -> int:
     lock = threading.Lock()
     # Monitor mode batches reports; enforce mode scans inline (needs the verdict now).
     reporter = _Reporter(cfg) if (not cfg["enforce"] and cfg["url"] and cfg["token"]) else None
-    threading.Thread(target=_pump_child_to_client, args=(child, cfg, state, lock, reporter),
-                     daemon=True).start()
+    pump = threading.Thread(target=_pump_child_to_client,
+                            args=(child, cfg, state, lock, reporter), daemon=True)
+    pump.start()
 
     out = sys.stdout.buffer
     try:
@@ -463,9 +464,17 @@ def main() -> int:
             child.stdin.close()
         except OSError:
             pass
+        rc = child.wait()
+        # The pump is a daemon thread: exiting right after child.wait() raced it and could
+        # drop the tail of the server→client stream (frames the child wrote just before
+        # exit, still in its stdout pipe). After child exit the pipe hits EOF so the pump
+        # ends on its own; the join is bounded only for an enforce-mode scan mid-flight
+        # against a hung backend. Join BEFORE reporter.close() so the pump's last
+        # enqueues make the final flush.
+        pump.join(timeout=cfg["timeout"] + 1)
         if reporter is not None:
             reporter.close()  # flush any queued reports
-    return child.wait()
+    return rc
 
 
 if __name__ == "__main__":
