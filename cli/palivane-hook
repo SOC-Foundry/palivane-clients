@@ -154,6 +154,31 @@ def _is_excluded(cwd: str, exclude: list) -> bool:
     return any(rp == d or rp.startswith(d + os.sep) for d in exclude)
 
 
+def _touches_excluded(tool_input: dict, exclude: list) -> bool:
+    """True if a tool call TARGETS a path inside an excluded directory.
+
+    _is_excluded covers the session's cwd, which is not the same question. A session rooted
+    at ~ that reads ~/Palivane/backend/tests/... is not excluded by cwd, so the repo's
+    deliberately realistic fixtures (AKIA keys, .aws/credentials, `rm -rf /` in detector
+    corpora) still produced findings — which is exactly what setting the exclusion was meant
+    to prevent. Match on the paths in the call as well as on where the session started.
+    """
+    if not exclude or not isinstance(tool_input, dict):
+        return False
+    paths: list[str] = []
+    _harvest_strings(tool_input, paths)
+    for raw in paths:
+        if not raw or os.sep not in raw:
+            continue
+        try:
+            rp = os.path.realpath(os.path.expanduser(raw.strip()))
+        except (OSError, ValueError):
+            continue
+        if any(rp == d or rp.startswith(d + os.sep) for d in exclude):
+            return True
+    return False
+
+
 def build_activity(tool_name: str, tool_input: dict) -> dict | None:
     """Map a Claude Code tool call onto Palivane's MCP-activity shape (POST /api/ingest/mcp).
 
@@ -556,7 +581,11 @@ def main() -> int:
         report_parse_miss("/api/ingest/mcp", "claude-code", cfg, event)
         return 0
 
-    activity = build_activity(event.get("tool_name", ""), event.get("tool_input") or {})
+    tool_input = event.get("tool_input") or {}
+    if _touches_excluded(tool_input, cfg["exclude"]):
+        return 0                                  # the call reaches into an excluded repo
+
+    activity = build_activity(event.get("tool_name", ""), tool_input)
     if activity is None:
         return 0
 
