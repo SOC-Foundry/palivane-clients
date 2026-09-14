@@ -443,11 +443,15 @@ def load_cache(path: str) -> dict:
 
 
 def save_cache(path: str, cache: dict) -> None:
+    """Atomic (temp + os.replace): the --async child can be killed at any moment, and a
+    truncated cache reads as empty next run — which would re-post every finding."""
     p = os.path.expanduser(path)
     os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
-    with open(p, "w") as f:
+    tmp = f"{p}.tmp"
+    with open(tmp, "w") as f:
         json.dump(cache, f, indent=2)
-    os.chmod(p, 0o600)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
 
 
 def should_post(cache: dict, backend: str, key: str, dig: str) -> bool:
@@ -642,6 +646,14 @@ def run(cfg: dict, cache_path: str = CACHE_PATH, cwd: str = ".",
             _mark_posted(cache, cfg["url"], key, dig)
             reported += 1
             say(f"posted {key}")
+            # Persist the mark NOW, not at the end of the run: the --async child can be
+            # killed any time (session end), and self_update below spends seconds on the
+            # network — dying there forgot every mark and re-posted the whole run's
+            # findings next session. Best-effort: the final save (or next run) retries.
+            try:
+                save_cache(cache_path, cache)
+            except OSError:
+                pass
         else:
             say(f"failed {key} (will retry next run)")
 
