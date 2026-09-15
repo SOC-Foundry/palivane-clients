@@ -210,8 +210,14 @@ def build_activity(tool_name: str, tool_input: dict) -> dict | None:
         fp = tool_input.get("file_path", "")
         activity["resource"] = fp if isinstance(fp, str) else ""
     else:
-        # Write/Edit/WebFetch/… — harvest all string values (file paths land in
-        # args_text for the sensitive-path check; content is scanned for secrets/PII).
+        # Write/Edit/WebFetch/… — harvest all string values; content is scanned for
+        # secrets/PII. The FILE PATH is lifted out into `resource` rather than left in
+        # args_text: the backend judges "targets a sensitive path" on resource for these
+        # tools, because their args_text is the file's content and a document that merely
+        # mentions ~/.aws/credentials is not an access of it.
+        fp = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+        if isinstance(fp, str):
+            activity["resource"] = fp
         harvested = []
         _harvest_strings(tool_input, harvested)
         activity["args_text"] = "\n".join(harvested)[:_MAX_ARGS_TEXT]
