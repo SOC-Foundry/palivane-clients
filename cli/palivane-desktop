@@ -855,7 +855,23 @@ cmd_uninstall() {
   esac
 }
 
+# Everything between the app and a verdict, checked rather than assumed.
+#
+# This used to print "proxy: active" and stop, which was true and useless: the proxy ran for
+# a week authenticating with a revoked key, against traffic that never reached it because the
+# Electron apps were not wired, with a CA trusted in neither store. Three independent
+# failures, all invisible to the one command meant to report the state — and all of them
+# fail OPEN, so nothing was blocked and nothing said so.
+#
+# Each check names what breaks when it fails, because "NSS: no" means nothing to someone
+# debugging at 11pm.
+status_check() {                       # status_check <label> <ok?> <consequence-if-not>
+  if [ "$2" = "1" ]; then printf '  ok    %s\n' "$1"
+  else printf '  FAIL  %s — %s\n' "$1" "$3"; STATUS_BAD=1; fi
+}
+
 cmd_status() {
+  STATUS_BAD=0
   case "$OS" in
     Darwin) launchctl list 2>/dev/null | grep -q palivane-proxy && echo "proxy: running" || echo "proxy: not running" ;;
     Linux)
@@ -868,6 +884,87 @@ cmd_status() {
     [ -f "$SHIM_DIR/$name" ] && grep -q "palivane-desktop CLI capture shim" "$SHIM_DIR/$name" 2>/dev/null && active="$active $name"
   done
   [ -n "$active" ] && echo "cli shims:$active" || echo "cli shims: none"
+
+  echo "capture path:"
+
+  # 1. The credential. A revoked token means every scan 401s and the proxy fails open —
+  #    indistinguishable from "nothing risky was sent" unless something checks.
+  local url token code=""
+  url="$(svc_env PALIVANE_URL)"; token="$(svc_env PALIVANE_TOKEN)"
+  if [ -z "$url" ] || [ -z "$token" ]; then
+    status_check "backend credential" 0 "no PALIVANE_URL/PALIVANE_TOKEN in the proxy service"
+  else
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+            -X POST "$url/api/ingest/ai-usage" -H 'content-type: application/json' \
+            -H "X-Palivane-Token: $token" -d '{"content":"palivane status probe","destination":"status-check"}' 2>/dev/null || echo 000)"
+    case "$code" in
+      2*) status_check "backend credential" 1 ;;
+      401|403) status_check "backend credential" 0 "the proxy's token is rejected ($code) — every scan fails open, nothing is blocked" ;;
+      000) status_check "backend credential" 0 "cannot reach $url — scans fail open" ;;
+      *)  status_check "backend credential" 0 "backend returned $code" ;;
+    esac
+  fi
+
+  # 2/3. CA trust. Electron verifies against NSS and ignores the system bundle, so the two
+  #      are reported separately: NSS missing breaks the desktop apps specifically.
+  if [ "$OS" = "Linux" ]; then
+    if command -v certutil >/dev/null 2>&1; then
+      certutil -d "$NSS_DB" -L 2>/dev/null | grep -q "$CA_NICK" \
+        && status_check "CA trusted by Electron apps (NSS)" 1 \
+        || status_check "CA trusted by Electron apps (NSS)" 0 \
+             "Claude/ChatGPT desktop will show ERR_CERT_AUTHORITY_INVALID"
+    else
+      status_check "CA trusted by Electron apps (NSS)" 0 "certutil missing — install nss-tools/libnss3-tools"
+    fi
+    if [ -f "$CA" ] && openssl verify -CApath /etc/ssl/certs "$CA" >/dev/null 2>&1; then
+      status_check "CA in the system bundle" 1
+    else
+      status_check "CA in the system bundle" 0 "Node CLIs and curl will reject the proxy"
+    fi
+
+    # 4. Electron routing. The apps ignore env vars and the DE proxy setting, so an override
+    #    carrying --proxy-server is the only thing that routes them.
+    local wired=0 f
+    for f in "${HOME_DIR}/.local/share/applications"/*.desktop; do
+      [ -f "$f" ] || continue
+      grep -q -- "--proxy-server=" "$f" 2>/dev/null && wired=1 && break
+    done
+    status_check "desktop AI apps routed through the proxy" "$wired" \
+      "Claude/ChatGPT desktop bypass the proxy entirely — re-run: palivane-desktop install"
+
+    # 5. End to end, the way the desktop app actually sends: a GZIPPED body. Every check
+    #    above passed while the proxy read raw_content and handed gzip bytes to the parser,
+    #    so nothing from Claude Desktop was ever scanned. Wiring proved wired, trust proved
+    #    trusted, and the thing they exist for was broken — so push a known-bad payload
+    #    through and require a refusal.
+    if command -v curl >/dev/null 2>&1 && command -v gzip >/dev/null 2>&1; then
+      local probe_body probe_code
+      probe_body="$(mktemp)"
+      printf '%s' '{"prompt":"palivane self-test 000-00-0000"}' | gzip > "$probe_body"
+      probe_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+        -x "http://127.0.0.1:${PORT}" --cacert "$CA" \
+        -X POST "https://claude.ai/api/organizations/00000000-0000-0000-0000-000000000000/chat_conversations/00000000-0000-0000-0000-000000000000/completion" \
+        -H 'content-type: application/json' -H 'content-encoding: gzip' \
+        --data-binary "@$probe_body" 2>/dev/null || echo 000)"
+      rm -f "$probe_body"
+      [ "$probe_code" = "400" ] \
+        && status_check "a compressed prompt carrying PII is refused" 1 \
+        || status_check "a compressed prompt carrying PII is refused" 0 \
+             "got HTTP $probe_code — the proxy is not scanning what the desktop app sends"
+    fi
+  fi
+
+  [ "$STATUS_BAD" = "1" ] && echo "capture is INCOMPLETE — the checks above marked FAIL are not capturing."
+  return 0
+}
+
+# Read one Environment= value out of the installed proxy service, so status reports what the
+# RUNNING proxy uses rather than what the current shell happens to have exported.
+svc_env() {
+  case "$OS" in
+    Linux) sed -n "s/^Environment=$1=//p" "${HOME_DIR}/.config/systemd/user/palivane-proxy.service" 2>/dev/null | head -1 ;;
+    *)     printf '%s' "${!1:-}" ;;
+  esac
 }
 
 # Dispatch only when executed. Sourcing the file defines the functions without running an
