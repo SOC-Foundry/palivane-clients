@@ -474,6 +474,42 @@ def extract_ws_text(payload: bytes | str) -> str:
     return payload[:8000]
 
 
+# --- deferring to a live local hook ------------------------------------------------------
+# A prompt typed into Claude Code is captured twice: by the hook before it leaves, and again
+# here when the agent calls the provider. Two findings for one action. The hook sees the
+# better artefact (the typed prompt, not the whole payload with the agent's context scaffold),
+# so this defers to it — but ONLY while the backend confirms that hook actually reported
+# recently. Presence would be a signal the monitored person can delete; liveness is not.
+#
+# Fails CLOSED: any error, timeout or unreachable backend leaves the set empty and this proxy
+# keeps scanning everything. Losing a duplicate is cheap; losing the capture is not.
+_HOOKED: dict = {"tools": frozenset(), "at": 0.0}
+_HOOKED_TTL = 300.0          # 5 min — deference lags a hook going quiet by at most this
+
+
+def hooked_tools() -> frozenset:
+    """Tools whose local hook is live for this actor, cached. Empty on any failure."""
+    import time
+    now = time.time()
+    if now - _HOOKED["at"] < _HOOKED_TTL:
+        return _HOOKED["tools"]
+    _HOOKED["at"] = now
+    base = os.getenv("PALIVANE_URL", "").rstrip("/")
+    token = os.getenv("PALIVANE_TOKEN", "")
+    if not base or not token:
+        _HOOKED["tools"] = frozenset()
+        return _HOOKED["tools"]
+    try:
+        req = urllib.request.Request(f"{base}/api/capture/hooked",
+                                     headers={"X-Palivane-Token": token})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read() or b"{}")
+        _HOOKED["tools"] = frozenset(t for t in (data.get("tools") or []) if t)
+    except Exception:
+        _HOOKED["tools"] = frozenset()      # fail closed: scan everything
+    return _HOOKED["tools"]
+
+
 def detect_tool(user_agent: str) -> str:
     """Identify a coding assistant from its User-Agent so per-tool policy can apply."""
     ua = (user_agent or "").lower()
@@ -1034,10 +1070,18 @@ class PalivaneGuard:
             # 1) Prompt content scan (shadow-AI / data-loss). extract_prompt returns the
             #    current user turn from a recognized shape; only fall back to harvesting all
             #    strings for hosts we can't parse (never on structured API telemetry).
-            prompt = extract_prompt(raw)
-            if not prompt.strip() and needs_harvest(req.pretty_host):
+            # A live local hook already scanned this prompt before it left the machine, and
+            # saw the better artefact. Skip ONLY the prompt scan: section 2 below reads the
+            # agent's tool USE out of the same request, which is a different exposure and
+            # stays covered. An early return here would have silently dropped it.
+            ua_tool = detect_tool(req.headers.get("user-agent", ""))
+            defer_prompt = bool(ua_tool) and ua_tool in hooked_tools()
+
+            prompt = "" if defer_prompt else extract_prompt(raw)
+            if not defer_prompt and not prompt.strip() and needs_harvest(req.pretty_host):
                 prompt = harvest_prompt(raw)
-            elif not prompt.strip() and raw.strip() and _carries_a_prompt(req.path):
+            elif not defer_prompt and not prompt.strip() and raw.strip() \
+                    and _carries_a_prompt(req.path):
                 # A structured host whose prompt-carrying endpoint parsed to nothing means the
                 # vendor changed shape, and the failure mode is silence: the request sails
                 # through unscanned and no finding is ever created to notice. Say so. Not a
