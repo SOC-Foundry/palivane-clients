@@ -978,7 +978,19 @@ class PalivaneGuard:
         req = flow.request
         if req.method != "POST":
             return
-        raw = req.raw_content or b""
+        # `.content`, not `.raw_content`: raw_content is the body EXACTLY as it arrived,
+        # still compressed when the client sets content-encoding. Claude Desktop gzips every
+        # request (anthropic-client-platform: desktop_app, content-encoding: gzip), so the
+        # parsers below received gzip bytes, failed to decode JSON, extracted nothing, and
+        # every prompt from the desktop app passed unscanned — a browser sending the same
+        # text uncompressed was blocked correctly, which is why this looked like it worked.
+        # mitmproxy decodes content-encoding for `.content`; fall back to raw for a body it
+        # cannot decode, so a malformed/unknown encoding still gets scanned as bytes rather
+        # than silently skipped.
+        try:
+            raw = req.content or b""
+        except Exception:                      # undecodable encoding — scan what we have
+            raw = req.raw_content or b""
 
         # Perplexity Comet (agentic browser): the assistant endpoint has its own body
         # shape, so it gets a dedicated parser. A parse-miss (shape drift, new build)
@@ -1089,7 +1101,10 @@ class PalivaneGuard:
         req, resp = flow.request, flow.response
         if req.method != "POST" or resp is None or is_ai_host(req.pretty_host):
             return
-        body = resp.raw_content or b""
+        try:
+            body = resp.content or b""      # decoded; raw_content is still gzip/br/zstd
+        except Exception:
+            body = resp.raw_content or b""
         if not is_mcp(body):
             return
         activity = extract_mcp_activity(body)
