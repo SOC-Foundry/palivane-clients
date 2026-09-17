@@ -176,10 +176,28 @@ def intercept_patterns() -> list[str]:
 # Cursor) still get the harvest fallback since we can't parse their bodies.
 STRUCTURED_API_SUFFIXES = (
     "api.openai.com", "api.anthropic.com",
+    # claude.ai is a chat UI, but its completion body is a KNOWN shape ({"prompt": …}), so it
+    # is parsed rather than harvested. Harvesting it was harmless only while the body arrived
+    # gzipped and matched nothing; once decoding was fixed, "every string value" meant the
+    # 57KB envelope — conversation UUIDs, a device id, a sessionKey, sha256 file hashes —
+    # and the entropy detector made a separate "secret" finding out of each one. One prompt,
+    # four findings, none of them the user's data.
+    "claude.ai",
     "generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com",
     "aiplatform.googleapis.com", "api.cohere.ai", "api.mistral.ai", "api.perplexity.ai",
     "githubcopilot.com", "copilot-proxy.githubusercontent.com",
 )
+
+
+# Endpoint paths that carry a user prompt, for the structured hosts. Used only to decide
+# whether an unparseable body deserves a warning — a telemetry or sync POST parsing to
+# nothing is normal and must stay quiet, or the log becomes noise nobody reads.
+_PROMPT_PATHS = ("/completion", "/messages", "/chat/completions", "/generateContent")
+
+
+def _carries_a_prompt(path: str) -> bool:
+    p = (path or "").split("?", 1)[0]
+    return any(p.endswith(s) or s in p for s in _PROMPT_PATHS)
 
 
 def needs_harvest(host: str) -> bool:
@@ -1019,6 +1037,17 @@ class PalivaneGuard:
             prompt = extract_prompt(raw)
             if not prompt.strip() and needs_harvest(req.pretty_host):
                 prompt = harvest_prompt(raw)
+            elif not prompt.strip() and raw.strip() and _carries_a_prompt(req.path):
+                # A structured host whose prompt-carrying endpoint parsed to nothing means the
+                # vendor changed shape, and the failure mode is silence: the request sails
+                # through unscanned and no finding is ever created to notice. Say so. Not a
+                # harvest fallback — that is what produced a "secret" finding per UUID in the
+                # envelope — but loud enough that shape drift is discovered by us, not by a
+                # customer wondering why their console went quiet.
+                import logging
+                logging.warning(
+                    "palivane: %s%s carried no recognizable prompt (%d bytes) — shape drift? "
+                    "This request was NOT scanned.", req.pretty_host, req.path[:80], len(raw))
             if prompt.strip():
                 tool = detect_tool(req.headers.get("user-agent", ""))
                 verdict = await asyncio.to_thread(
