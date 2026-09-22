@@ -48,7 +48,7 @@ Read-only, deliberately:
 | `ai_tool_inventory` | Shadow-AI inventory: tools in use, sanctioned or not, and the exposure |
 | `list_connectors` | SaaS connectors and their sync status |
 | `gateway_usage` | LLM-gateway usage against the limit |
-| `investigate_finding` | Runs the read-only analyst on a finding and returns a written investigation with a recommended action (never applies one) |
+| `investigate_finding` | Runs the read-only analyst on a finding and returns a written investigation with a recommended action (never applies one). Needs the analyst switched on **and** your org's own LLM key — it has no fallback to Palivane's provider, so without one it returns 400 |
 
 Triage and sync tools (`set_finding_status`, `sync_connector`) are **not** here yet. The
 REST API gates writes with an explicit route allowlist, and MCP puts every call — reads
