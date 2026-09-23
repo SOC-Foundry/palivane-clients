@@ -13,6 +13,7 @@ audit it before you deploy it:
 | [`cli/`](cli/) | Capture hooks for AI coding tools (Claude Code, Cursor, Codex, Copilot, Gemini CLI), device posture + at-rest secrets scanning, MCP config wrapping, CI scanning, and the `palivane-connect` self-serve enrollment. |
 | [`proxy/`](proxy/) | The egress proxy addon (mitmproxy-based) covering desktop AI apps and anything else that won't take a base-URL override. |
 | [`mcp-server/`](mcp-server/) | Palivane *as* an MCP server: query findings, work the triage queue, inspect shadow-AI usage, run connector syncs and pull a compliance report from your AI assistant, on a long-lived console API key. |
+| [`git/`](git/) | The commit-time gate: a pre-commit hook and a GitHub Action that scan staged files and PR diffs for secrets and PII before they reach a repo, complementing GitHub's own push protection. Install it straight from this repo — see [`git/README.md`](git/README.md). |
 
 Every *capture* component is fail-open by design: if the backend is unreachable, your AI
 tools keep working — a down security control must never take engineering down with it. The
