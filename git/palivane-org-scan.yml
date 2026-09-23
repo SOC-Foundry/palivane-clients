@@ -1,0 +1,38 @@
+# Scheduled org-wide secret & PII sweep — a TEMPLATE to copy into a repo as
+# .github/workflows/palivane-org-scan.yml (a dedicated "security" repo is a good home).
+#
+# Unlike the per-PR Action (which only sees a PR's changed files), this walks EVERY repo in
+# the org via the GitHub API — no checkout — on a schedule, and records the findings in
+# Palivane. Pair it with the PR gate: the PR Action stops new leaks, this catches what's
+# already sitting in the default branches.
+name: Palivane org secret & PII scan
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"        # every Monday 07:00 UTC — adjust to taste
+  workflow_dispatch: {}         # also runnable on demand from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      PALIVANE_URL: https://palivane.corp.example.com
+      PALIVANE_TOKEN: ${{ secrets.PALIVANE_TOKEN }}
+      # The org to sweep.
+      PALIVANE_ORG: your-org
+      # A token that can READ your org's repos. NOTE: the built-in ${{ github.token }} only
+      # sees THIS repo, so an org-wide sweep needs a PAT or GitHub App token with org repo
+      # read, stored as a secret.
+      GITHUB_TOKEN: ${{ secrets.PALIVANE_ORG_READ_TOKEN }}
+    steps:
+      - name: Fetch the scanner
+        run: |
+          curl -fsSL "$PALIVANE_URL/cli/palivane-github-scan" -o palivane-github-scan
+          chmod +x palivane-github-scan
+      - name: Scan the org
+        # --record persists findings; --fail-closed makes the job fail if Palivane is
+        # unreachable (so a broken sweep is visible rather than silently skipped).
+        run: ./palivane-github-scan --org "$PALIVANE_ORG" --record --fail-closed
