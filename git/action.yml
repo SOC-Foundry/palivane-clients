@@ -1,0 +1,32 @@
+name: "Palivane secret & PII scan"
+description: "Scan a pull request's changed files for secrets and PII via your Palivane backend."
+branding:
+  icon: shield
+  color: blue
+inputs:
+  palivane-url:
+    description: "Palivane backend base URL (e.g. https://palivane.corp.example.com)."
+    required: true
+  palivane-token:
+    description: "A Palivane API key (ak_…). Pass from a repo/org secret."
+    required: true
+  strict:
+    description: "Fail the check on warn-level findings too (not just blocks)."
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Palivane secret & PII scan
+      shell: bash
+      env:
+        PALIVANE_URL: ${{ inputs.palivane-url }}
+        PALIVANE_TOKEN: ${{ inputs.palivane-token }}
+      run: |
+        base="${{ github.event.pull_request.base.sha }}"
+        head="${{ github.event.pull_request.head.sha }}"
+        range="${base:-HEAD~1}..${head:-HEAD}"
+        echo "Scanning range: $range"
+        python3 "$GITHUB_ACTION_PATH/palivane_git_scan.py" \
+          --range "$range" --fail-closed \
+          ${{ inputs.strict == 'true' && '--strict' || '' }}

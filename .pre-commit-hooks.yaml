@@ -1,0 +1,7 @@
+- id: palivane-secret-scan
+  name: Palivane secret & PII scan
+  description: Block commits that contain secrets or PII (scanned via your Palivane backend).
+  entry: git/palivane_git_scan.py --staged
+  language: script
+  pass_filenames: false
+  always_run: true

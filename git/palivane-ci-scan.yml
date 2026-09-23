@@ -1,0 +1,47 @@
+# CI-runner posture scan — a TEMPLATE to copy into a repo as
+# .github/workflows/palivane-ci-scan.yml (or run org-wide, see the last job comment).
+#
+# Audits this repo's GitHub Actions workflows for the configurations that get runners
+# popped: pwn-request triggers (pull_request_target + PR-head checkout), unpinned
+# third-party actions, write-all token permissions, secrets:inherit to third parties,
+# self-hosted runners on PR triggers — and AI agents running in CI, including deploy/cloud
+# secrets handed into their steps. Findings land in Palivane (Findings + Discovery).
+name: Palivane CI-runner scan
+
+on:
+  pull_request:
+    paths: [".github/workflows/**"]   # gate workflow changes at PR time
+  schedule:
+    - cron: "0 7 * * 1"               # weekly posture sweep of what's on the default branch
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write    # lets the scanner authenticate with the runner's OIDC token —
+                     # delete this line (and --github-oidc below) to use PALIVANE_TOKEN instead
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      PALIVANE_URL: https://palivane.corp.example.com
+      # Only needed without OIDC: a per-tenant API key (ak_…) stored as a secret.
+      # PALIVANE_TOKEN: ${{ secrets.PALIVANE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the scanner
+        run: |
+          curl -fsSL "$PALIVANE_URL/cli/palivane-ci-scan" -o palivane-ci-scan
+          chmod +x palivane-ci-scan
+      - name: Scan this repo's workflows
+        # --github-oidc: authenticate as this workflow's identity (register the issuer
+        # https://token.actions.githubusercontent.com under Agents → workload identity).
+        # For an org-wide sweep instead: ./palivane-ci-scan --org your-org (needs a
+        # GITHUB_TOKEN with org repo read — the built-in github.token is repo-scoped).
+        #
+        # Whether a finding FAILS this job follows your org's CI block severity
+        # (Settings → CI scan block severity), which defaults to `critical`: an exploitable
+        # workflow fails the build, while posture debt (unpinned actions, write-all) is
+        # reported and warns. Add --block-on=high here to run a stricter gate in this
+        # pipeline than org policy — it can tighten the gate, never loosen it.
+        run: ./palivane-ci-scan --path . --github-oidc --fail-closed
