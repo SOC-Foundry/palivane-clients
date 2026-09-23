@@ -1,0 +1,39 @@
+{
+  "name": "palivane-vscode",
+  "displayName": "Palivane, AI Security Posture",
+  "description": "Continuous in-IDE posture for Palivane: extension inventory drift, MCP config changes, and AI-assistant autonomy settings, reported live to your org's Palivane console.",
+  "version": "0.2.0",
+  "publisher": "palivane",
+  "license": "MIT",
+  "icon": "icon.png",
+  "repository": { "type": "git", "url": "https://github.com/SOC-Foundry/Palivane" },
+  "homepage": "https://app.palivane.io",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "keywords": ["security", "ai", "shadow ai", "mcp", "posture", "dlp"],
+  "galleryBanner": { "color": "#0b0e17", "theme": "dark" },
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "palivane.connect", "title": "Palivane: Connect to console" },
+      { "command": "palivane.reportNow", "title": "Palivane: Report posture now" },
+      { "command": "palivane.disconnect", "title": "Palivane: Disconnect" }
+    ],
+    "configuration": {
+      "title": "Palivane",
+      "properties": {
+        "palivane.url": {
+          "type": "string",
+          "default": "",
+          "description": "Palivane console URL (empty = hosted SaaS or the URL from ~/.claude/settings.json)"
+        },
+        "palivane.url": {
+          "type": "string",
+          "default": "",
+          "description": "Deprecated pre-rebrand setting, use palivane.url. Still read as a fallback."
+        }
+      }
+    }
+  }
+}
