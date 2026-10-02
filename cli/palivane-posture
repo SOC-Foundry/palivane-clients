@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -133,6 +134,22 @@ def _findings(text: str, server: str = "") -> list[dict]:
         for fd in out:
             fd["server"] = server
     return out
+
+
+# `palivane connect` writes Palivane's own capture key into an agent's settings.json, as
+# PALIVANE_TOKEN and, when it routes through our gateway, as ANTHROPIC_AUTH_TOKEN, because the
+# hook cannot work without it. Reading that file back and reporting the key as a "possible
+# secret" put a finding on every enrolled machine, and beside any real finding in the same file
+# it tipped a warning into critical. Only the VALUE of those two settings is exempt, and only
+# when it is one of our `ak_` keys: a second key pasted elsewhere in the file, or someone
+# else's token in the same variable, still reports.
+_OWN_KEY_RE = re.compile(r'("(?:PALIVANE_TOKEN|ANTHROPIC_AUTH_TOKEN)"\s*:\s*")(ak_[^"\\]*)(")')
+
+
+def _without_own_credential(content: str) -> str:
+    """`content` with our own key's value blanked in place. Same length, same lines, so a
+    finding elsewhere in the file keeps the line number someone will need to find it by."""
+    return _OWN_KEY_RE.sub(lambda m: m.group(1) + "x" * len(m.group(2)) + m.group(3), content)
 
 
 def mcp_findings(content: str) -> list[dict]:
@@ -624,7 +641,8 @@ def run(cfg: dict, cache_path: str = CACHE_PATH, cwd: str = ".",
     for label, content, tool in collect_agent_configs():
         items.append((f"agent:{label}", "/api/scan/agent-config",
                       {"content": detect.redact(content), "tool": tool, "user": user,
-                       "findings": _findings(content), "record": True}, content))
+                       "findings": _findings(_without_own_credential(content)),
+                       "record": True}, content))
     for label, content, path, tool in collect_agent_rules(cwd):
         items.append((f"rules:{label}", "/api/scan/agent-rules",
                       {"content": detect.redact(content), "path": path, "tool": tool,
