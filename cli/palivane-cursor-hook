@@ -75,6 +75,22 @@ def agent_ua(event: dict | None = None) -> str:
     return f"palivane-cursor-hook/{VERSION} (cursor{'/' + ver if ver else ''})"
 
 
+def report_parse_miss(event: dict, cfg: dict) -> None:
+    """Tell the backend the extractor recognised a prompt event and got nothing out of it.
+
+    The content field carries a marker rather than being empty (the ingest schema requires a
+    non-empty body) and is never scored: the endpoint short-circuits on the flag. The User-Agent
+    carries Cursor's own build when the event exposes one, because "since which release" is the
+    first question when a shape changes under us. Cheap and silent: a short timeout, no output
+    to the host, and nothing at all when the device is not connected."""
+    if not cfg.get("url") or not cfg.get("token"):
+        return
+    _post("/api/ingest/ai-usage",
+          {"content": "[palivane parse-miss]", "tool": "cursor", "destination": "cursor",
+           "parse_miss": True},
+          {**cfg, "timeout": min(cfg.get("timeout", 5.0), 3.0)}, ua=agent_ua(event))
+
+
 def prompt_parse_miss(event: dict) -> bool:
     """True when the prompt-bearing event carries no `prompt` STRING at all.
 
@@ -253,7 +269,7 @@ def read_config() -> dict:
             "user": user, "exclude": exclude}
 
 
-def _post(endpoint: str, payload: dict, cfg: dict) -> dict:
+def _post(endpoint: str, payload: dict, cfg: dict, ua: str = "") -> dict:
     """POST to a Palivane ingest endpoint; fail open (action=allow) on any error."""
     try:
         body = dict(payload)
@@ -261,7 +277,8 @@ def _post(endpoint: str, payload: dict, cfg: dict) -> dict:
         req = urllib.request.Request(
             cfg["url"].rstrip("/") + endpoint, method="POST",
             data=json.dumps(body).encode(),
-            headers={"content-type": "application/json", "User-Agent": agent_ua(), "X-Palivane-Token": cfg["token"]},
+            headers={"content-type": "application/json", "User-Agent": ua or agent_ua(),
+                     "X-Palivane-Token": cfg["token"]},
         )
         with urllib.request.urlopen(req, timeout=cfg.get("timeout", 5.0)) as r:
             return json.loads(r.read())
@@ -374,7 +391,8 @@ def main() -> int:
         event = json.load(sys.stdin)
     except Exception:
         return 0
-    if _is_excluded(_event_cwd(event), read_config()["exclude"]):
+    cfg = read_config()
+    if _is_excluded(_event_cwd(event), cfg["exclude"]):
         return 0
     name = event.get("hook_event_name", "")
 
@@ -385,11 +403,9 @@ def main() -> int:
         endpoint = "/api/ingest/mcp"
     if payload is None:
         if endpoint.endswith("/ai-usage") and prompt_parse_miss(event):
-            _post(endpoint, {"content": "[palivane parse-miss]", "tool": "cursor",
-                             "destination": "cursor", "parse_miss": True}, cfg)
+            report_parse_miss(event, cfg)
         return 0
 
-    cfg = read_config()
     if not cfg["url"] or not cfg["token"]:
         return 0  # not connected to Palivane — nothing to report to
 
