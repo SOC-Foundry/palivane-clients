@@ -22,8 +22,11 @@ Set PALIVANE_ENFORCE=true to also block on ordinary high-risk verdicts — tool 
 then scanned synchronously and denied with the reason shown to the model; blocked prompts
 are erased with the reason shown to the user. The org can set that stance centrally
 (console Settings → Enforcement): `palivane-connect` provisions it at connect time, and
-inline verdicts carry the live value in their `enforce` field. Fails open on any error:
-Palivane being down never breaks the developer.
+inline verdicts carry the live value in their `enforce` field. Under enforce, an org that
+turned on ASK (console Settings → Policy) also has a tool call that scores in the warn band
+put to the developer as Claude Code's own permission prompt, with the reason, instead of
+running silently; a block stays a block. Fails open on any error: Palivane being down never
+breaks the developer.
 
 Installed by `palivane-connect` (PreToolUse + UserPromptSubmit entries in
 ~/.claude/settings.json), or manually:
@@ -406,6 +409,34 @@ def deny_output(verdict: dict) -> dict:
     }}
 
 
+def should_ask(verdict: dict) -> bool:
+    """The org's ASK verdict: a tool call in the warn band that the org wants a person to
+    approve rather than run silently. The server decides — it only sets `ask` for an actor
+    who is enforced, in a tenant that opted in — so this just honors it. Callers check
+    should_block first: a block is never softened into an ask."""
+    return bool(verdict.get("ask"))
+
+
+def ask_output(verdict: dict) -> dict:
+    """PreToolUse ask — Claude Code shows its normal permission prompt and the developer
+    approves or refuses. The reason is shown to the USER in that prompt (a deny's goes to the
+    model), so it carries the fix the way a blocked prompt does. In a run nobody can answer
+    (`claude -p`), Claude Code denies the call instead."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    reason = (f"Palivane flagged this tool call ({cats or 'policy'}) — "
+              f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'suspicious')}. "
+              f"Approve it only if you meant to run it.")
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        reason += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "ask",
+        "permissionDecisionReason": reason,
+    }}
+
+
 def prompt_block_output(verdict: dict) -> dict:
     """UserPromptSubmit structured block — the prompt is erased and the reason (with the
     fix, since the reader here is the user, not the model) is shown in the transcript."""
@@ -602,6 +633,9 @@ def main() -> int:
         verdict = scan_mcp(activity, cfg["url"], cfg["token"], cfg["user"], cfg["timeout"])
         if should_block(verdict, True):
             print(json.dumps(deny_output(verdict)))
+            return 0
+        if should_ask(verdict):
+            print(json.dumps(ask_output(verdict)))
             return 0
         return 1 if _auth_rejected(verdict) else 0
     else:

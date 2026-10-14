@@ -23,8 +23,10 @@ is allowed with ~zero added latency. Prompts (beforeSubmitPrompt) are the except
 are scanned inline even in monitor mode so a confirmed secret/PII leak (`force_block`) is
 stopped before it leaves — same rule as the egress proxy: block the certain, monitor the
 fuzzy. Set PALIVANE_ENFORCE=true to scan every event synchronously and DENY on a block
-verdict — the reason is surfaced to the user and the agent. Fails open on any error:
-Palivane being down never breaks the developer.
+verdict — the reason is surfaced to the user and the agent. An org that turned on ASK
+(console Settings → Policy) also has a shell or MCP call in the warn band put to the
+developer as Cursor's own approval prompt instead of running silently; a block stays a
+block. Fails open on any error: Palivane being down never breaks the developer.
 
 Register in ~/.cursor/hooks.json (user), <project>/.cursor/hooks.json, or the enterprise
 path pushed by MDM (macOS /Library/Application Support/Cursor/hooks.json, Linux
@@ -85,6 +87,11 @@ _MAX_ARGS_TEXT = 20000
 # Events that expect a permission verdict ({"permission": allow|deny|ask}); the odd ones
 # out are beforeSubmitPrompt (uses {"continue": bool}) and afterFileEdit (no output).
 _PERMISSION_EVENTS = {"beforeShellExecution", "beforeMCPExecution", "beforeReadFile"}
+
+# The ones of those that may answer "ask". beforeReadFile takes allow|deny only, and Cursor
+# blocks the action on a response outside the hook's schema, so an ask there would be a
+# hard block, not a prompt.
+_ASK_EVENTS = {"beforeShellExecution", "beforeMCPExecution"}
 
 
 def _harvest_strings(obj, out: list[str]) -> None:
@@ -292,6 +299,26 @@ def block_output(event_name: str, verdict: dict) -> dict:
     return {"permission": "deny", "user_message": reason, "agent_message": reason}
 
 
+def should_ask(event_name: str, verdict: dict) -> bool:
+    """The org's ASK verdict for an event that can carry one. The server sets `ask` only
+    for an enforced actor in a tenant that opted in; callers check should_block first, so
+    a block is never softened into an ask."""
+    return event_name in _ASK_EVENTS and bool(verdict.get("ask"))
+
+
+def ask_output(verdict: dict) -> dict:
+    """Cursor's own approval prompt for a shell or MCP call, with the reason."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    msg = (f"Palivane flagged this call ({cats or 'policy'}) — "
+           f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'suspicious')}. "
+           f"Approve it only if you meant to run it.")
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        msg += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return {"permission": "ask", "user_message": msg}
+
+
 def allow_output(event_name: str) -> dict | None:
     """Explicit allow so monitor mode never leaves Cursor guessing. afterFileEdit takes
     no output."""
@@ -374,6 +401,9 @@ def main() -> int:
         verdict = _post(endpoint, payload, cfg)
         if should_block(verdict, cfg["enforce"]):
             print(json.dumps(block_output(name, verdict)))
+            return 0
+        if should_ask(name, verdict):
+            print(json.dumps(ask_output(verdict)))
             return 0
         out = allow_output(name)
         if out is not None:

@@ -116,6 +116,17 @@ only thing that sees it.
   for one user, a group glob (`*@pilot.acme.com`), or a single tool — pilot a team on
   enforcement while the rest of the org stays in monitor. Overrides ride the same
   verdict `enforce` field, so no device config changes.
+- **Ask (opt-in):** with *Ask before risky tool calls* on (console → Settings → Policy),
+  a tool call that scores above allow but below the block severity is not run silently:
+  the hook answers `permissionDecision: "ask"` and Claude Code shows its normal
+  permission prompt with Palivane's reason, so a false positive costs one keypress
+  instead of a block. It sits between allow and block, so it never softens a block, and
+  it only reaches actors in enforce (the server sets `ask` on the verdict, so the staged
+  rollout above covers it too). Prompts can't ask — `UserPromptSubmit` only blocks — and
+  in an unattended run (`claude -p`) nobody can answer, so Claude Code denies the call.
+  Tool-call scores are mostly 0 or 60+, so at the default block severity (`high`) the band
+  is narrow; set *MCP block severity* to `critical` to ask on `high` and block only
+  `critical`.
 
 Installed by `palivane-connect`, or manually in `~/.claude/settings.json` /
 `managed-settings.json` (MDM):
@@ -151,6 +162,11 @@ API** (Cursor 1.7+) to inspect from *inside* Cursor — one script dispatched on
 - **Enforce (`PALIVANE_ENFORCE=true`):** synchronous scan; blocks are returned as Cursor's
   `permission: deny` (or `continue: false` for a prompt), with the reason shown to the
   user and agent. `afterFileEdit` is always monitor (Cursor accepts no output there).
+- **Ask (opt-in):** the same *Ask before risky tool calls* setting. A shell or MCP call
+  in the warn band is answered `permission: ask`, so Cursor shows its own approval prompt
+  instead of running it silently. `beforeReadFile` never asks (Cursor takes allow/deny
+  there, and a response outside a hook's schema blocks the action), and neither does a
+  prompt.
 
 Register in `~/.cursor/hooks.json`, `<project>/.cursor/hooks.json`, or the enterprise path
 (MDM). The policy pack emits a ready-to-push `cursor-hooks.json`:
