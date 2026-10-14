@@ -17,12 +17,23 @@ window.addEventListener("message", async (e) => {
       verdict = await chrome.runtime.sendMessage({
         type: "scan", content: d.content, destination: d.destination,
       });
-    } catch (_) { verdict = { action: "allow" }; }
+    } catch (_) {
+      // The extension was updated or reloaded under this tab: its old content script can no
+      // longer reach it, so every message from here on goes out unchecked until the tab reloads.
+      verdict = { action: "allow", skipped: "reload this tab" };
+    }
+    if (verdict && verdict.skipped) noteSkipped(verdict.skipped);
     window.postMessage({ __palivane: true, kind: "verdict", id: d.id, verdict: verdict || { action: "allow" } }, "*");
   } else if (d.kind === "blocked") {
     showBlockModal(d.verdict);
   } else if (d.kind === "warn") {
     showWarnBanner(d.verdict);
+  } else if (d.kind === "skipped") {
+    noteSkipped(d.reason);
+  } else if (d.kind === "late") {
+    showLateNotice(d.verdict);
+  } else if (d.kind === "blind") {
+    try { chrome.runtime.sendMessage({ type: "blind", destination: d.destination }); } catch (_) { /* fail open */ }
   }
 });
 
@@ -95,6 +106,22 @@ function showBlockModal(verdict) {
       </ul>
     </div>` : "";
 
+  // Coaching: the org would rather the person send a cleaned version than be hard-stopped.
+  // The message is still held, since the original must not leave; this hands them the clean
+  // copy to send instead (or an approved tool, above).
+  const cleaned = verdict.coached && typeof verdict.redacted_content === "string" ? verdict.redacted_content : "";
+  const clean = cleaned ? `
+    <div style="margin-top:14px;padding:11px 13px;background:rgba(63,185,80,.08);
+        border:1px solid rgba(63,185,80,.35);border-radius:10px">
+      <div style="font-weight:700;color:#4ade80;font-size:13px">Cleaned version, sensitive values removed</div>
+      <pre id="palivane-clean" style="margin:8px 0 0;white-space:pre-wrap;word-break:break-word;
+          max-height:130px;overflow:auto;color:#c4ccdb;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace">${escapeHtml(cleaned)}</pre>
+      <button id="palivane-copy-clean" style="margin-top:8px;padding:7px 12px;border:none;
+          border-radius:8px;background:#4ade80;color:#04140b;font-weight:700;font-size:12.5px;cursor:pointer">
+        Copy cleaned message
+      </button>
+    </div>` : "";
+
   const wrap = document.createElement("div");
   wrap.id = "palivane-modal";
   wrap.style.cssText = [
@@ -109,12 +136,13 @@ function showBlockModal(verdict) {
         border:1px solid #2a3346;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.5);
         padding:22px 24px">
       <div style="display:flex;align-items:center;gap:10px;font-size:17px;font-weight:800">
-        <span style="color:#ff5d6c">🛡</span> Palivane blocked this message
+        <span style="color:#ff5d6c">🛡</span> Palivane ${cleaned ? "held" : "blocked"} this message
       </div>
       <p style="color:#c4ccdb;margin:12px 0 6px">
         It was <strong>not sent</strong> to the AI tool because it contained ${reasonText(verdict)}.
       </p>
       <ul style="margin:8px 0 4px;padding-left:18px;color:#e6e9f0">${rows}</ul>
+      ${clean}
       ${fix}
       ${alt}
       <div style="color:#8a93a6;font-size:12px;margin-top:12px">
@@ -154,6 +182,20 @@ function showBlockModal(verdict) {
   const btn = document.getElementById("palivane-modal-x");
   btn.addEventListener("click", close);
   btn.focus();
+
+  document.getElementById("palivane-copy-clean")?.addEventListener("click", async (e) => {
+    const b = e.currentTarget;
+    try {
+      await navigator.clipboard.writeText(cleaned);
+      b.textContent = "✓ Copied, paste it into the message box";
+    } catch (_) {
+      // Clipboard blocked on this page: select the text so Ctrl/Cmd+C finishes the job.
+      const pre = document.getElementById("palivane-clean");
+      const r = document.createRange(); r.selectNodeContents(pre);
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+      b.textContent = "Selected, press Ctrl/Cmd+C";
+    }
+  });
 
   // Justified proceed: record the reason, background stores the override token, the
   // user's next send of the same message goes through (as a warn, audit-logged).
@@ -227,6 +269,47 @@ function showWarnBanner(verdict) {
   el.prepend(close);
   document.documentElement.appendChild(el);
   setTimeout(() => el.remove(), 8000);
+}
+
+// --- Notices: a check that did not happen, or happened too late ---
+// Fail-open means a broken check looks exactly like a clean one. These make the difference
+// visible: the banner here, the toolbar badge and popup line via the background worker.
+function showNotice(html, color) {
+  const id = "palivane-notice";
+  document.getElementById(id)?.remove();
+  const el = document.createElement("div");
+  el.id = id;
+  el.style.cssText = [
+    "position:fixed", "top:0", "left:0", "right:0", "z-index:2147483647",
+    "padding:12px 18px", "font:14px/1.45 system-ui,sans-serif", "color:#fff",
+    "box-shadow:0 2px 14px rgba(0,0,0,.45)", `background:${color}`,
+  ].join(";");
+  el.innerHTML = html;
+  const close = document.createElement("span");
+  close.textContent = "✕";
+  close.style.cssText = "cursor:pointer;float:right;opacity:.85;font-weight:700;margin-left:12px";
+  close.onclick = () => el.remove();
+  el.prepend(close);
+  document.documentElement.appendChild(el);
+  setTimeout(() => el.remove(), 10000);
+}
+
+// One banner every five minutes, not one per message: a backend that is down for an hour
+// should not nag on every send. The popup and badge carry the persistent state.
+let lastSkipNotice = 0;
+function noteSkipped(reason) {
+  try { chrome.runtime.sendMessage({ type: "skipped", reason: String(reason || "") }); } catch (_) { /* fail open */ }
+  const now = Date.now();
+  if (now - lastSkipNotice < 5 * 60 * 1000) return;
+  lastSkipNotice = now;
+  showNotice(`<strong>Palivane could not check that message</strong> ` +
+             `<span style="opacity:.95">(${escapeHtml(reason || "unknown")}), so it was sent unchecked.</span>`, "#475569");
+}
+
+function showLateNotice(verdict) {
+  showNotice(`<strong>Palivane found ${reasonText(verdict)} in that message,</strong> ` +
+             `<span style="opacity:.95">but its answer arrived after the message was sent. ` +
+             `Tell your security team if this was real data.</span>`, "#c0283a");
 }
 
 function escapeHtml(s) {

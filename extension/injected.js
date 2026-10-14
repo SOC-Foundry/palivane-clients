@@ -3,7 +3,19 @@
 // Communicates with the content script (isolated world) via window.postMessage.
 (() => {
   const PENDING = new Map();
+  const LATE = new Set();   // scans we stopped waiting for; their answer may still arrive
   let SEQ = 0;
+
+  // How long a message waits for Palivane's answer before it goes out unchecked.
+  const SCAN_TIMEOUT_MS = 4000;
+  // A prompt is text. Past this size a body is an upload, not something to read into memory.
+  const MAX_BODY_BYTES = 1 << 20;
+  // The backend scores at most 200,000 characters a call and answers 422 above that, which used to
+  // read as "Palivane is unavailable" and let the whole message out. A longer message is scanned in
+  // windows (concurrently, so the 4s budget is per message, not per window), overlapping a little
+  // so a value that straddles a boundary is not cut in two. Past MAX_WINDOWS it is scanned up to
+  // there and the rest is reported as unreadable.
+  const WINDOW = 150000, OVERLAP = 500, MAX_WINDOWS = 8;
 
   // URL patterns that look like "the user is submitting a prompt".
   const SEND_PATTERNS = [
@@ -20,6 +32,12 @@
     /\/gql_POST\b/,                        // poe.com (GraphQL sendMessage)
   ];
   const looksLikeSend = (url) => SEND_PATTERNS.some((re) => re.test(url));
+
+  // A verdict that must stop the message. A coached verdict is a block the org softened into a
+  // warning on the assumption that the client would show the cleaned version and let the person
+  // send THAT; this client holds the message and shows it (content.js), it never lets the
+  // original out.
+  const stop = (v) => !!v && (v.action === "block" || v.coached === true);
 
   function extractPrompt(bodyText) {
     if (!bodyText) return "";
@@ -49,7 +67,7 @@
         if (v.length) return v.sort((a, b) => b.length - a.length)[0];
       }
     } catch (_) { /* not JSON, fall through */ }
-    return String(bodyText).slice(0, 8000);
+    return String(bodyText);
   }
 
   function scan(content, destination) {
@@ -57,11 +75,29 @@
       const id = ++SEQ;
       PENDING.set(id, resolve);
       window.postMessage({ __palivane: true, kind: "scan", id, content, destination }, "*");
-      // Fail OPEN: never break the user's tool if Palivane is slow/unreachable.
+      // Fail OPEN: never break the user's tool if Palivane is slow/unreachable. But not in
+      // silence: a message that went out unchecked is a gap the person has to be able to see.
       setTimeout(() => {
-        if (PENDING.has(id)) { PENDING.delete(id); resolve({ action: "allow" }); }
-      }, 4000);
+        if (PENDING.has(id)) {
+          PENDING.delete(id);
+          LATE.add(id);
+          window.postMessage({ __palivane: true, kind: "skipped", reason: "no answer in time" }, "*");
+          resolve({ action: "allow" });
+        }
+      }, SCAN_TIMEOUT_MS);
     });
+  }
+
+  async function scanAll(prompt, destination) {
+    if (prompt.length <= WINDOW) return scan(prompt, destination);
+    if (prompt.length > WINDOW * MAX_WINDOWS) { reportBlind(); prompt = prompt.slice(0, WINDOW * MAX_WINDOWS); }
+    const parts = [];
+    for (let i = 0; ; i += WINDOW - OVERLAP) {
+      parts.push(prompt.slice(i, i + WINDOW));
+      if (i + WINDOW >= prompt.length) break;
+    }
+    const verdicts = await Promise.all(parts.map((p) => scan(p, destination)));
+    return verdicts.find(stop) || verdicts.find((v) => v.action === "warn") || { action: "allow" };
   }
 
   window.addEventListener("message", (e) => {
@@ -69,8 +105,20 @@
     const d = e.data;
     if (!d || !d.__palivane || d.kind !== "verdict") return;
     const resolve = PENDING.get(d.id);
-    if (resolve) { PENDING.delete(d.id); resolve(d.verdict || { action: "allow" }); }
+    if (resolve) { PENDING.delete(d.id); resolve(d.verdict || { action: "allow" }); return; }
+    // The answer came after we stopped waiting and the message had already gone out. If it
+    // would have stopped that message, say so instead of leaving the person to assume it was
+    // checked.
+    if (LATE.delete(d.id) && stop(d.verdict)) {
+      window.postMessage({ __palivane: true, kind: "late", verdict: d.verdict }, "*");
+    }
   });
+
+  // A send we could see but not read (a stream, or something too big to be a prompt). Reported
+  // so the console can show the blind spot; the message itself still goes out.
+  function reportBlind() {
+    window.postMessage({ __palivane: true, kind: "blind", destination: location.origin }, "*");
+  }
 
   const DEBUG = false; // flip to true to log captured requests/verdicts to the page console (per-site tuning)
 
@@ -104,9 +152,9 @@
             if (prompt) {
               if (DEBUG) console.log("[Palivane] ws user-send captured chars=", prompt.length,
                 "snippet=", prompt.slice(0, 80));
-              scan(prompt, location.origin).then((verdict) => {
+              scanAll(prompt, location.origin).then((verdict) => {
                 if (DEBUG) console.log("[Palivane] ws verdict", verdict.action, verdict.severity, verdict.risk_score);
-                if (verdict.action === "block") {
+                if (stop(verdict)) {
                   // Drop the frame, the prompt never leaves, and show the block UI.
                   window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
                   return;
@@ -130,40 +178,62 @@
     }
   } catch (_) { /* leave WebSocket alone on failure */ }
 
-  // Coerce fetch/XHR bodies of any shape to scannable text. Gemini and some apps use
-  // URLSearchParams / FormData rather than a JSON string.
-  function bodyToText(body) {
-    if (body == null) return "";
-    if (typeof body === "string") return body;
+  // Coerce a fetch/XHR body of any shape to scannable text. Gemini and some apps use
+  // URLSearchParams / FormData rather than a JSON string, and a page is free to hand fetch a
+  // Blob or a typed array too. `unreadable` means there IS a body we cannot read (a stream, or
+  // one too big to be a prompt), so the caller can report it instead of skipping the scan.
+  async function readBody(body) {
+    if (body == null) return { text: "", unreadable: false };
+    if (typeof body === "string") return { text: body, unreadable: false };
     try {
-      if (body instanceof URLSearchParams) return decodeURIComponent(body.toString());
+      if (body instanceof URLSearchParams) {
+        const raw = body.toString();
+        try { return { text: decodeURIComponent(raw), unreadable: false }; }
+        catch (_) { return { text: raw, unreadable: false }; }
+      }
       if (typeof FormData !== "undefined" && body instanceof FormData) {
         const out = [];
-        for (const [k, v] of body.entries()) if (typeof v === "string") out.push(v);
-        return out.join("\n");
+        for (const [, v] of body.entries()) if (typeof v === "string") out.push(v);
+        return { text: out.join("\n"), unreadable: false };
+      }
+      if (typeof Blob !== "undefined" && body instanceof Blob) {
+        return body.size > MAX_BODY_BYTES ? { text: "", unreadable: true }
+                                          : { text: await body.text(), unreadable: false };
+      }
+      if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+        return body.byteLength > MAX_BODY_BYTES ? { text: "", unreadable: true }
+                                                : { text: new TextDecoder().decode(body), unreadable: false };
       }
     } catch (_) { /* fall through */ }
-    return "";
+    return { text: "", unreadable: true };
   }
 
   const origFetch = window.fetch;
   window.fetch = async function (input, init) {
     try {
-      const url = typeof input === "string" ? input : (input && input.url) || "";
-      const method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
-      const bodyText = bodyToText(init && init.body);
-      if (DEBUG && method === "POST") {
-        console.debug("[Palivane] fetch POST", url, "match=", looksLikeSend(url),
-          "bodyChars=", bodyText.length);
-      }
-      if (method === "POST" && looksLikeSend(url) && bodyText) {
-        const prompt = extractPrompt(bodyText);
+      const isReq = typeof Request !== "undefined" && input instanceof Request;
+      const url = typeof input === "string" ? input : (input && (input.url || input.href)) || "";
+      const method = ((init && init.method) || (isReq && input.method) || "GET").toUpperCase();
+      if (method === "POST" && looksLikeSend(url)) {
+        // fetch(url, {body}) or fetch(new Request(url, {body})): init.body wins when both exist.
+        // A Request's own body is read from a clone, so the page's real send is untouched.
+        let body;
+        try {
+          if (init && init.body != null) body = await readBody(init.body);
+          else if (isReq && !input.bodyUsed) body = { text: await input.clone().text(), unreadable: false };
+          else body = { text: "", unreadable: false };
+        } catch (_) { body = { text: "", unreadable: true }; }   // e.g. a locked stream: say so, do not skip in silence
+        if (DEBUG) {
+          console.debug("[Palivane] fetch POST", url, "bodyChars=", body.text.length, "unreadable=", body.unreadable);
+        }
+        if (body.unreadable) reportBlind();
+        const prompt = body.text ? extractPrompt(body.text) : "";
         if (DEBUG) console.log("[Palivane] captured", url, "promptChars=", (prompt || "").length,
           "snippet=", (prompt || "").slice(0, 80));
         if (prompt && prompt.trim()) {
-          const verdict = await scan(prompt, location.origin);
+          const verdict = await scanAll(prompt, location.origin);
           if (DEBUG) console.log("[Palivane] verdict", verdict.action, verdict.severity, verdict.risk_score);
-          if (verdict.action === "block") {
+          if (stop(verdict)) {
             window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
             return new Response(JSON.stringify({ error: "Blocked by Palivane: sensitive data detected." }),
               { status: 451, headers: { "content-type": "application/json" } });
@@ -191,34 +261,36 @@
   XMLHttpRequest.prototype.send = function (body) {
     try {
       const info = this.__palivane;
-      if (info && info.method === "POST" && looksLikeSend(info.url)) {
-        const bodyText = bodyToText(body);
-        if (DEBUG) console.debug("[Palivane] xhr POST", info.url, "match= true bodyChars=", bodyText.length);
-        const prompt = bodyText ? extractPrompt(bodyText) : "";
-        if (prompt && prompt.trim()) {
-          const xhr = this, args = arguments;
-          scan(prompt, location.origin).then((verdict) => {
-            if (DEBUG) console.log("[Palivane] xhr verdict", verdict.action, verdict.severity, verdict.risk_score);
-            if (verdict.action === "block") {
-              window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
-              // Don't send. Signal a network failure so the app's error path runs;
-              // the sensitive body never left the browser.
-              try {
-                Object.defineProperty(xhr, "readyState", { value: 4, configurable: true });
-                Object.defineProperty(xhr, "status", { value: 0, configurable: true });
-              } catch (_) { /* native props may be non-configurable; events still fire */ }
-              try { xhr.dispatchEvent(new Event("readystatechange")); } catch (_) {}
-              try { xhr.dispatchEvent(new ProgressEvent("error")); } catch (_) {}
-              try { xhr.dispatchEvent(new ProgressEvent("loadend")); } catch (_) {}
-              return;
-            }
-            if (verdict.action === "warn") {
-              window.postMessage({ __palivane: true, kind: "warn", verdict }, "*");
-            }
-            origSend.apply(xhr, args);   // allowed → send for real
-          });
-          return;   // defer the real send until the verdict resolves
-        }
+      if (info && info.method === "POST" && looksLikeSend(info.url) && body != null) {
+        const xhr = this, args = arguments;
+        // Reading a Blob is asynchronous, so the real send is deferred until we know whether
+        // there is a prompt in it (and, if so, what Palivane says about it).
+        readBody(body).then(async (b) => {
+          if (DEBUG) console.debug("[Palivane] xhr POST", info.url, "bodyChars=", b.text.length, "unreadable=", b.unreadable);
+          if (b.unreadable) reportBlind();
+          const prompt = b.text ? extractPrompt(b.text) : "";
+          if (!(prompt && prompt.trim())) { origSend.apply(xhr, args); return; }
+          const verdict = await scanAll(prompt, location.origin);
+          if (DEBUG) console.log("[Palivane] xhr verdict", verdict.action, verdict.severity, verdict.risk_score);
+          if (stop(verdict)) {
+            window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
+            // Don't send. Signal a network failure so the app's error path runs;
+            // the sensitive body never left the browser.
+            try {
+              Object.defineProperty(xhr, "readyState", { value: 4, configurable: true });
+              Object.defineProperty(xhr, "status", { value: 0, configurable: true });
+            } catch (_) { /* native props may be non-configurable; events still fire */ }
+            try { xhr.dispatchEvent(new Event("readystatechange")); } catch (_) {}
+            try { xhr.dispatchEvent(new ProgressEvent("error")); } catch (_) {}
+            try { xhr.dispatchEvent(new ProgressEvent("loadend")); } catch (_) {}
+            return;
+          }
+          if (verdict.action === "warn") {
+            window.postMessage({ __palivane: true, kind: "warn", verdict }, "*");
+          }
+          origSend.apply(xhr, args);   // allowed → send for real
+        }).catch(() => { try { origSend.apply(xhr, args); } catch (_) { /* fail open */ } });
+        return;   // defer the real send until the verdict resolves
       }
     } catch (_) { /* fail open */ }
     return origSend.apply(this, arguments);

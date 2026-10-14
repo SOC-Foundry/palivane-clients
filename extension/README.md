@@ -35,9 +35,34 @@ worker for a verdict (which calls Palivane), and:
   that files the request to the security team's audit log (`POST /api/exception-request`).
   This turns a hard wall into a redirect, which is what keeps users from finding a
   workaround.
+- **coached** (the org turned on Coaching mode) → the server softens a secret/PII block
+  into a warning on the assumption that the client will show the cleaned version. The
+  original message is still **held, never sent**; the modal shows the cleaned copy
+  (sensitive values replaced) with a **Copy cleaned message** button, plus the approved
+  tools. In monitor mode (Enforce off in Options) it is the plain amber warning instead.
+
+It reads the body of a send however the page builds it: a string, `URLSearchParams`,
+`FormData` text fields, a `Blob`, an `ArrayBuffer` or typed array, or a `Request` object
+(read from a clone, so the page's own send is untouched), over `fetch` and `XMLHttpRequest`.
+A body it cannot read (a stream, or anything over 1 MB) is reported as a parse-miss on the
+device's sensor in the console instead of being skipped in silence. The backend scores at most
+200,000 characters a call, so a longer message is scanned in overlapping 150,000-character
+windows (up to 1.2 million characters; the rest is reported the same way), and a send that is
+not JSON (Gemini's form-encoded one) is scanned whole rather than cut to its first 8,000
+characters.
 
 It **fails open**: if the backend is slow, unreachable, or unconfigured, prompts go
-through untouched, the extension never breaks the user's tool.
+through, the extension never breaks the user's tool. But a check that did not happen no
+longer looks like a clean one:
+
+- A message sent **unchecked** (not signed in, capture key rejected, server error, no
+  answer within 4 seconds, or the extension was updated under an open tab) shows a grey
+  banner (at most one per five minutes), puts a **!** on the toolbar icon, and the popup
+  says why. The next successful check clears the mark.
+- If the answer arrives **after** the 4 seconds and would have stopped the message, a red
+  banner says so, so nobody assumes it was checked.
+- After an extension update or reload, tabs that were already open lose their link to the
+  extension until they are reloaded; the banner says "reload this tab".
 
 ## Backend setup
 
