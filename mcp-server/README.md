@@ -44,7 +44,7 @@ Read-only, deliberately:
 | Tool | Does |
 |------|------|
 | `list_findings` | Findings for your tenant, filterable by severity, status, surface, actor |
-| `get_finding` | Full detail for one finding — signals, evidence, actor, owner response |
+| `get_finding` | Full detail for one finding — signals, evidence, actor, owner response, and, when the org keeps evidence context, a masked excerpt around each match |
 | `ai_tool_inventory` | Shadow-AI inventory: tools in use, sanctioned or not, and the exposure |
 | `list_connectors` | SaaS connectors and their sync status |
 | `gateway_usage` | LLM-gateway usage against the limit |

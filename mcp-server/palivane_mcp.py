@@ -156,7 +156,9 @@ def list_findings(severity: str = "", status: str = "", surface: str = "",
 
 @mcp.tool()
 def get_finding(finding_id: int) -> dict:
-    """Full detail for one finding: signals, evidence, actor, surface, owner response."""
+    """Full detail for one finding: signals, evidence, actor, surface, owner response. When the
+    org keeps evidence context, each signal also carries a short masked excerpt (`context`) of
+    the words, command or path around the match; names and free text in it are not masked."""
     return _api.request("GET", f"/api/findings/{finding_id}")
 
 
