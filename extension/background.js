@@ -100,7 +100,8 @@ async function recordVerdict(verdict) {
   // Keep a session block counter + the last verdict for the popup, and reflect blocks
   // on the toolbar badge.
   const { blockCount = 0 } = await chrome.storage.local.get({ blockCount: 0 });
-  const next = verdict.action === "block" ? blockCount + 1 : blockCount;
+  // A coached verdict is held like a block (injected.js), so it counts as one.
+  const next = verdict.action === "block" || verdict.coached ? blockCount + 1 : blockCount;
   await chrome.storage.local.set({
     blockCount: next,
     lastVerdict: { ...verdict, at: Date.now() },
@@ -109,8 +110,26 @@ async function recordVerdict(verdict) {
     if (next > 0) {
       await chrome.action.setBadgeText({ text: String(next) });
       await chrome.action.setBadgeBackgroundColor({ color: "#c0283a" });
+    } else {
+      await chrome.action.setBadgeText({ text: "" });   // a good check clears an "unchecked" mark
     }
   } catch (_) { /* action API may be unavailable in some contexts */ }
+}
+
+// A message went out without being checked (not signed in, key rejected, server down or slow,
+// a body we could not read). Fail-open is the stated stance, but it must not look the same as a
+// clean check: the popup says so and the badge carries a "!" until the next good verdict.
+async function recordSkip(label) {
+  try {
+    await chrome.storage.local.set({ lastSkip: { label: String(label || "unknown"), at: Date.now() } });
+    await chrome.action.setBadgeText({ text: "!" });
+    await chrome.action.setBadgeBackgroundColor({ color: "#b8791f" });
+  } catch (_) { /* action API may be unavailable in some contexts */ }
+}
+
+function skipped(label, reason) {
+  recordSkip(label);
+  return { action: "allow", reason, skipped: label };
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -176,12 +195,40 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg && msg.type === "skipped") {
+    recordSkip(msg.reason);       // injected.js gave up waiting; nothing to answer
+    return;
+  }
+  if (msg && msg.type === "blind") {
+    (async () => {
+      try {
+        // A send we saw but could not read. Tell the console once per site per ten minutes
+        // (parse_miss: no content, it only moves the sensor's drift counter).
+        const origin = String(msg.destination || "");
+        const k = "blindAt:" + origin;
+        const seen = (await chrome.storage.session.get({ [k]: 0 }))[k];
+        if (Date.now() - seen < 10 * 60 * 1000) return;
+        await chrome.storage.session.set({ [k]: Date.now() });
+        await recordSkip("could not read a message on " + origin.replace(/^https?:\/\//, ""));
+        const c = await config();
+        const key = await getIngestKey(c);
+        if (!key) return;
+        await fetch(c.backendUrl.replace(/\/$/, "") + "/api/ingest/ai-usage", {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Palivane-Token": key },
+          body: JSON.stringify({ content: "[palivane parse-miss]", destination: origin,
+                                 user: c.user, parse_miss: true }),
+        });
+      } catch (_) { /* fail open */ }
+    })();
+    return;
+  }
   if (!msg || msg.type !== "scan") return;
   (async () => {
     try {
       const c = await config();
       let key = await getIngestKey(c);
-      if (!key) { sendResponse({ action: "allow", reason: "unconfigured" }); return; }
+      if (!key) { sendResponse(skipped("not signed in", "unconfigured")); return; }
       // A recorded justification grants exactly one send: attach the token, and clear it
       // when the backend honored it (verdict.overridden) so it cannot linger.
       const { overrideGrant } = await chrome.storage.session.get({ overrideGrant: null });
@@ -199,12 +246,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         key = await getIngestKey(c, true);
         if (key) res = await call(key);
       }
-      if (!res.ok) { sendResponse({ action: "allow", reason: "backend " + res.status }); return; }
+      if (!res.ok) {
+        const why = res.status === 401 || res.status === 403 ? "capture key rejected, sign in again"
+                                                              : "server error " + res.status;
+        sendResponse(skipped(why, "backend " + res.status));
+        return;
+      }
       const verdict = await res.json();
       // In monitor mode (enforce off) a "block" is normally downgraded to "warn", but a
       // CONFIRMED secret/PII leak (force_block) is hard-blocked regardless: block the
       // certain, monitor the fuzzy.
       if (!c.enforce && verdict.action === "block" && !verdict.force_block) verdict.action = "warn";
+      // Monitor mode never holds a message, and a coached verdict is held: it falls back to the
+      // plain warning the org's softer action already was.
+      if (!c.enforce && verdict.coached) verdict.coached = false;
       if (verdict.overridden) await chrome.storage.session.remove("overrideGrant");  // consumed
       if (verdict.action === "block" && verdict.finding_id && verdict.self_justify) {
         await chrome.storage.session.set({
@@ -213,7 +268,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       await recordVerdict(verdict);
       sendResponse(verdict);
     } catch (e) {
-      sendResponse({ action: "allow", reason: String(e) }); // fail open
+      sendResponse(skipped("could not reach Palivane", String(e))); // fail open
     }
   })();
   return true; // keep the message channel open for the async sendResponse

@@ -10,6 +10,16 @@ function render(state) {
   $("blockCount").textContent = state.blockCount || 0;
   const v = state.lastVerdict;
   const el = $("verdict");
+  // A message that went out unchecked is newer news than the last verdict: say so, because a
+  // failed check otherwise looks exactly like a clean one.
+  const sk = state.lastSkip;
+  const skipEl = $("skip");
+  if (sk && (!v || sk.at > (v.at || 0))) {
+    skipEl.hidden = false;
+    skipEl.textContent = `Last message was sent unchecked: ${sk.label} (${new Date(sk.at).toLocaleTimeString()})`;
+  } else {
+    skipEl.hidden = true;
+  }
   if (!v) {
     el.className = "verdict muted";
     el.textContent = "No prompts inspected yet.";
@@ -19,7 +29,7 @@ function render(state) {
   const when = v.at ? esc(new Date(v.at).toLocaleTimeString()) : "";
   el.className = "verdict";
   el.innerHTML =
-    `<div>last verdict, <span class="sev sev-${esc(v.severity)}">${esc(v.action)} · ${esc(v.severity)}</span> ` +
+    `<div>last verdict, <span class="sev sev-${esc(v.severity)}">${esc(v.coached ? "held (coached)" : v.action)} · ${esc(v.severity)}</span> ` +
     `(risk ${esc(v.risk_score ?? "?")})</div>` +
     `<div class="sigs">${sigs}</div>` +
     `<div class="muted" style="margin-top:4px;font-size:11px;">${when}</div>`;
@@ -57,13 +67,13 @@ async function loadConn() {
 }
 
 async function load() {
-  render(await chrome.storage.local.get({ blockCount: 0, lastVerdict: null }));
+  render(await chrome.storage.local.get({ blockCount: 0, lastVerdict: null, lastSkip: null }));
   loadConn();
 }
 
 document.addEventListener("DOMContentLoaded", load);
 $("reset").addEventListener("click", async () => {
-  await chrome.storage.local.set({ blockCount: 0 });
+  await chrome.storage.local.set({ blockCount: 0, lastSkip: null });
   try { await chrome.action.setBadgeText({ text: "" }); } catch (_) {}
   load();
 });
