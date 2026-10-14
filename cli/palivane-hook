@@ -81,7 +81,12 @@ def agent_ua(event: dict | None = None) -> str:
     return f"palivane-hook/{VERSION} (claude-code{'/' + ver if ver else ''})"
 
 
-SKIP_TOOLS = {"TodoWrite", "Task", "ExitPlanMode", "AskUserQuestion"}
+# The assistant's own to-do list, questions and plan mode: they touch nothing, and their text
+# quotes paths and commands the way any plan does ("check perms on ~/.ssh/"), which scored
+# critical/block. Mirrors BOOKKEEPING_BUILTINS in the backend's mcp_guard, which also ignores
+# them for older hooks and for the proxy path.
+SKIP_TOOLS = {"TodoWrite", "Task", "ExitPlanMode", "EnterPlanMode", "AskUserQuestion",
+              "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop"}
 
 _MAX_ARGS_TEXT = 20000
 

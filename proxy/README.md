@@ -28,7 +28,7 @@ the AI list by default; add your MCP servers via `PALIVANE_PROXY_INTERCEPT_EXTRA
 normalized activity to `POST /api/ingest/mcp` on the **`mcp`** surface. A block verdict
 returns a **JSON-RPC error** so the agent surfaces it cleanly. It flags:
 
-- **sensitive resource access** (tool/resource touching `.env`, private keys, cloud creds…)
+- **sensitive resource access** (tool/resource touching `.env`, private keys, cloud creds… judged by the path it was pointed at, not the text it returned; `.env.example` is a template, not a secret)
 - **dangerous commands** (`curl … | sh`, `rm -rf /`, reverse shells…)
 - **tool poisoning** (injected instructions in a server's advertised tool descriptions —
   caught in the `tools/list` response *and* in the tool defs the agent sends to the LLM API)
