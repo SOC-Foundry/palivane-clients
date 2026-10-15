@@ -31,7 +31,26 @@
     /\/app-chat\/conversations\b/,         // grok.com
     /\/gql_POST\b/,                        // poe.com (GraphQL sendMessage)
   ];
-  const looksLikeSend = (url) => SEND_PATTERNS.some((re) => re.test(url));
+  // The page's own analytics and error reporting ride the same patterns (a RUM beacon posted to a
+  // `/completion` route, say) and are not something the person typed. A beacon is not a prompt, so
+  // it is left alone: by host (the usual vendors) and, for a first-party proxy of one, by shape.
+  const TELEMETRY_HOSTS = /(^|[.-])datadoghq\.(com|eu)$|(^|\.)(datadoghq-browser-agent\.com|sentry\.io|segment\.(io|com)|statsig(api)?\.com|featuregates\.org|amplitude\.com|mixpanel\.com|posthog\.com|google-analytics\.com|doubleclick\.net|clarity\.ms|hotjar\.(com|io)|fullstory\.com|logrocket\.(com|io)|cloudflareinsights\.com|launchdarkly\.com|intercom\.io|bugsnag\.com)$/i;
+  function parseUrl(url) {
+    try { return new URL(url, location.href); } catch (_) { return null; }
+  }
+  // Only the path says "this is a send"; a query string such as `?ref=/completion` does not.
+  const looksLikeSend = (url) => {
+    const u = parseUrl(url);
+    if (u && TELEMETRY_HOSTS.test(u.hostname)) return false;
+    const path = u ? u.pathname : String(url);
+    return SEND_PATTERNS.some((re) => re.test(path));
+  };
+  // Datadog RUM events carry a `_dd` object; no chat request does.
+  const isTelemetryBody = (bodyText) => {
+    if (typeof bodyText !== "string" || bodyText.charCodeAt(0) !== 123 /* { */) return false;
+    try { const j = JSON.parse(bodyText); return !!j && typeof j === "object" && "_dd" in j; }
+    catch (_) { return false; }
+  };
 
   // A verdict that must stop the message. A coached verdict is a block the org softened into a
   // warning on the assumption that the client would show the cleaned version and let the person
@@ -40,7 +59,7 @@
   const stop = (v) => !!v && (v.action === "block" || v.coached === true);
 
   function extractPrompt(bodyText) {
-    if (!bodyText) return "";
+    if (!bodyText || isTelemetryBody(bodyText)) return "";
     try {
       const j = JSON.parse(bodyText);
       if (Array.isArray(j.messages)) {            // OpenAI/ChatGPT shape
