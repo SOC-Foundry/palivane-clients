@@ -237,6 +237,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         method: "POST",
         headers: { "content-type": "application/json", "X-Palivane-Token": k },
         body: JSON.stringify({ content: msg.content, destination: msg.destination, user: c.user,
+                               ...(msg.endpoint ? { endpoint: String(msg.endpoint).slice(0, 200) } : {}),
                                ...(grant ? { override_token: grant } : {}) }),
       });
       let res = await call(key);

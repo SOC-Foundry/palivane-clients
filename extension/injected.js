@@ -45,6 +45,13 @@
     const path = u ? u.pathname : String(url);
     return SEND_PATTERNS.some((re) => re.test(path));
   };
+  // Where a captured message was headed: host and path of the request, never the query string
+  // (it can carry tokens). It rides with the scan so a finding can say which request it came from,
+  // which is what tells a real send from the page's own traffic when a check fires on something odd.
+  const endpointOf = (url) => {
+    const u = parseUrl(url);
+    return u ? (u.host + u.pathname).slice(0, 200) : "";
+  };
   // Datadog RUM events carry a `_dd` object; no chat request does.
   const isTelemetryBody = (bodyText) => {
     if (typeof bodyText !== "string" || bodyText.charCodeAt(0) !== 123 /* { */) return false;
@@ -89,11 +96,11 @@
     return String(bodyText);
   }
 
-  function scan(content, destination) {
+  function scan(content, destination, endpoint) {
     return new Promise((resolve) => {
       const id = ++SEQ;
       PENDING.set(id, resolve);
-      window.postMessage({ __palivane: true, kind: "scan", id, content, destination }, "*");
+      window.postMessage({ __palivane: true, kind: "scan", id, content, destination, endpoint }, "*");
       // Fail OPEN: never break the user's tool if Palivane is slow/unreachable. But not in
       // silence: a message that went out unchecked is a gap the person has to be able to see.
       setTimeout(() => {
@@ -107,15 +114,15 @@
     });
   }
 
-  async function scanAll(prompt, destination) {
-    if (prompt.length <= WINDOW) return scan(prompt, destination);
+  async function scanAll(prompt, destination, endpoint) {
+    if (prompt.length <= WINDOW) return scan(prompt, destination, endpoint);
     if (prompt.length > WINDOW * MAX_WINDOWS) { reportBlind(); prompt = prompt.slice(0, WINDOW * MAX_WINDOWS); }
     const parts = [];
     for (let i = 0; ; i += WINDOW - OVERLAP) {
       parts.push(prompt.slice(i, i + WINDOW));
       if (i + WINDOW >= prompt.length) break;
     }
-    const verdicts = await Promise.all(parts.map((p) => scan(p, destination)));
+    const verdicts = await Promise.all(parts.map((p) => scan(p, destination, endpoint)));
     return verdicts.find(stop) || verdicts.find((v) => v.action === "warn") || { action: "allow" };
   }
 
@@ -171,7 +178,7 @@
             if (prompt) {
               if (DEBUG) console.log("[Palivane] ws user-send captured chars=", prompt.length,
                 "snippet=", prompt.slice(0, 80));
-              scanAll(prompt, location.origin).then((verdict) => {
+              scanAll(prompt, location.origin, endpointOf(String(url))).then((verdict) => {
                 if (DEBUG) console.log("[Palivane] ws verdict", verdict.action, verdict.severity, verdict.risk_score);
                 if (stop(verdict)) {
                   // Drop the frame, the prompt never leaves, and show the block UI.
@@ -250,7 +257,7 @@
         if (DEBUG) console.log("[Palivane] captured", url, "promptChars=", (prompt || "").length,
           "snippet=", (prompt || "").slice(0, 80));
         if (prompt && prompt.trim()) {
-          const verdict = await scanAll(prompt, location.origin);
+          const verdict = await scanAll(prompt, location.origin, endpointOf(url));
           if (DEBUG) console.log("[Palivane] verdict", verdict.action, verdict.severity, verdict.risk_score);
           if (stop(verdict)) {
             window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
@@ -289,7 +296,7 @@
           if (b.unreadable) reportBlind();
           const prompt = b.text ? extractPrompt(b.text) : "";
           if (!(prompt && prompt.trim())) { origSend.apply(xhr, args); return; }
-          const verdict = await scanAll(prompt, location.origin);
+          const verdict = await scanAll(prompt, location.origin, endpointOf(info.url));
           if (DEBUG) console.log("[Palivane] xhr verdict", verdict.action, verdict.severity, verdict.risk_score);
           if (stop(verdict)) {
             window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
