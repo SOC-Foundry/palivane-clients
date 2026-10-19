@@ -15,7 +15,7 @@ window.addEventListener("message", async (e) => {
     let verdict = { action: "allow" };
     try {
       verdict = await chrome.runtime.sendMessage({
-        type: "scan", content: d.content, destination: d.destination,
+        type: "scan", content: d.content, destination: d.destination, endpoint: d.endpoint,
       });
     } catch (_) {
       // The extension was updated or reloaded under this tab: its old content script can no
