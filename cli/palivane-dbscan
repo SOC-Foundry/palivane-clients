@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""palivane-dbscan — find credentials stored in a database, and columns that keep them in clear.
+
+A hosted service that stores its customers' provider keys, GitHub tokens or webhook URLs in a table
+is one database compromise away from a rotation event for every one of them. This scanner reads a
+sample of each text column under a read-only role, finds credentials in it LOCALLY (palivane_detect,
+shared with palivane-secrets and palivane-s3-scan), and also flags columns named like a credential
+(api_key, secret, token, password...) whose values are neither a recognizable ciphertext nor a
+password hash, i.e. that are stored in clear.
+
+Privacy by design, the same contract as the other at-rest scanners: detection runs where the data
+is, and only METADATA leaves: the table and column, the credential type, a masked preview
+(`ghp_••••4f2a`) and how many sampled values matched. Row contents and the raw secret never leave
+the database host. Reports to POST /api/scan/secrets as `credential_at_rest` findings.
+
+    palivane-dbscan --dsn-env DATABASE_URL            # Postgres, connection string from the environment
+    palivane-dbscan --sqlite ./app.db                 # a SQLite file
+    palivane-dbscan --dsn-env DATABASE_URL --dry-run  # print what would be reported; send nothing
+    palivane-dbscan --dsn-env DATABASE_URL --exclude-table 'alembic*' --exclude-table 'audit.*'
+
+Safety: the session is read-only with a statement timeout, only text/json columns are read, each
+table is capped at --sample rows (a TABLESAMPLE on big Postgres tables so the sample is not just
+the oldest rows), and --max-tables bounds the run. The default scan SAMPLES, so one bad row in a big
+log table can be missed (a test with a single planted token among 120,000 rows missed it at 2000 rows
+and found it at --sample 200000, 240,000 values in about a second). Raise --sample for a thorough
+pass, and read "finding nothing" as "nothing in the sample": the summary says how many values it saw.
+
+Postgres needs psycopg (v3) or psycopg2, imported lazily so the tool loads without either. The
+connection string is read from the environment (--dsn-env), never a flag, so a password does not
+land in shell history or the process list. Palivane auth is PALIVANE_URL + PALIVANE_TOKEN (an ak_…
+key) from the environment.
+
+Exit codes: 0 = scan completed (findings or not), 2 = findings and --fail-on-findings, 1 = could not
+run. On a backend error it fails OPEN unless --fail-closed is given.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import math
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import urllib.request
+from collections import Counter
+
+BATCH = 200
+PLAINTEXT_LABEL = "Plaintext credential column"
+
+
+def _load_detect():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "palivane_detect.py")
+    if not os.path.exists(path):
+        base = (os.environ.get("PALIVANE_URL") or "").rstrip("/")
+        if not base:
+            sys.exit("palivane_detect.py not found next to this script and PALIVANE_URL "
+                     "is unset, so it cannot be fetched. Download it from "
+                     "<your-palivane-url>/cli/palivane_detect.py into the same directory.")
+        try:
+            with urllib.request.urlopen(base + "/cli/palivane_detect.py", timeout=20) as r:
+                body = r.read()
+            path = os.path.join(tempfile.gettempdir(), "palivane_detect.py")
+            with open(path, "wb") as fh:
+                fh.write(body)
+        except Exception as e:                                    # noqa: BLE001
+            sys.exit(f"could not fetch palivane_detect.py from {base}: {e}")
+    spec = importlib.util.spec_from_file_location("palivane_detect", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+detect = _load_detect()
+
+# --- what looks like a credential column, and what a safely stored one looks like ----------------
+
+# Column names that hold a credential. The suffixes that follow are NOT credentials: a token's
+# expiry, count, type or hash is metadata about one, and a *_hash column is the safe way to keep it.
+CRED_COL = re.compile(
+    r"(api[_-]?key|secret|token|credential|passw(or)?d|passwd|private[_-]?key|access[_-]?key|"
+    r"auth[_-]?key|bearer|webhook[_-]?url|client[_-]?secret)", re.IGNORECASE)
+NOT_CRED_COL = re.compile(
+    r"(_hash|_digest|_hmac|_salt|_expires?|_expiry|_exp|_at|_on|_count|_type|_kind|_version|_id|_ids|_len|"
+    r"_length|_prefix|_last4|_masked|_set|_enabled|_ttl|_status|_name|_label|_scope|_scopes|_url_set)$|"
+    r"^(has_|is_|num_|n_)", re.IGNORECASE)
+
+# Shapes of a value that is stored safely: our own enc: envelope, Fernet, bcrypt/argon2/pbkdf2/scrypt
+# password hashes, an AWS KMS blob, Vault transit, jasypt, a PEM ENCRYPTED block, and an envelope-
+# encryption JSON document. A bare hex digest of a hash length is a hash too.
+_SAFE = [
+    re.compile(r"^enc:v\d+:"), re.compile(r"^gAAAA[A-Za-z0-9_\-=]{20,}$"),
+    re.compile(r"^\$(2[abxy]|argon2(id|i|d)?|pbkdf2[\w-]*|scrypt|[156]|sha\d+)\$"),
+    re.compile(r"^AQI[A-Za-z0-9+/=]{40,}$"), re.compile(r"^vault:v\d+:"), re.compile(r"^ENC\(.+\)$"),
+    re.compile(r"-----BEGIN ENCRYPTED"), re.compile(r"^pbkdf2_sha\d+\$"),
+    re.compile(r'^\s*\{.*"(ciphertext|encrypted_?data|iv|nonce|kms_?key)".*\}\s*$', re.DOTALL),
+    re.compile(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$|^[0-9a-fA-F]{128}$"),
+]
+_SYSTEM_SCHEMAS = {"pg_catalog", "information_schema", "sqlite_master"}
+
+
+def _entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    n = len(s)
+    return -sum(c / n * math.log2(c / n) for c in Counter(s).values())
+
+
+def classify_stored(value: str) -> str:
+    """'empty', 'safe' (recognizable ciphertext or hash), 'cleartext' (credential-looking, in the
+    clear) or 'other' (short, sentence-like or low-entropy: not worth a finding)."""
+    v = (value or "").strip()
+    if not v:
+        return "empty"
+    if any(rx.search(v) for rx in _SAFE):
+        return "safe"
+    if v.lower() in ("null", "none", "n/a", "changeme", "todo", "xxx") or len(v) < 16 or any(c.isspace() for c in v):
+        return "other"
+    if v.startswith(("http://", "https://")) and "?" not in v and len(v.split("/")) < 6:
+        return "other"                      # a plain URL with no token in it
+    return "cleartext" if _entropy(v) >= 3.2 else "other"
+
+
+def is_credential_column(name: str) -> bool:
+    return bool(CRED_COL.search(name)) and not NOT_CRED_COL.search(name)
+
+
+# --- the databases ------------------------------------------------------------------------------
+
+def _q(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
+class SqliteDB:
+    engine = "sqlite"
+
+    def __init__(self, path: str):
+        self.name = os.path.basename(path)
+        self.host = "localhost"
+        self.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+    def columns(self):
+        """[(schema, table, [text-like column names])]"""
+        out = []
+        for (t,) in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"):
+            cols = [r[1] for r in self.conn.execute(f"PRAGMA table_info({_q(t)})")
+                    if not r[2] or re.search(r"CHAR|CLOB|TEXT|JSON", r[2], re.IGNORECASE)]
+            if cols:
+                out.append(("main", t, cols))
+        return out
+
+    def sample(self, schema, table, cols, n):
+        cur = self.conn.execute(f"SELECT {', '.join(_q(c) for c in cols)} FROM {_q(table)} LIMIT {int(n)}")
+        yield from cur
+
+    def close(self):
+        self.conn.close()
+
+
+class PostgresDB:
+    engine = "postgres"
+    _TEXT = ("text", "character varying", "character", "json", "jsonb", "name")
+
+    def __init__(self, dsn: str):
+        try:
+            import psycopg                                        # v3
+            self.conn = psycopg.connect(dsn, autocommit=False)
+            self.conn.read_only = True
+        except ImportError:
+            try:
+                import psycopg2                                   # v2
+            except ImportError:
+                sys.exit("palivane-dbscan needs psycopg or psycopg2 for Postgres: pip install 'psycopg[binary]'")
+            self.conn = psycopg2.connect(dsn)
+            self.conn.set_session(readonly=True, autocommit=False)
+        cur = self.conn.cursor()
+        cur.execute("SET statement_timeout = '20s'")
+        cur.execute("SELECT current_database(), coalesce(inet_server_addr()::text, 'local')")
+        self.name, self.host = cur.fetchone()
+
+    def columns(self):
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name "
+            "FROM information_schema.columns c "
+            "JOIN information_schema.tables t USING (table_schema, table_name) "
+            "WHERE t.table_type = 'BASE TABLE' AND c.table_schema NOT IN ('pg_catalog', 'information_schema') "
+            "AND c.table_schema NOT LIKE 'pg\\_toast%' ORDER BY 1, 2, c.ordinal_position")
+        by: dict = {}
+        for schema, table, col, dtype, udt in cur.fetchall():
+            if dtype in self._TEXT or udt == "citext":
+                by.setdefault((schema, table), []).append(col)
+        return [(s, t, cols) for (s, t), cols in by.items()]
+
+    def _estimate(self, schema, table) -> int:
+        cur = self.conn.cursor()
+        cur.execute("SELECT c.reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = %s AND c.relname = %s", (schema, table))
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] and row[0] > 0 else 0
+
+    def sample(self, schema, table, cols, n):
+        est = self._estimate(schema, table)
+        pct = min(100.0, max(0.01, 200.0 * n / est)) if est > n * 4 else 0
+        sql = f"SELECT {', '.join(_q(c) for c in cols)} FROM {_q(schema)}.{_q(table)}"
+        if pct:
+            sql += f" TABLESAMPLE SYSTEM ({pct:.4f})"
+        cur = self.conn.cursor()
+        try:
+            cur.execute(sql + f" LIMIT {int(n)}")
+        except Exception:                                         # noqa: BLE001  e.g. a partitioned parent
+            self.conn.rollback()
+            cur = self.conn.cursor()
+            cur.execute(f"SELECT {', '.join(_q(c) for c in cols)} FROM {_q(schema)}.{_q(table)} LIMIT {int(n)}")
+        yield from cur
+
+    def close(self):
+        try:
+            self.conn.rollback()
+        finally:
+            self.conn.close()
+
+
+# --- the scan -----------------------------------------------------------------------------------
+
+def _text(value) -> str | None:
+    if value is None or isinstance(value, (bytes, bytearray, memoryview)):
+        return None
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value)
+    return str(value)[:20000]
+
+
+def _wanted(schema: str, table: str, include: list[str], exclude: list[str]) -> bool:
+    names = (f"{schema}.{table}", table)
+    hit = lambda pats: any(fnmatch.fnmatch(n, p) for n in names for p in pats)    # noqa: E731
+    return (not include or hit(include)) and not hit(exclude)
+
+
+def scan(db, *, sample: int = 2000, include=(), exclude=(), max_tables: int = 500) -> dict:
+    """{'findings': [...], 'tables': n, 'values': n, 'errors': [...]}. A finding names a column and what
+    was found in it; it never contains a value, only a masked example."""
+    include, exclude = list(include), list(exclude)
+    findings, errors = [], []
+    tables = values = 0
+    for schema, table, cols in db.columns():
+        if schema in _SYSTEM_SCHEMAS or not _wanted(schema, table, include, exclude):
+            continue
+        if tables >= max_tables:
+            errors.append(f"stopped at --max-tables {max_tables}")
+            break
+        tables += 1
+        agg = {c: {"n": 0, "labels": {}, "clear": 0, "clear_mask": ""} for c in cols}
+        try:
+            for row in db.sample(schema, table, cols, sample):
+                for col, raw in zip(cols, row):
+                    text = _text(raw)
+                    if text is None or not text.strip():
+                        continue
+                    a = agg[col]
+                    a["n"] += 1
+                    values += 1
+                    hits = detect.scan_text(text)
+                    for label, _line, masked in hits:
+                        slot = a["labels"].setdefault(label, {"count": 0, "mask": masked})
+                        slot["count"] += 1
+                    if not hits and is_credential_column(col) and classify_stored(text) == "cleartext":
+                        a["clear"] += 1
+                        a["clear_mask"] = a["clear_mask"] or detect.mask(text.strip())
+        except Exception as e:                                    # noqa: BLE001  one table must not stop the scan
+            errors.append(f"{schema}.{table}: {str(e)[:100]}")
+            try:
+                db.conn.rollback()
+            except Exception:                                     # noqa: BLE001
+                pass
+            continue
+        for col, a in agg.items():
+            ref = f"{schema}.{table}.{col}"
+            for label, slot in a["labels"].items():
+                findings.append({"column": ref, "label": label, "count": slot["count"],
+                                 "sampled": a["n"], "masked": slot["mask"]})
+            if a["clear"] and a["clear"] / max(a["n"], 1) >= 0.2:
+                findings.append({"column": ref, "label": PLAINTEXT_LABEL, "count": a["clear"],
+                                 "sampled": a["n"], "masked": a["clear_mask"]})
+    return {"findings": findings, "tables": tables, "values": values, "errors": errors}
+
+
+def to_items(db, findings: list[dict]) -> list[dict]:
+    """The findings as /api/scan/secrets items. `masked` is the example alone (no counts), because the
+    server folds a repeat on what the finding says, and a count that changes every scan would open a
+    new finding every time."""
+    return [{"path": f"db://{db.name}/{f['column']}", "secret_types": [f["label"]], "masked": f["masked"],
+             "line": 0, "world_readable": False, "verified": False, "source": "dbscan", "count": f["count"]}
+            for f in findings]
+
+
+# --- reporting ----------------------------------------------------------------------------------
+
+def read_config(url_flag: str) -> dict:
+    url = (url_flag or os.getenv("PALIVANE_URL", "")).rstrip("/")
+    return {"url": url, "token": os.getenv("PALIVANE_TOKEN", "")}
+
+
+def post_batch(cfg: dict, items: list[dict], host: str, record: bool, timeout: float = 30.0) -> dict:
+    payload = json.dumps({"items": items, "host": host, "record": record}).encode()
+    req = urllib.request.Request(
+        cfg["url"] + "/api/scan/secrets", data=payload, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "palivane-dbscan/1.0",
+                 "X-Palivane-Token": cfg["token"]})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def open_db(args):
+    if args.sqlite:
+        return SqliteDB(args.sqlite)
+    dsn = os.getenv(args.dsn_env, "")
+    if not dsn and not any(os.getenv(k) for k in ("PGHOST", "PGDATABASE", "PGSERVICE")):
+        sys.exit(f"palivane-dbscan: set {args.dsn_env} to a Postgres connection string (or use --sqlite FILE).")
+    return PostgresDB(dsn)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Find credentials stored in a database, and columns that keep them in clear.")
+    ap.add_argument("--dsn-env", default="PALIVANE_DB_DSN",
+                    help="environment variable holding the Postgres connection string (default PALIVANE_DB_DSN)")
+    ap.add_argument("--sqlite", default="", help="scan a SQLite file instead")
+    ap.add_argument("--sample", type=int, default=2000,
+                    help="rows read per table (default 2000; raise it for a thorough pass, e.g. 1000000)")
+    ap.add_argument("--include-table", action="append", default=[], metavar="GLOB", help="only these tables (schema.table or table)")
+    ap.add_argument("--exclude-table", action="append", default=[], metavar="GLOB", help="skip these tables")
+    ap.add_argument("--max-tables", type=int, default=500)
+    ap.add_argument("--record", action="store_true", help="persist findings server-side")
+    ap.add_argument("--dry-run", action="store_true", help="print the findings; send nothing")
+    ap.add_argument("--json", action="store_true", help="print the findings as JSON items")
+    ap.add_argument("--fail-on-findings", action="store_true", help="exit 2 when anything is found (CI)")
+    ap.add_argument("--fail-closed", action="store_true", help="exit non-zero on a backend error")
+    ap.add_argument("--url", default="", help="Palivane backend base URL (or PALIVANE_URL)")
+    args = ap.parse_args()
+
+    cfg = read_config(args.url)
+    if not args.dry_run and not args.json and (not cfg["url"] or not cfg["token"]):
+        print("palivane: set PALIVANE_URL and PALIVANE_TOKEN to report findings (or use --dry-run).", file=sys.stderr)
+        return 1 if args.fail_closed else 0
+
+    db = open_db(args)
+    try:
+        result = scan(db, sample=args.sample, include=args.include_table, exclude=args.exclude_table,
+                      max_tables=args.max_tables)
+        items = to_items(db, result["findings"])
+        host = f"{db.engine}:{db.host}"
+    finally:
+        db.close()
+
+    if args.json:
+        print(json.dumps({"items": items, "tables": result["tables"], "values": result["values"],
+                          "errors": result["errors"]}, indent=2, ensure_ascii=False))
+    else:
+        print(f"Scanned {result['tables']} table(s), {result['values']} sampled value(s) in {host}/{db.name}.")
+        for f in result["findings"]:
+            print(f"  • {f['column']}  [{f['label']}]  {f['masked']}  ({f['count']} of {f['sampled']} sampled values)")
+        for e in result["errors"]:
+            print(f"  ! {e}", file=sys.stderr)
+        if not result["findings"]:
+            print("✓ Nothing found in the sample (a sample is not proof the database is clean).")
+
+    if items and not args.dry_run and not args.json:
+        try:
+            sent = flagged = 0
+            for i in range(0, len(items), BATCH):
+                resp = post_batch(cfg, items[i:i + BATCH], host, args.record)
+                sent += resp.get("scanned", 0)
+                flagged += resp.get("flagged", 0)
+            print(f"Reported {sent} finding(s) to Palivane ({flagged} flagged).")
+        except Exception as e:                                    # noqa: BLE001
+            print(f"palivane: could not report ({e}). {'Failing closed.' if args.fail_closed else 'Failing open.'}",
+                  file=sys.stderr)
+            return 1 if args.fail_closed else (2 if (items and args.fail_on_findings) else 0)
+    return 2 if (items and args.fail_on_findings) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
