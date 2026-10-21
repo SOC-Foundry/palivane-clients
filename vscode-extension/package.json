@@ -28,7 +28,7 @@
           "default": "",
           "description": "Palivane console URL (empty = hosted SaaS or the URL from ~/.claude/settings.json)"
         },
-        "palivane.url": {
+        "warden.url": {
           "type": "string",
           "default": "",
           "description": "Deprecated pre-rebrand setting, use palivane.url. Still read as a fallback."
