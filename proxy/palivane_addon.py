@@ -32,9 +32,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -487,27 +490,51 @@ _HOOKED: dict = {"tools": frozenset(), "at": 0.0}
 _HOOKED_TTL = 300.0          # 5 min — deference lags a hook going quiet by at most this
 
 
+_HOOKED_LOCK = threading.Lock()   # single-flight: one refresh at a time
+
+
+def _hooked_fresh() -> bool:
+    return time.time() - _HOOKED["at"] < _HOOKED_TTL
+
+
 def hooked_tools() -> frozenset:
-    """Tools whose local hook is live for this actor, cached. Empty on any failure."""
-    import time
-    now = time.time()
-    if now - _HOOKED["at"] < _HOOKED_TTL:
+    """Tools whose local hook is live for this actor, cached. Empty on any failure.
+
+    Blocking (a urlopen of up to 3s): call it from a worker thread, never from the event
+    loop — the async request() hook goes through hooked_tools_async(). While one refresh is
+    in flight, other callers get the cached set rather than queueing a duplicate lookup."""
+    if _hooked_fresh():
         return _HOOKED["tools"]
-    _HOOKED["at"] = now
-    base = os.getenv("PALIVANE_URL", "").rstrip("/")
-    token = os.getenv("PALIVANE_TOKEN", "")
-    if not base or not token:
-        _HOOKED["tools"] = frozenset()
-        return _HOOKED["tools"]
+    if not _HOOKED_LOCK.acquire(blocking=False):
+        return _HOOKED["tools"]            # a refresh is already running: serve the cache
     try:
-        req = urllib.request.Request(f"{base}/api/capture/hooked",
-                                     headers={"X-Palivane-Token": token})
-        with urllib.request.urlopen(req, timeout=3) as r:
-            data = json.loads(r.read() or b"{}")
-        _HOOKED["tools"] = frozenset(t for t in (data.get("tools") or []) if t)
-    except Exception:
-        _HOOKED["tools"] = frozenset()      # fail closed: scan everything
-    return _HOOKED["tools"]
+        if _hooked_fresh():                # refreshed while we raced for the lock
+            return _HOOKED["tools"]
+        _HOOKED["at"] = time.time()
+        base = os.getenv("PALIVANE_URL", "").rstrip("/")
+        token = os.getenv("PALIVANE_TOKEN", "")
+        if not base or not token:
+            _HOOKED["tools"] = frozenset()
+            return _HOOKED["tools"]
+        try:
+            req = urllib.request.Request(f"{base}/api/capture/hooked",
+                                         headers={"X-Palivane-Token": token})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                data = json.loads(r.read() or b"{}")
+            _HOOKED["tools"] = frozenset(t for t in (data.get("tools") or []) if t)
+        except Exception:
+            _HOOKED["tools"] = frozenset()      # fail closed: scan everything
+        return _HOOKED["tools"]
+    finally:
+        _HOOKED_LOCK.release()
+
+
+async def hooked_tools_async() -> frozenset:
+    """hooked_tools() for the event loop: the cache hit is answered inline, a refresh runs
+    in a worker thread so a slow backend never stalls every other proxied connection."""
+    if _hooked_fresh():
+        return _HOOKED["tools"]
+    return await asyncio.to_thread(hooked_tools)
 
 
 def detect_tool(user_agent: str) -> str:
@@ -549,38 +576,67 @@ def _token_fp(token: str) -> str:
     return hashlib.sha256((token or "").encode()).hexdigest()[:16]
 
 
+_BREAKER_LOCK = threading.Lock()   # concurrent flows record from worker threads
+
+
 def _breaker_load() -> dict:
     try:
         with open(_breaker_path()) as fh:
-            return json.load(fh)
+            st = json.load(fh)
+        return st if isinstance(st, dict) else {}
     except Exception:
         return {}
 
 
 def _breaker_save(state: dict) -> None:
+    # A unique temp name per write: concurrent flows (worker threads here, other processes
+    # sharing the state dir) used to share one fixed "<path>.tmp" and clobber each other.
     try:
         path = _breaker_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(state, fh)
-        os.replace(tmp, path)
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".proxy-breaker.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(state, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:
         pass
+
+
+def _deadline(v, now: float, cap: float) -> float:
+    """A breaker deadline read from the state file, which anything running as this user can
+    write. Only a finite positive number no further out than now+cap counts — every deadline
+    this code writes is at most `cap` away, so anything beyond it (a hand-written 9e18 that
+    would stand the sensor down forever) is tampering or clock skew: treat it as closed."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+        return 0.0
+    return float(v) if v <= now + cap else 0.0
 
 
 def _breaker_skip(token: str) -> str:
     """Reason to skip the network and fail open, or '' to proceed."""
     st, fp, now = _breaker_load(), _token_fp(token), time.time()
-    if st.get("deauth_fp") == fp and now < st.get("deauth_until", 0):
+    if st.get("deauth_fp") == fp and now < _deadline(st.get("deauth_until"), now, _DEAUTH_SECS):
         return "deauthorized"
-    if now < st.get("cooldown_until", 0):
+    if now < _deadline(st.get("cooldown_until"), now, _COOLDOWN_SECS):
         return "backoff"
     return ""
 
 
 def _breaker_record(token: str, status) -> None:
     """status: 200 healthy | 401/403 revoked | None transient error."""
+    with _BREAKER_LOCK:
+        _breaker_record_locked(token, status)
+
+
+def _breaker_record_locked(token: str, status) -> None:
     st, fp, now = _breaker_load(), _token_fp(token), time.time()
     if status == 200:
         if st:
@@ -593,7 +649,8 @@ def _breaker_record(token: str, status) -> None:
             sys.stderr.write("palivane: capture key rejected (revoked or invalid) — standing "
                              "down; re-run `palivane connect` to re-issue.\n")
         return
-    fails = int(st.get("fails", 0)) + 1
+    prev = st.get("fails")
+    fails = (prev if isinstance(prev, int) and not isinstance(prev, bool) and prev > 0 else 0) + 1
     if fails >= _FAIL_THRESHOLD:
         st.update(fails=0, cooldown_until=now + _COOLDOWN_SECS)
     else:
@@ -1075,7 +1132,7 @@ class PalivaneGuard:
             # agent's tool USE out of the same request, which is a different exposure and
             # stays covered. An early return here would have silently dropped it.
             ua_tool = detect_tool(req.headers.get("user-agent", ""))
-            defer_prompt = bool(ua_tool) and ua_tool in hooked_tools()
+            defer_prompt = bool(ua_tool) and ua_tool in await hooked_tools_async()
 
             prompt = "" if defer_prompt else extract_prompt(raw)
             if not defer_prompt and not prompt.strip() and needs_harvest(req.pretty_host):

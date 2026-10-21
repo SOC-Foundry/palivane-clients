@@ -19,7 +19,9 @@ Usage:
 
 Exit codes: 0 = clean/allowed (warns by default), 1 = a blocking finding (or any
 finding with --strict). On a backend/network error it fails OPEN (exit 0) unless
---fail-closed is given (recommended for CI).
+--fail-closed is given (recommended for CI). Renamed files are scanned; binary files
+are skipped; a file over 1 MB is scanned up to 1 MB with a warning. With --fail-closed,
+a file that could not be read or was only partly scanned also fails the run.
 """
 from __future__ import annotations
 
@@ -31,7 +33,8 @@ import sys
 import urllib.error
 import urllib.request
 
-MAX_BYTES = 1_000_000   # skip files larger than this (likely data/blobs, not source)
+MAX_BYTES = 1_000_000   # scan at most this much of a file; larger files are truncated (with a warning)
+_BINARY_SNIFF = 8192    # a NUL byte in this prefix marks a file as binary (images, archives, ...)
 
 
 def _git(*args: str) -> str:
@@ -40,30 +43,38 @@ def _git(*args: str) -> str:
 
 def _changed(mode: str, rng: str) -> list[str]:
     if mode == "staged":
-        out = _git("diff", "--cached", "--name-only", "--diff-filter=ACM", "-z")
+        out = _git("diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z")
     elif mode == "all":
         out = _git("ls-files", "-z")          # every tracked file — whole-repo sweep
     else:
-        out = _git("diff", "--name-only", "--diff-filter=ACM", "-z", *rng.split())
+        out = _git("diff", "--name-only", "--diff-filter=ACMR", "-z", *rng.split())
     return [p for p in out.split("\0") if p]
 
 
-def _content(path: str, mode: str) -> str | None:
-    """Read a file's content: the staged blob in staged mode, else the working tree."""
+def _content(path: str, mode: str) -> tuple[str | None, str | None]:
+    """Read a file's content: the staged blob in staged mode, else the working tree.
+
+    Returns (content, problem). content is None when the file is skipped; problem is a
+    human-readable reason when the file was skipped or only partly scanned, None otherwise.
+    Binary files (a NUL byte near the start) are skipped without a problem: they are not
+    source. Non-UTF-8 text is decoded with replacement characters rather than dropped, and an
+    oversized file is scanned up to MAX_BYTES rather than skipped.
+    """
     try:
         if mode == "staged":
             raw = subprocess.run(["git", "show", f":{path}"], capture_output=True, check=True).stdout
         else:
             with open(path, "rb") as fh:
                 raw = fh.read()
-    except (subprocess.CalledProcessError, OSError):
-        return None
+    except (subprocess.CalledProcessError, OSError) as e:
+        return None, f"could not read ({e.__class__.__name__})"
+    if b"\0" in raw[:_BINARY_SNIFF]:
+        return None, None    # binary — not source, nothing to scan
+    problem = None
     if len(raw) > MAX_BYTES:
-        return None
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return None    # binary — skip
+        problem = f"larger than {MAX_BYTES:,} bytes ({len(raw):,}); only the first {MAX_BYTES:,} were scanned"
+        raw = raw[:MAX_BYTES]
+    return raw.decode("utf-8", errors="replace"), problem
 
 
 def main() -> int:
@@ -86,9 +97,21 @@ def main() -> int:
 
     mode = "all" if args.all else ("range" if args.rng else "staged")
     paths = args.files or _changed(mode, args.rng or "")
-    files = [{"path": p, "content": c} for p in paths if (c := _content(p, mode)) is not None]
+    files, incomplete = [], []
+    for p in paths:
+        content, problem = _content(p, mode)
+        if problem:
+            incomplete.append(p)
+            print(f"palivane: WARNING {p}: {problem}.", file=sys.stderr)
+        if content is not None:
+            files.append({"path": p, "content": content})
+    # With --fail-closed a file that was not (fully) scanned is a failure, never a silent pass.
+    gap = 1 if (incomplete and args.fail_closed) else 0
+    if gap:
+        print(f"palivane: {len(incomplete)} file(s) could not be fully scanned. Failing closed.",
+              file=sys.stderr)
     if not files:
-        return 0
+        return gap
 
     payload = json.dumps({"files": files, "record": args.record}).encode()
     req = urllib.request.Request(
@@ -110,7 +133,7 @@ def main() -> int:
     flagged = result.get("files", [])
     if not flagged:
         print(f"palivane: scanned {result.get('scanned', len(files))} file(s) — clean ✓")
-        return 0
+        return gap
 
     blocking = False
     print(f"\n  ⚠ Palivane found sensitive data in {len(flagged)} file(s):\n")
@@ -127,7 +150,7 @@ def main() -> int:
         print("  Commit blocked. Remove the secret/PII (and rotate any exposed key), or override\n"
               "  with `git commit --no-verify` if this is a false positive.\n", file=sys.stderr)
         return 1
-    return 0
+    return gap
 
 
 if __name__ == "__main__":

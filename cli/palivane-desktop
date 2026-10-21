@@ -72,9 +72,21 @@ SHIM_DIR="${WDIR}/bin"
 NSS_DB="sql:${HOME_DIR}/.pki/nssdb"
 CA_NICK="palivane-mitmproxy"
 # mitmproxy is installed here as a self-contained binary (bundles its own Python) so the
-# default install needs no system Python and never trips PEP-668. Pin with PALIVANE_MITM_VERSION.
+# default install needs no system Python and never trips PEP-668. The version is PINNED and
+# each tarball's sha256 is checked before anything is extracted: this binary terminates TLS
+# for every AI tool on the machine, so "whatever GitHub calls latest" is not good enough.
+# PALIVANE_MITM_VERSION overrides it only together with PALIVANE_MITM_SHA256.
 MITM_DIR="${WDIR}/mitmproxy"
-MITM_FALLBACK_VERSION="12.2.3"   # used only if the latest-version lookup fails
+MITM_VERSION="12.2.3"
+# sha256 of mitmproxy-12.2.3-<os>-<arch>.tar.gz as published on downloads.mitmproxy.org.
+mitm_pinned_sha256() {
+  case "$1" in
+    linux-x86_64)  printf '2e95286b618fa6fd33e5e62a78c2e5112571d85f42ec2bac29b97ee242bdb5c5' ;;
+    linux-aarch64) printf 'b358643a6c4f4b39e33d985350f660b724fece95687d7daa899ef0c4e211f681' ;;
+    macos-x86_64)  printf '7998187f5a0d399ab796af4523d3ad830ebe690726a41bc3e1df47a8e477a641' ;;
+    macos-arm64)   printf '0a09ee3b82569e8985aff8186e4792618b8e5d0c766098db093d09a87d4b013a' ;;
+  esac
+}
 # CLIs captured via a PATH shim — they use their own HTTP client and ignore the OS proxy
 # + trust store, so a system proxy alone never sees them. Override with PALIVANE_CLI_TOOLS.
 CLI_SHIM_TOOLS="${PALIVANE_CLI_TOOLS:-claude codex gemini}"
@@ -118,27 +130,47 @@ mitm_arch() {
   esac
 }
 
-# Latest published version (strip the leading v); PALIVANE_MITM_VERSION pins it, and a baked
-# fallback keeps install working if GitHub is unreachable.
-mitm_version() {
-  [ -n "${PALIVANE_MITM_VERSION:-}" ] && { printf '%s' "$PALIVANE_MITM_VERSION"; return; }
-  local v
-  v="$(curl -fsSL https://api.github.com/repos/mitmproxy/mitmproxy/releases/latest 2>/dev/null \
-        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([0-9.]*\)".*/\1/p' | head -1)"
-  printf '%s' "${v:-$MITM_FALLBACK_VERSION}"
+mitm_version() { printf '%s' "${PALIVANE_MITM_VERSION:-$MITM_VERSION}"; }
+
+# The sha256 the downloaded tarball must have: the pinned one, or PALIVANE_MITM_SHA256 for an
+# operator-chosen version. Empty = no known hash, so the download is not attempted.
+mitm_expected_sha256() {
+  if [ -n "${PALIVANE_MITM_VERSION:-}" ] && [ "$PALIVANE_MITM_VERSION" != "$MITM_VERSION" ]; then
+    printf '%s' "${PALIVANE_MITM_SHA256:-}"
+  else
+    mitm_pinned_sha256 "$1"
+  fi
+}
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d" " -f1
+  else shasum -a 256 "$1" | cut -d" " -f1; fi
 }
 
 # Preferred install: the self-contained release tarball (bundles Python) → no system deps,
 # no PEP-668. Lands mitmdump/mitmproxy/mitmweb in $MITM_DIR.
 install_mitm_standalone() {
-  local arch os ver url tmp
+  local arch os ver url tmp want got
   arch="$(mitm_arch)"; [ -n "$arch" ] || return 1
   case "$OS" in Darwin) os=macos ;; Linux) os=linux ;; *) return 1 ;; esac
   ver="$(mitm_version)"; [ -n "$ver" ] || return 1
+  want="$(mitm_expected_sha256 "${os}-${arch}")"
+  if [ -z "$want" ]; then
+    log "no known sha256 for mitmproxy ${ver} (${os}-${arch}) — set PALIVANE_MITM_SHA256 to use it."
+    return 1
+  fi
   url="https://downloads.mitmproxy.org/${ver}/mitmproxy-${ver}-${os}-${arch}.tar.gz"
   log "downloading mitmproxy ${ver} (${os}-${arch}); no Python required…"
-  mkdir -p "$MITM_DIR"; tmp="$(mktemp -d)"
-  if curl -fsSL "$url" -o "${tmp}/m.tar.gz" && tar -xzf "${tmp}/m.tar.gz" -C "$MITM_DIR"; then
+  tmp="$(mktemp -d)"
+  curl -fsSL "$url" -o "${tmp}/m.tar.gz" || { rm -rf "$tmp"; return 1; }
+  got="$(sha256_of "${tmp}/m.tar.gz")"
+  if [ "$got" != "$want" ]; then
+    rm -rf "$tmp"
+    # Not a reason to fall back to another source: the bytes are not the release we pinned.
+    die "mitmproxy download failed its sha256 check (got $got, want $want) — refusing to install it."
+  fi
+  mkdir -p "$MITM_DIR"
+  if tar -xzf "${tmp}/m.tar.gz" -C "$MITM_DIR"; then
     rm -rf "$tmp"; [ -x "${MITM_DIR}/mitmdump" ]
   else
     rm -rf "$tmp"; return 1
@@ -147,12 +179,14 @@ install_mitm_standalone() {
 
 # Fallback (unusual arch, or downloads.mitmproxy.org blocked): a dedicated venv or pipx —
 # both sidestep PEP-668 (never pip --user into system site-packages). Symlinks into $MITM_DIR.
+# Same pinned version as the tarball, from PyPI.
 install_mitm_pip() {
+  local spec; spec="mitmproxy==$(mitm_version)"
   if command -v python3 >/dev/null 2>&1 && python3 -m venv "${MITM_DIR}/venv" >/dev/null 2>&1 \
-       && "${MITM_DIR}/venv/bin/pip" install --quiet mitmproxy >/dev/null 2>&1; then
+       && "${MITM_DIR}/venv/bin/pip" install --quiet "$spec" >/dev/null 2>&1; then
     ln -sf "${MITM_DIR}/venv/bin/mitmdump" "${MITM_DIR}/mitmdump"; return 0
   fi
-  if command -v pipx >/dev/null 2>&1 && pipx install mitmproxy >/dev/null 2>&1; then
+  if command -v pipx >/dev/null 2>&1 && pipx install "$spec" >/dev/null 2>&1; then
     local m; m="$(command -v mitmdump || printf '%s' "${HOME_DIR}/.local/bin/mitmdump")"
     mkdir -p "$MITM_DIR"; ln -sf "$m" "${MITM_DIR}/mitmdump"; return 0
   fi
@@ -169,19 +203,95 @@ ensure_mitm() {
   command -v mitmdump >/dev/null 2>&1 || die "mitmproxy installed but 'mitmdump' is still not on PATH."
 }
 
+# --- Release integrity: the same check install.sh makes, for what this script downloads ---
+# The addon runs inside the proxy that sees every AI request, so it is fetched like the
+# installer fetches the CLI: manifest.sig (ECDSA P-256 / SHA-256 over the canonical
+# {name: sha256} map) must verify under the PINNED release key — PALIVANE_RELEASE_PUBKEY, the
+# key install.sh persisted in ~/.palivane/release-pubkey.pem, else the vendor key below —
+# and the file's sha256 must match the manifest. Fail closed; the existing copy is kept.
+PALIVANE_VENDOR_RELEASE_PUBKEY="-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtwIOdXmgRU12/7oDPzpkLqrud1DN
+s2ngn344uoGU+MF5HUF7gFG2emj+UG3aPvm5Jbh+ggQdxs9R7ZZ1PwoP9Q==
+-----END PUBLIC KEY-----"
+
+release_pubkey() {
+  if [ -n "${PALIVANE_RELEASE_PUBKEY:-}" ]; then printf '%s\n' "$PALIVANE_RELEASE_PUBKEY"
+  elif grep -qs "BEGIN PUBLIC KEY" "${WDIR}/release-pubkey.pem"; then cat "${WDIR}/release-pubkey.pem"
+  else printf '%s\n' "$PALIVANE_VENDOR_RELEASE_PUBKEY"; fi
+}
+
+# Unsigned is accepted only when the install recorded an unsigned deployment
+# (install.sh REQUIRE_SIG=0) or PALIVANE_RELEASE_REQUIRE_SIG=0 says so.
+unsigned_release_allowed() {
+  local v="${PALIVANE_RELEASE_REQUIRE_SIG:-}"
+  [ -n "$v" ] || v="$(cat "${WDIR}/release-require-sig" 2>/dev/null || true)"
+  case "$v" in 0|skip) return 0 ;; *) return 1 ;; esac
+}
+
+# fetch_verified <name> <dest>: download <name> from the deployment, verify it, then move it
+# into place atomically. Non-zero, with <dest> untouched, on any failure.
+fetch_verified() {
+  local name="$1" dest="$2" base="${PALIVANE_URL%/}" t want got sig_ok=1
+  t="$(mktemp -d)" || return 1
+  if ! curl -fsSL "$base/cli/manifest.json" -o "$t/manifest.json" \
+     || ! curl -fsSL "$base/cli/$name" -o "$t/file"; then
+    rm -rf "$t"; return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "python3 is needed to verify $name against the release manifest."; rm -rf "$t"; return 1
+  fi
+  # Canonical digest = compact sorted {name: sha256} JSON (release_signing.canonical_files_digest).
+  if ! python3 - "$t/manifest.json" "$name" "$t/want" > "$t/digest" <<'PY'
+import json, sys
+files = json.load(open(sys.argv[1]))["files"]
+open(sys.argv[3], "w").write(str((files.get(sys.argv[2]) or {}).get("sha256", "")))
+sys.stdout.write(json.dumps({k: v["sha256"] for k, v in files.items()},
+                            separators=(",", ":"), sort_keys=True))
+PY
+  then rm -rf "$t"; return 1; fi
+  if curl -fsSL "$base/cli/manifest.sig" -o "$t/manifest.sig" 2>/dev/null; then
+    if command -v openssl >/dev/null 2>&1; then
+      release_pubkey > "$t/pub.pem"
+      if openssl base64 -d -A -in "$t/manifest.sig" -out "$t/sig.der" 2>/dev/null \
+         && openssl dgst -sha256 -verify "$t/pub.pem" -signature "$t/sig.der" "$t/digest" >/dev/null 2>&1; then
+        sig_ok=0
+      else
+        log "release signature INVALID for $name — refusing it (possible tampering)."
+      fi
+    elif unsigned_release_allowed; then sig_ok=0
+    else log "openssl is needed to verify the release signature."
+    fi
+  elif unsigned_release_allowed; then sig_ok=0
+  else log "the deployment served no release signature — refusing $name."
+  fi
+  [ "$sig_ok" = 0 ] || { rm -rf "$t"; return 1; }
+  want="$(cat "$t/want")"; got="$(sha256_of "$t/file")"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    log "$name failed its sha256 check against the signed manifest — refusing it."
+    rm -rf "$t"; return 1
+  fi
+  mkdir -p "$(dirname "$dest")"
+  cp "$t/file" "${dest}.palivane-new" && mv -f "${dest}.palivane-new" "$dest"
+  local rc=$?
+  rm -rf "$t"
+  return $rc
+}
+
 fetch_addon() {
   mkdir -p "$WDIR"
-  log "fetching capture addon…"
-  curl -fsSL "${PALIVANE_URL%/}/cli/palivane_addon.py" -o "$ADDON" || die "could not download palivane_addon.py from $PALIVANE_URL"
+  log "fetching capture addon (verifying the signed release)…"
+  fetch_verified palivane_addon.py "$ADDON" \
+    || die "could not get a verified palivane_addon.py from $PALIVANE_URL (unreachable, or its release signature/hash did not check out)."
 }
 
 bootstrap_ca() {
   [ -f "$CA" ] && return
   log "generating mitmproxy CA (first run)…"
-  ( mitmdump -q --listen-port "$PORT" >/dev/null 2>&1 & echo $! >/tmp/palivane-mitm-boot.pid ) || true
+  local bpid
+  mitmdump -q --listen-port "$PORT" >/dev/null 2>&1 &
+  bpid=$!
   for _ in $(seq 1 20); do [ -f "$CA" ] && break; sleep 0.5; done
-  kill "$(cat /tmp/palivane-mitm-boot.pid 2>/dev/null)" 2>/dev/null || true
-  rm -f /tmp/palivane-mitm-boot.pid
+  kill "$bpid" 2>/dev/null || true
   [ -f "$CA" ] || die "mitmproxy CA was not generated at $CA"
 }
 
@@ -561,14 +671,55 @@ resolve_upstream_ca() {
   return 0
 }
 
+# Write stdin to $1 readable by this user only. The proxy unit/plist carry PALIVANE_TOKEN and
+# the mitmproxy config carries upstream proxy credentials; under the default umask they were
+# world-readable (0644). Truncate + chmod BEFORE the content goes in, so there is no window.
+write_private() {
+  ( umask 077; : > "$1" )
+  chmod 600 "$1"
+  cat > "$1"
+}
+
+# Upstream proxy credentials never go on the mitmdump command line (visible to every local
+# user in ps, and in the unit file): mitmproxy reads options from <confdir>/config.yaml, so
+# they go there, 0600. A URL with userinfo (an ambient https_proxy=http://u:p@corp:8080) is
+# split the same way, since `--mode upstream:` would otherwise carry the password.
+MITM_CONF="${HOME_DIR}/.mitmproxy/config.yaml"
+MITM_CONF_MARK="# managed by palivane-desktop"
+
+split_upstream_userinfo() {
+  local scheme rest userinfo
+  case "$UPSTREAM_PROXY" in *://*@*) ;; *) return 0 ;; esac
+  scheme="${UPSTREAM_PROXY%%://*}"; rest="${UPSTREAM_PROXY#*://}"
+  userinfo="${rest%@*}"
+  case "$userinfo" in */*) return 0 ;; esac        # the '@' is in a path, not userinfo
+  UPSTREAM_PROXY="${scheme}://${rest##*@}"
+  # Percent-decode (proxy URLs encode reserved characters in the password).
+  [ -n "$UPSTREAM_AUTH" ] || UPSTREAM_AUTH="$(printf '%b' "${userinfo//%/\\x}")"
+  return 0
+}
+
+write_mitm_conf() {
+  if [ -z "$UPSTREAM_AUTH" ]; then remove_mitm_conf; return 0; fi
+  if [ -f "$MITM_CONF" ] && ! grep -qF "$MITM_CONF_MARK" "$MITM_CONF"; then
+    die "$MITM_CONF exists and is not Palivane's; add  upstream_auth: '<user:pass>'  to it (chmod 600) and re-run without PALIVANE_UPSTREAM_AUTH."
+  fi
+  mkdir -p "$(dirname "$MITM_CONF")"
+  printf "%s\nupstream_auth: '%s'\n" "$MITM_CONF_MARK" "${UPSTREAM_AUTH//\'/\'\'}" | write_private "$MITM_CONF"
+}
+
+remove_mitm_conf() {
+  [ -f "$MITM_CONF" ] && grep -qF "$MITM_CONF_MARK" "$MITM_CONF" && rm -f "$MITM_CONF"
+  return 0
+}
+
 # Extra mitmdump flags, as a plain space-separated string (for the systemd ExecStart line).
 # The two blocks are independent: upstream-proxy chaining (axis 1) and upstream trust
 # (axis 2). A TLS-inspecting L3 client like Cloudflare WARP needs ONLY the second, so the
 # CA/insecure flags must not be gated on UPSTREAM_PROXY being set.
 mitm_upstream_flags() {
   if [ -n "$UPSTREAM_PROXY" ]; then
-    printf ' --mode upstream:%s' "$UPSTREAM_PROXY"
-    [ -n "$UPSTREAM_AUTH" ] && printf ' --upstream-auth %s' "$UPSTREAM_AUTH"
+    printf ' --mode upstream:%s' "$UPSTREAM_PROXY"   # credentials: write_mitm_conf
   fi
   [ -n "$UPSTREAM_CA" ] && printf ' --set ssl_verify_upstream_trusted_ca=%s' "$UPSTREAM_CA"
   [ -n "$UPSTREAM_INSECURE" ] && printf ' --ssl-insecure'
@@ -579,7 +730,6 @@ mitm_upstream_flags() {
 mitm_upstream_plist() {
   if [ -n "$UPSTREAM_PROXY" ]; then
     printf '    <string>--mode</string><string>upstream:%s</string>\n' "$UPSTREAM_PROXY"
-    [ -n "$UPSTREAM_AUTH" ] && printf '    <string>--upstream-auth</string><string>%s</string>\n' "$UPSTREAM_AUTH"
   fi
   [ -n "$UPSTREAM_CA" ] && printf '    <string>--set</string><string>ssl_verify_upstream_trusted_ca=%s</string>\n' "$UPSTREAM_CA"
   [ -n "$UPSTREAM_INSECURE" ] && printf '    <string>--ssl-insecure</string>\n'
@@ -590,16 +740,18 @@ start_service() {
   local tok; tok="$1"
   local up_flags up_plist
   resolve_upstream_ca
+  split_upstream_userinfo
+  write_mitm_conf
   up_flags="$(mitm_upstream_flags)"
   up_plist="$(mitm_upstream_plist)"
-  [ -n "$UPSTREAM_PROXY" ] && log "chaining egress through upstream proxy: $UPSTREAM_PROXY"
+  [ -n "$UPSTREAM_PROXY" ] && log "chaining egress through upstream proxy: $UPSTREAM_PROXY${UPSTREAM_AUTH:+ (credentials in $MITM_CONF, 0600)}"
   [ -n "$UPSTREAM_CA" ] && log "trusting $UPSTREAM_CA on the upstream leg (TLS-inspecting proxy/VPN)"
   [ -n "$UPSTREAM_INSECURE" ] && log "warning: upstream cert verification DISABLED (PALIVANE_UPSTREAM_INSECURE)"
   case "$OS" in
     Darwin)
       local plist="${HOME_DIR}/Library/LaunchAgents/io.palivane.proxy.plist"
       mkdir -p "${HOME_DIR}/Library/LaunchAgents"
-      cat > "$plist" <<PLIST
+      write_private "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -625,7 +777,7 @@ PLIST
     Linux)
       local unit="${HOME_DIR}/.config/systemd/user/palivane-proxy.service"
       mkdir -p "${HOME_DIR}/.config/systemd/user"
-      cat > "$unit" <<UNIT
+      write_private "$unit" <<UNIT
 [Unit]
 Description=Palivane desktop egress proxy
 [Service]
@@ -786,7 +938,7 @@ cmd_install() {
     case "$amb" in
       ""|*127.0.0.1:*|*localhost:*|*::1:*) : ;;
       *) UPSTREAM_PROXY="$amb"
-         log "detected an existing egress proxy in the environment ($amb) — chaining through it." ;;
+         log "detected an existing egress proxy in the environment (${amb#*@}) — chaining through it." ;;
     esac
   fi
   ensure_mitm
@@ -818,6 +970,7 @@ cmd_install() {
 
 cmd_uninstall() {
   unwire_cli_capture
+  remove_mitm_conf
   unwire_electron_apps
   case "$OS" in
     Darwin)

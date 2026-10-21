@@ -47,6 +47,161 @@ GITHUB_API = "https://api.github.com"
 UNREADABLE = object()
 
 
+# >>> palivane release-verify (keep identical in every client script that carries it;
+# test_release_verify.py checks they match and that the key is release_signing's)
+# Everything these scripts download after install is checked the way install.sh checks the
+# install itself: /cli/manifest.sig (ECDSA P-256 / SHA-256 over the canonical {name: sha256}
+# map) must verify under the PINNED release key, then each file's sha256 must match the
+# manifest. Anything else is refused and the installed copy is kept. TLS alone proves who
+# served the bytes, not that they are a release the vendor signed.
+_VENDOR_RELEASE_PUBKEY = """-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtwIOdXmgRU12/7oDPzpkLqrud1DN
+s2ngn344uoGU+MF5HUF7gFG2emj+UG3aPvm5Jbh+ggQdxs9R7ZZ1PwoP9Q==
+-----END PUBLIC KEY-----
+"""
+_RELEASE_PUBKEY_PATH = "~/.palivane/release-pubkey.pem"      # written by install.sh
+_RELEASE_REQUIRE_SIG_PATH = "~/.palivane/release-require-sig"  # "0" = deployment unsigned
+
+
+def _release_pubkey() -> str:
+    """The pinned key: PALIVANE_RELEASE_PUBKEY, else the key install.sh persisted from the
+    deployment it installed from (a self-host's own key), else the vendor key above."""
+    import os
+    pem = (os.environ.get("PALIVANE_RELEASE_PUBKEY") or "").strip()
+    if pem:
+        return pem
+    try:
+        with open(os.path.expanduser(_RELEASE_PUBKEY_PATH)) as f:
+            pem = f.read().strip()
+        if "BEGIN PUBLIC KEY" in pem:
+            return pem
+    except OSError:
+        pass
+    return _VENDOR_RELEASE_PUBKEY.strip()
+
+
+def _unsigned_release_allowed() -> bool:
+    """An unsigned manifest is accepted only when the install recorded that its deployment
+    does not sign (install.sh REQUIRE_SIG=0/skip), or PALIVANE_RELEASE_REQUIRE_SIG=0 says so.
+    No record means a signature is required: fail closed."""
+    import os
+    v = (os.environ.get("PALIVANE_RELEASE_REQUIRE_SIG") or "").strip()
+    if not v:
+        try:
+            with open(os.path.expanduser(_RELEASE_REQUIRE_SIG_PATH)) as f:
+                v = f.read().strip()
+        except OSError:
+            v = ""
+    return v in ("0", "skip")
+
+
+def _verify_release_sig(message: bytes, sig_b64: bytes, pubkey_pem: str):
+    """True = verified, False = rejected, None = nothing on this machine can verify (no
+    `cryptography`, no openssl). Same check as install.sh's `openssl dgst -sha256 -verify`."""
+    import base64
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    try:
+        sig = base64.b64decode(sig_b64.strip(), validate=True)
+    except (ValueError, TypeError):
+        return False
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    except ImportError:
+        pass
+    else:
+        try:
+            load_pem_public_key(pubkey_pem.encode()).verify(
+                sig, message, ec.ECDSA(hashes.SHA256()))
+            return True
+        except (InvalidSignature, ValueError, TypeError):
+            return False
+    openssl = shutil.which("openssl")
+    if not openssl:
+        return None
+    d = tempfile.mkdtemp(prefix="palivane-verify-")      # 0700: private to this user
+    try:
+        paths = []
+        for name, blob in (("pub.pem", pubkey_pem.encode()), ("sig.der", sig), ("msg", message)):
+            p = os.path.join(d, name)
+            with open(p, "wb") as f:
+                f.write(blob)
+            paths.append(p)
+        r = subprocess.run([openssl, "dgst", "-sha256", "-verify", paths[0],
+                            "-signature", paths[1], paths[2]],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _verified_manifest(fetch):
+    """The release manifest, or None unless it is authentic. `fetch(name)` returns the bytes
+    of <base>/cli/<name>, or None on any failure (a 404 for manifest.sig included)."""
+    import json
+    raw = fetch("manifest.json")
+    if raw is None:
+        return None
+    try:
+        manifest = json.loads(raw)
+        hashes = {str(k): str(v["sha256"]) for k, v in manifest["files"].items()}
+    except Exception:                                           # noqa: BLE001
+        return None
+    # Must match release_signing.canonical_files_digest byte for byte.
+    message = json.dumps(hashes, separators=(",", ":"), sort_keys=True).encode()
+    sig = fetch("manifest.sig")
+    ok = _verify_release_sig(message, sig, _release_pubkey()) if sig else None
+    if ok is False:
+        return None
+    if ok is None and not _unsigned_release_allowed():
+        return None
+    return manifest
+
+
+def _matches_manifest(manifest: dict, name: str, blob: bytes) -> bool:
+    import hashlib
+    want = ((manifest.get("files") or {}).get(name) or {}).get("sha256", "")
+    return bool(want) and hashlib.sha256(blob).hexdigest() == want
+# <<< palivane release-verify
+
+
+# >>> palivane detect-loader (keep identical across the scripts that carry it)
+def _fetch_detect_verified(base: str):
+    """palivane_detect.py from `base`, verified against the signed release manifest and
+    loaded from memory. It used to be written to a fixed path in the shared temp dir and
+    executed from there, so any local user who created that file first chose the code."""
+    import sys
+    import types
+    import urllib.request
+
+    def fetch(name):
+        try:
+            with urllib.request.urlopen(f"{base}/cli/{name}", timeout=20) as r:
+                return r.read() if 200 <= r.status < 300 else None
+        except Exception:                                       # noqa: BLE001
+            return None
+
+    manifest = _verified_manifest(fetch)
+    body = fetch("palivane_detect.py") if manifest is not None else None
+    if body is None or not _matches_manifest(manifest, "palivane_detect.py", body):
+        sys.exit(f"could not fetch a verified palivane_detect.py from {base} (unreachable, "
+                 "or its release signature/hash did not check out). Place "
+                 "palivane_detect.py next to this script, or reinstall with install.sh.")
+    mod = types.ModuleType("palivane_detect")
+    mod.__file__ = f"{base}/cli/palivane_detect.py"
+    sys.modules["palivane_detect"] = mod
+    exec(compile(body, "palivane_detect.py", "exec"), mod.__dict__)
+    return mod
+# <<< palivane detect-loader
+
+
 # Detection is shared with palivane-secrets and palivane-s3-scan and lives beside this
 # script. The CLIs are downloaded individually, so fall back to fetching it from the same
 # deployment this scanner reports to rather than failing with an ImportError.
@@ -60,14 +215,7 @@ def _load_detect():
             sys.exit("palivane_detect.py not found next to this script and PALIVANE_URL "
                      "is unset, so it cannot be fetched. Download it from "
                      "<your-palivane-url>/cli/palivane_detect.py into the same directory.")
-        try:
-            with urllib.request.urlopen(base + "/cli/palivane_detect.py", timeout=20) as r:
-                body = r.read()
-            path = os.path.join(tempfile.gettempdir(), "palivane_detect.py")
-            with open(path, "wb") as fh:
-                fh.write(body)
-        except Exception as e:                                    # noqa: BLE001
-            sys.exit(f"could not fetch palivane_detect.py from {base}: {e}")
+        return _fetch_detect_verified(base)
     spec = importlib.util.spec_from_file_location("palivane_detect", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

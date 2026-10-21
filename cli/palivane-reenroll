@@ -18,7 +18,10 @@ Config (first found wins), shape {"url","enroll_token","device"}:
 
     palivane-reenroll                      # print a live device key (apiKeyHelper mode)
     palivane-reenroll --refresh            # force a fresh enrollment, ignoring the cache
-    palivane-reenroll --setup URL TOKEN    # write ~/.palivane/enroll.json (installer helper)
+    PALIVANE_ENROLL_TOKEN=… palivane-reenroll --setup URL
+                                           # write ~/.palivane/enroll.json (installer helper);
+                                           # or pipe the token: `--setup URL - < file`. A token
+                                           # given as a 3rd argument still works but shows in ps.
 
 Stdlib only.
 """
@@ -79,11 +82,17 @@ def _read_cached_key() -> str:
         return ""
 
 
+def _write_private(path: str, text: str) -> None:
+    """Write a secret file created 0600 (in a 0700 dir), so it is never briefly world-readable."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(path, 0o600)   # an existing file keeps its old mode through O_CREAT; tighten it
+
+
 def _write_cached_key(key: str) -> None:
-    os.makedirs(os.path.dirname(_KEY_CACHE), exist_ok=True)
-    with open(_KEY_CACHE, "w") as f:
-        f.write(key)
-    os.chmod(_KEY_CACHE, 0o600)
+    _write_private(_KEY_CACHE, key)
 
 
 def _post(url: str, payload: dict) -> dict:
@@ -132,19 +141,36 @@ def _resolve_key(cfg: dict, force: bool) -> str:
 
 
 def _setup(url: str, token: str) -> None:
-    os.makedirs(os.path.dirname(_USER_CFG), exist_ok=True)
-    with open(_USER_CFG, "w") as f:
-        json.dump({"url": url.rstrip("/"), "enroll_token": token, "device": _device_id()}, f, indent=2)
-    os.chmod(_USER_CFG, 0o600)
+    _write_private(_USER_CFG, json.dumps(
+        {"url": url.rstrip("/"), "enroll_token": token, "device": _device_id()}, indent=2))
     _log(f"wrote {_USER_CFG}")
+
+
+def _setup_token(args: list[str]) -> str:
+    """The enrollment token for --setup: PALIVANE_ENROLL_TOKEN, else stdin when the token
+    argument is '-' or omitted, else (legacy) the argument itself — which leaks it to `ps`
+    and shell history, so prefer the env var or stdin."""
+    if len(args) == 1 and args[0] != "-":
+        return args[0].strip()
+    env = os.environ.get("PALIVANE_ENROLL_TOKEN", "").strip()
+    if env:
+        return env
+    if sys.stdin.isatty():
+        _log("enter the enrollment token, then press Enter:")
+    return sys.stdin.readline().strip()
 
 
 def main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "--setup":
-        if len(args) != 3:
-            sys.exit("usage: palivane-reenroll --setup URL ENROLL_TOKEN")
-        _setup(args[1], args[2])
+        if len(args) not in (2, 3):
+            sys.exit("usage: PALIVANE_ENROLL_TOKEN=... palivane-reenroll --setup URL\n"
+                     "       palivane-reenroll --setup URL - < token-file\n"
+                     "       palivane-reenroll --setup URL ENROLL_TOKEN   (legacy; visible in ps)")
+        token = _setup_token(args[2:])
+        if not token:
+            sys.exit("palivane-reenroll: no enrollment token (set PALIVANE_ENROLL_TOKEN or pipe it on stdin)")
+        _setup(args[1], token)
         return
     force = bool(args and args[0] == "--refresh")
     cfg = _load_config()

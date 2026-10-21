@@ -45,10 +45,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -275,29 +277,50 @@ def _token_fp(token: str) -> str:
 def _breaker_load() -> dict:
     try:
         with open(_breaker_path()) as fh:
-            return json.load(fh)
+            st = json.load(fh)
+        return st if isinstance(st, dict) else {}
     except Exception:
         return {}
 
 
 def _breaker_save(state: dict) -> None:
+    # A unique temp name per write: concurrent writers sharing the state dir used to share
+    # one fixed "<path>.tmp" and clobber each other mid-write.
     try:
         path = _breaker_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(state, fh)
-        os.replace(tmp, path)
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".hook-breaker.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(state, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:
         pass
+
+
+def _deadline(v, now: float, cap: float) -> float:
+    """A breaker deadline read from the state file, which anything running as this user can
+    write. Only a finite positive number no further out than now+cap counts — every deadline
+    this code writes is at most `cap` away, so anything beyond it (a hand-written 9e18 that
+    would stand the sensor down forever) is tampering or clock skew: treat it as closed."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+        return 0.0
+    return float(v) if v <= now + cap else 0.0
 
 
 def _breaker_skip(token: str) -> str:
     """Reason to skip the network and fail open, or '' to proceed."""
     st, fp, now = _breaker_load(), _token_fp(token), time.time()
-    if st.get("deauth_fp") == fp and now < st.get("deauth_until", 0):
+    if st.get("deauth_fp") == fp and now < _deadline(st.get("deauth_until"), now, _DEAUTH_SECS):
         return "deauthorized"
-    if now < st.get("cooldown_until", 0):
+    if now < _deadline(st.get("cooldown_until"), now, _COOLDOWN_SECS):
         return "backoff"
     return ""
 
@@ -316,7 +339,8 @@ def _breaker_record(token: str, status) -> None:
             sys.stderr.write("palivane: capture key rejected (revoked or invalid) — standing "
                              "down; re-run `palivane connect` to re-issue.\n")
         return
-    fails = int(st.get("fails", 0)) + 1
+    prev = st.get("fails")
+    fails = (prev if isinstance(prev, int) and not isinstance(prev, bool) and prev > 0 else 0) + 1
     if fails >= _FAIL_THRESHOLD:
         st.update(fails=0, cooldown_until=now + _COOLDOWN_SECS)
     else:
