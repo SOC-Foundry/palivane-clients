@@ -31,7 +31,7 @@ Windows-specific notes (deliberate choices, mirrored from the bash version's pos
     real tool starts (same trick as the bash wire_cli_capture). Shims are wired in BOTH
     modes; -CliOnly just skips the CA-store trust + system proxy.
   * mitmproxy installs as the self-contained Windows binary (bundles its own Python).
-    Pin with $env:PALIVANE_MITM_VERSION.
+    Pinned to a version + sha256; override with $env:PALIVANE_MITM_VERSION + PALIVANE_MITM_SHA256.
   * The endpoint credential scan (`palivane-secrets`, secrets at rest) IS stdlib Python, and
     mitmproxy's bundled interpreter isn't callable, so it needs Python 3 on the box. When
     one is found the scan is installed as a second daily task (03:00) driven by a generated
@@ -67,9 +67,10 @@ $Addon     = Join-Path $WDir "palivane_addon.py"
 $CA        = Join-Path $HomeDir ".mitmproxy\mitmproxy-ca-cert.pem"
 $ShimDir   = Join-Path $WDir "bin"
 # mitmproxy is installed here as a self-contained binary (bundles its own Python) so the
-# install needs no system Python. Pin with PALIVANE_MITM_VERSION.
+# install needs no system Python. Pinned (version + sha256) below.
 $MitmDir   = Join-Path $WDir "mitmproxy"
-$MitmFallbackVersion = "12.2.3"   # used only if the latest-version lookup fails
+$MitmVersion = "12.2.3"   # pinned; the zip is sha256-checked before it is extracted
+$MitmSha256  = "04a01ea95ae96df75058a893e774957d294e69012dab1f4e256ce2b0c6725483"   # mitmproxy-12.2.3-windows-x86_64.zip
 # CLIs captured via a PATH shim — they use their own HTTP client and ignore the WinINET
 # proxy + Windows cert store, so the user proxy alone never sees them.
 $CliShimTools = if ($env:PALIVANE_CLI_TOOLS) { $env:PALIVANE_CLI_TOOLS -split "\s+" } else { @("claude", "codex", "gemini") }
@@ -184,17 +185,140 @@ function Resolve-PalivaneUrl([object]$settings) {
 
 # ---------- mitmproxy (self-contained Windows binary) ----------
 
-# Latest published version (strip the leading v); PALIVANE_MITM_VERSION pins it, and a baked
-# fallback keeps install working if GitHub is unreachable.
+# Pinned version; PALIVANE_MITM_VERSION overrides it only together with PALIVANE_MITM_SHA256.
 function Get-MitmVersion {
     if ($env:PALIVANE_MITM_VERSION) { return $env:PALIVANE_MITM_VERSION }
+    return $MitmVersion
+}
+
+function Get-MitmExpectedSha256 {
+    if ($env:PALIVANE_MITM_VERSION -and $env:PALIVANE_MITM_VERSION -ne $MitmVersion) {
+        return "$env:PALIVANE_MITM_SHA256".ToLowerInvariant()
+    }
+    return $MitmSha256
+}
+
+# ---------- release integrity (the same check install.sh makes) ----------
+# The addon runs inside the proxy that sees every AI request, and palivane-secrets runs as a
+# daily task, so both are fetched the way the installer fetches the CLI: manifest.sig (ECDSA
+# P-256 / SHA-256 over the canonical {name: sha256} map) must verify under the PINNED release
+# key — $env:PALIVANE_RELEASE_PUBKEY, ~/.palivane/release-pubkey.pem, else the vendor key
+# below — and each file's sha256 must match the manifest. Fail closed.
+$VendorReleasePubkey = @"
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtwIOdXmgRU12/7oDPzpkLqrud1DN
+s2ngn344uoGU+MF5HUF7gFG2emj+UG3aPvm5Jbh+ggQdxs9R7ZZ1PwoP9Q==
+-----END PUBLIC KEY-----
+"@
+
+function Get-ReleasePubkey {
+    if ($env:PALIVANE_RELEASE_PUBKEY) { return $env:PALIVANE_RELEASE_PUBKEY }
+    $f = Join-Path $WDir "release-pubkey.pem"
+    if (Test-Path -LiteralPath $f -PathType Leaf) {
+        $pem = Get-Content -LiteralPath $f -Raw
+        if ($pem -match "BEGIN PUBLIC KEY") { return $pem }
+    }
+    return $VendorReleasePubkey
+}
+
+# Unsigned is accepted only when PALIVANE_RELEASE_REQUIRE_SIG=0 (or the install recorded an
+# unsigned deployment in ~/.palivane/release-require-sig).
+function Test-UnsignedReleaseAllowed {
+    $v = "$env:PALIVANE_RELEASE_REQUIRE_SIG"
+    if (-not $v) {
+        $f = Join-Path $WDir "release-require-sig"
+        if (Test-Path -LiteralPath $f -PathType Leaf) { $v = "$(Get-Content -LiteralPath $f -Raw)".Trim() }
+    }
+    return ($v -eq "0" -or $v -eq "skip")
+}
+
+# DER ECDSA-Sig-Value (SEQUENCE { INTEGER r, INTEGER s }), which openssl and the server
+# produce, -> the fixed 64-byte r||s form .NET's VerifyData takes.
+function ConvertFrom-DerSignature([byte[]]$der) {
+    if ($der.Length -lt 8 -or $der[0] -ne 0x30) { return $null }
+    $i = 2
+    if ($der[1] -band 0x80) { $i = 2 + ($der[1] -band 0x7f) }
+    $out = New-Object byte[] 64
+    for ($k = 0; $k -lt 2; $k++) {
+        if ($i + 1 -ge $der.Length -or $der[$i] -ne 0x02) { return $null }
+        $len = [int]$der[$i + 1]; $i += 2
+        if ($len -lt 1 -or $i + $len -gt $der.Length) { return $null }
+        $start = $i; $end = $i + $len - 1; $i += $len
+        while ($start -lt $end -and $der[$start] -eq 0) { $start++ }
+        $n = $end - $start + 1
+        if ($n -gt 32) { return $null }
+        [Array]::Copy($der, $start, $out, ($k * 32) + (32 - $n), $n)
+    }
+    return $out
+}
+
+function Test-ReleaseSignature([byte[]]$message, [string]$sigB64, [string]$pubPem) {
     try {
-        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/mitmproxy/mitmproxy/releases/latest" `
-            -Headers @{ "User-Agent" = "palivane-desktop/1.0" } -TimeoutSec 15 -UseBasicParsing
-        $v = "$($rel.tag_name)" -replace "^v", ""
-        if ($v -match "^[0-9][0-9.]*$") { return $v }
-    } catch {}
-    return $MitmFallbackVersion
+        $sig = ConvertFrom-DerSignature ([Convert]::FromBase64String($sigB64.Trim()))
+        if (-not $sig) { return $false }
+        $spki = [Convert]::FromBase64String(($pubPem -replace "-----[A-Z ]+-----", "") -replace "\s", "")
+        # A P-256 SubjectPublicKeyInfo ends in the 65-byte uncompressed point 04||X||Y.
+        $L = $spki.Length
+        if ($L -lt 65 -or $spki[$L - 65] -ne 4) { return $false }
+        $x = New-Object byte[] 32; [Array]::Copy($spki, $L - 64, $x, 0, 32)
+        $y = New-Object byte[] 32; [Array]::Copy($spki, $L - 32, $y, 0, 32)
+        $q = New-Object System.Security.Cryptography.ECPoint
+        $q.X = $x; $q.Y = $y
+        $p = New-Object System.Security.Cryptography.ECParameters
+        $p.Curve = [System.Security.Cryptography.ECCurve+NamedCurves]::nistP256
+        $p.Q = $q
+        $ec = [System.Security.Cryptography.ECDsa]::Create($p)
+        return [bool]$ec.VerifyData($message, $sig, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    } catch { return $false }
+}
+
+# The release manifest, or $null unless its signature verifies (see above).
+function Get-VerifiedManifest([string]$palivaneUrl) {
+    try {
+        $raw = (Invoke-WebRequest -Uri "$palivaneUrl/cli/manifest.json" -TimeoutSec 60 -UseBasicParsing).Content
+        if ($raw -is [byte[]]) { $raw = [Text.Encoding]::UTF8.GetString($raw) }
+        $m = $raw | ConvertFrom-Json
+    } catch { return $null }
+    # Canonical digest = compact sorted {name: sha256} JSON, byte-identical to
+    # release_signing.canonical_files_digest (names and hex hashes need no escaping).
+    [string[]]$names = @($m.files.PSObject.Properties | ForEach-Object { $_.Name })
+    [Array]::Sort($names, [StringComparer]::Ordinal)
+    $parts = @()
+    foreach ($n in $names) {
+        $h = "$($m.files.$n.sha256)"
+        if ($n -notmatch '^[A-Za-z0-9._-]+$' -or $h -notmatch '^[0-9a-f]{64}$') { return $null }
+        $parts += ('"' + $n + '":"' + $h + '"')
+    }
+    $message = [Text.Encoding]::UTF8.GetBytes("{" + ($parts -join ",") + "}")
+    $sig = $null
+    try { $sig = (Invoke-WebRequest -Uri "$palivaneUrl/cli/manifest.sig" -TimeoutSec 60 -UseBasicParsing).Content } catch {}
+    if ($sig -is [byte[]]) { $sig = [Text.Encoding]::ASCII.GetString($sig) }
+    if ($sig) {
+        if (-not (Test-ReleaseSignature $message "$sig" (Get-ReleasePubkey))) {
+            Log "release signature INVALID — refusing the download (possible tampering)."
+            return $null
+        }
+    } elseif (-not (Test-UnsignedReleaseAllowed)) {
+        Log "the deployment served no release signature — refusing the download."
+        return $null
+    }
+    return $m
+}
+
+# Download <name> next to <dest>, check it against the verified manifest, then move it into
+# place. Throws (leaving <dest> untouched) on any failure.
+function Save-VerifiedFile([string]$palivaneUrl, [object]$manifest, [string]$name, [string]$dest) {
+    $want = "$($manifest.files.$name.sha256)"
+    if (-not $want) { throw "$name is not in the signed release manifest" }
+    $tmp = "$dest.palivane-new"
+    try {
+        Invoke-WebRequest -Uri "$palivaneUrl/cli/$name" -OutFile $tmp -TimeoutSec 60 -UseBasicParsing
+        $got = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($got -ne $want) { throw "$name failed its sha256 check against the signed manifest" }
+        Move-Item -LiteralPath $tmp -Destination $dest -Force
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-Mitmdump {
@@ -219,12 +343,19 @@ function Install-Mitm {
     if ($arch -eq "ARM64") { Log "note: ARM64 Windows — using the x86_64 mitmproxy build (runs under x64 emulation)." }
     elseif ($arch -ne "AMD64") { Die "unsupported architecture: $arch (mitmproxy ships windows-x86_64 only)." }
     $ver = Get-MitmVersion
+    $want = Get-MitmExpectedSha256
+    if (-not $want) { Die "no known sha256 for mitmproxy $ver — set PALIVANE_MITM_SHA256 to use it." }
     $url = "https://downloads.mitmproxy.org/$ver/mitmproxy-$ver-windows-x86_64.zip"
     Log "downloading mitmproxy $ver (windows-x86_64); no Python required..."
     New-Item -ItemType Directory -Force -Path $MitmDir | Out-Null
     $zip = Join-Path $env:TEMP "palivane-mitmproxy-$ver.zip"
     try {
         Invoke-WebRequest -Uri $url -OutFile $zip -TimeoutSec 600 -UseBasicParsing
+        $got = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($got -ne $want) {
+            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+            Die "mitmproxy download failed its sha256 check (got $got, want $want) — refusing to install it."
+        }
         Expand-Archive -LiteralPath $zip -DestinationPath $MitmDir -Force
     } catch {
         Die "could not download/extract mitmproxy from $url ($($_.Exception.Message)); install it from https://mitmproxy.org/downloads/ into $MitmDir and re-run."
@@ -238,11 +369,13 @@ function Install-Mitm {
 
 function Fetch-Addon([string]$palivaneUrl) {
     New-Item -ItemType Directory -Force -Path $WDir | Out-Null
-    Log "fetching capture addon..."
+    Log "fetching capture addon (verifying the signed release)..."
+    $manifest = Get-VerifiedManifest $palivaneUrl
+    if (-not $manifest) { Die "could not get a verified release manifest from $palivaneUrl (unreachable, or its signature did not check out)." }
     try {
-        Invoke-WebRequest -Uri "$palivaneUrl/cli/palivane_addon.py" -OutFile $Addon -TimeoutSec 60 -UseBasicParsing
+        Save-VerifiedFile $palivaneUrl $manifest "palivane_addon.py" $Addon
     } catch {
-        Die "could not download palivane_addon.py from $palivaneUrl ($($_.Exception.Message))"
+        Die "could not download a verified palivane_addon.py from $palivaneUrl ($($_.Exception.Message))"
     }
 }
 
@@ -574,8 +707,9 @@ function Install-SecretsScan([string]$palivaneUrl, [string]$token, [string]$user
         return
     }
     try {
-        Invoke-WebRequest -Uri "$palivaneUrl/cli/palivane-secrets" -OutFile $SecretsScript `
-            -TimeoutSec 60 -UseBasicParsing
+        $manifest = Get-VerifiedManifest $palivaneUrl
+        if (-not $manifest) { throw "the release manifest did not verify" }
+        Save-VerifiedFile $palivaneUrl $manifest "palivane-secrets" $SecretsScript
     } catch {
         Log "credential scan skipped: could not download palivane-secrets ($($_.Exception.Message))."
         return

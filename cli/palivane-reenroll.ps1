@@ -18,7 +18,11 @@ Config (first found wins), shape {"url","enroll_token","device"}:
 
     palivane-reenroll.ps1                   # print a live device key (apiKeyHelper mode)
     palivane-reenroll.ps1 -Refresh          # force a fresh enrollment, ignoring the cache
-    palivane-reenroll.ps1 -Setup URL TOKEN  # write %USERPROFILE%\.palivane\enroll.json
+    $env:PALIVANE_ENROLL_TOKEN = "..."; palivane-reenroll.ps1 -Setup URL
+                                            # write %USERPROFILE%\.palivane\enroll.json; or pipe
+                                            # the token on stdin (`... | palivane-reenroll.ps1 -Setup URL -`).
+                                            # A token given as a 2nd argument still works but is
+                                            # visible in the process list.
 #>
 [CmdletBinding()]
 param(
@@ -42,8 +46,9 @@ function Die([string]$msg) { Write-Log $msg; exit 1 }
 
 function Get-DeviceId {
     $user = if ($env:USERNAME) { $env:USERNAME } else { "user" }
-    $host = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { "device" }
-    return "$user@$host"
+    # Not $host: that is PowerShell's read-only automatic $Host variable.
+    $hostName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { "device" }
+    return "$user@$hostName"
 }
 
 function Load-Config {
@@ -73,19 +78,23 @@ function Read-CachedKey {
     return ""
 }
 
-function Write-CachedKey([string]$key) {
-    $dir = Split-Path -Parent $KeyCache
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    Set-Content -LiteralPath $KeyCache -Value $key -NoNewline -Encoding ascii
-    # Lock down to the current user (rough equivalent of chmod 600).
+# Lock a secret file down to the current user (rough equivalent of chmod 600).
+function Protect-UserFile([string]$path) {
     try {
-        $acl = Get-Acl -LiteralPath $KeyCache
+        $acl = Get-Acl -LiteralPath $path
         $acl.SetAccessRuleProtection($true, $false)
         $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
             "$env:USERDOMAIN\$env:USERNAME", "FullControl", "Allow")
         $acl.AddAccessRule($rule)
-        Set-Acl -LiteralPath $KeyCache -AclObject $acl
+        Set-Acl -LiteralPath $path -AclObject $acl
     } catch {}
+}
+
+function Write-CachedKey([string]$key) {
+    $dir = Split-Path -Parent $KeyCache
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    Set-Content -LiteralPath $KeyCache -Value $key -NoNewline -Encoding ascii
+    Protect-UserFile $KeyCache
 }
 
 # True if $key still authenticates. On a network error, assume live (fail-safe: a transient
@@ -130,13 +139,27 @@ function Invoke-Setup([string]$url, [string]$token) {
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     @{ url = $url.TrimEnd("/"); enroll_token = $token; device = (Get-DeviceId) } |
         ConvertTo-Json | Set-Content -LiteralPath $UserCfg -Encoding UTF8
+    Protect-UserFile $UserCfg
     Write-Log "wrote $UserCfg"
 }
 
 # --- main ---
 if ($Setup) {
-    if (-not $Rest -or $Rest.Count -ne 2) { Die "usage: palivane-reenroll.ps1 -Setup URL ENROLL_TOKEN" }
-    Invoke-Setup $Rest[0] $Rest[1]
+    if (-not $Rest -or $Rest.Count -lt 1 -or $Rest.Count -gt 2) {
+        Die "usage: `$env:PALIVANE_ENROLL_TOKEN='...'; palivane-reenroll.ps1 -Setup URL  (or pipe the token: ... | palivane-reenroll.ps1 -Setup URL -)"
+    }
+    # Token source: a legacy 2nd argument (visible in the process list), else
+    # PALIVANE_ENROLL_TOKEN, else one line of stdin (when the argument is '-' or omitted).
+    $token = ""
+    if ($Rest.Count -eq 2 -and $Rest[1] -ne "-") { $token = $Rest[1] }
+    elseif ($env:PALIVANE_ENROLL_TOKEN) { $token = $env:PALIVANE_ENROLL_TOKEN }
+    else {
+        if (-not [Console]::IsInputRedirected) { Write-Log "enter the enrollment token, then press Enter:" }
+        $token = [Console]::In.ReadLine()
+    }
+    $token = ("$token").Trim()
+    if (-not $token) { Die "no enrollment token (set PALIVANE_ENROLL_TOKEN or pipe it on stdin)" }
+    Invoke-Setup $Rest[0] $token
     return
 }
 

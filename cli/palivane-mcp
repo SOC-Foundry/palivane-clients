@@ -20,8 +20,10 @@ Wrap any server by prefixing its command in the MCP config:
         "args": ["--", "npx", "-y", "@modelcontextprotocol/server-github"]}}}
 
 Monitor by default (report only, zero interference). Set PALIVANE_MCP_ENFORCE=true to
-block: a risky request is not forwarded — the client receives a JSON-RPC error naming
-the reason — and a poisoned tools/list result is replaced the same way. Fail-open: if
+block — or turn enforcement on for the org in the console (Settings → Enforcement): every
+verdict carries that stance in its `enforce` field, and the wrapper honours it live, as
+palivane-hook does. Under enforce a risky request is not forwarded — the client receives a
+JSON-RPC error naming the reason — and a poisoned tools/list result is replaced the same way. Fail-open: if
 the backend is down, everything passes through untouched. Framing is preserved exactly
 (original bytes are forwarded, never re-serialized); non-JSON lines pass through as-is.
 
@@ -37,7 +39,9 @@ server is refused until re-vetted (PALIVANE_MCP_REPIN=1 accepts the new version)
 
 Config: PALIVANE_URL + PALIVANE_TOKEN (an ak_… key). Optional: --name / PALIVANE_MCP_SERVER
 (server name for the org allowlist; else guessed from the command), PALIVANE_USER,
-PALIVANE_MCP_TIMEOUT, PALIVANE_MCP_BATCH (default 20), PALIVANE_MCP_FLUSH_MS (default 2000).
+PALIVANE_MCP_TIMEOUT, PALIVANE_MCP_BATCH (default 20), PALIVANE_MCP_FLUSH_MS (default 2000),
+PALIVANE_MCP_EXIT_GRACE (seconds the server gets to exit after the client hangs up before
+it is terminated; default 10).
 Stdlib only.
 """
 
@@ -45,10 +49,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -213,38 +219,67 @@ def _token_fp(token: str) -> str:
     return hashlib.sha256((token or "").encode()).hexdigest()[:16]
 
 
+_BREAKER_LOCK = threading.Lock()   # pump, stdin loop and reporter all record
+
+
 def _breaker_load() -> dict:
     try:
         with open(_breaker_path()) as fh:
-            return json.load(fh)
+            st = json.load(fh)
+        return st if isinstance(st, dict) else {}
     except Exception:
         return {}
 
 
 def _breaker_save(state: dict) -> None:
+    # A unique temp name per write: concurrent writers sharing the state dir used to share
+    # one fixed "<path>.tmp" and clobber each other mid-write.
     try:
         path = _breaker_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(state, fh)
-        os.replace(tmp, path)
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".mcp-breaker.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(state, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:
         pass
+
+
+def _deadline(v, now: float, cap: float) -> float:
+    """A breaker deadline read from the state file, which anything running as this user can
+    write. Only a finite positive number no further out than now+cap counts — every deadline
+    this code writes is at most `cap` away, so anything beyond it (a hand-written 9e18 that
+    would stand the sensor down forever) is tampering or clock skew: treat it as closed."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+        return 0.0
+    return float(v) if v <= now + cap else 0.0
 
 
 def _breaker_skip(token: str) -> str:
     """Reason to skip the network and fail open, or '' to proceed."""
     st, fp, now = _breaker_load(), _token_fp(token), time.time()
-    if st.get("deauth_fp") == fp and now < st.get("deauth_until", 0):
+    if st.get("deauth_fp") == fp and now < _deadline(st.get("deauth_until"), now, _DEAUTH_SECS):
         return "deauthorized"
-    if now < st.get("cooldown_until", 0):
+    if now < _deadline(st.get("cooldown_until"), now, _COOLDOWN_SECS):
         return "backoff"
     return ""
 
 
 def _breaker_record(token: str, status) -> None:
     """status: 200 healthy | 401/403 revoked | None transient error."""
+    with _BREAKER_LOCK:
+        _breaker_record_locked(token, status)
+
+
+def _breaker_record_locked(token: str, status) -> None:
     st, fp, now = _breaker_load(), _token_fp(token), time.time()
     if status == 200:
         if st:
@@ -257,12 +292,35 @@ def _breaker_record(token: str, status) -> None:
             sys.stderr.write("palivane: capture key rejected (revoked or invalid) — standing "
                              "down; re-run `palivane connect` to re-issue.\n")
         return
-    fails = int(st.get("fails", 0)) + 1
+    prev = st.get("fails")
+    fails = (prev if isinstance(prev, int) and not isinstance(prev, bool) and prev > 0 else 0) + 1
     if fails >= _FAIL_THRESHOLD:
         st.update(fails=0, cooldown_until=now + _COOLDOWN_SECS)
     else:
         st["fails"] = fails
     _breaker_save(st)
+
+
+def should_block(verdict: dict, enforce: bool) -> bool:
+    """Mirror of palivane-hook / the proxy: a confirmed secret/PII leak (force_block) is
+    blocked even in monitor mode. Everything else blocks under enforce — local
+    (PALIVANE_MCP_ENFORCE) or the org's stance from the console (Settings → Enforcement),
+    which the server returns on every verdict."""
+    if verdict.get("force_block"):
+        return True
+    return (enforce or bool(verdict.get("enforce"))) and verdict.get("action") == "block"
+
+
+def note_org_stance(state: dict, verdict) -> None:
+    """Remember the org's live enforce stance from any verdict that carries one. The
+    console can flip it either way; the latest verdict wins."""
+    if isinstance(verdict, dict) and "enforce" in verdict:
+        state["org_enforce"] = bool(verdict.get("enforce"))
+
+
+def enforcing(cfg: dict, state: dict) -> bool:
+    """Enforce locally (PALIVANE_MCP_ENFORCE) or because the org's console says so."""
+    return bool(cfg["enforce"] or state.get("org_enforce"))
 
 
 def scan_mcp(activity: dict, server: str, url: str, token: str,
@@ -294,12 +352,13 @@ def scan_mcp(activity: dict, server: str, url: str, token: str,
         return {"action": "allow", "reason": "scan-failed"}
 
 
-def scan_mcp_batch(items: list[dict], cfg: dict) -> None:
+def scan_mcp_batch(items: list[dict], cfg: dict) -> list:
     """Report a batch of activities to the batch ingest endpoint; fail open (silent).
-    Respects the same circuit breaker so a revoked key stops the batch telemetry too."""
+    Respects the same circuit breaker so a revoked key stops the batch telemetry too.
+    Returns the per-item verdicts ([] on any failure)."""
     token = cfg["token"]
     if _breaker_skip(token):
-        return
+        return []
     try:
         payload = {"items": [{"method": "", "server": "", "tool": "", "args_text": "",
                               "resource": "", "tool_descriptions": [], "transport": "stdio",
@@ -309,12 +368,19 @@ def scan_mcp_batch(items: list[dict], cfg: dict) -> None:
             data=json.dumps(payload).encode(),
             headers={"content-type": "application/json", "User-Agent": "palivane-mcp/1.0", "X-Palivane-Token": token},
         )
-        urllib.request.urlopen(req, timeout=cfg["timeout"]).read()
+        body = urllib.request.urlopen(req, timeout=cfg["timeout"]).read()
         _breaker_record(token, 200)
     except urllib.error.HTTPError as e:
         _breaker_record(token, e.code)
+        return []
     except Exception:
         _breaker_record(token, None)  # monitor telemetry — never affects the pipe
+        return []
+    try:
+        results = json.loads(body or b"{}").get("results")
+    except (ValueError, AttributeError):
+        return []
+    return results if isinstance(results, list) else []
 
 
 class _Reporter:
@@ -322,8 +388,9 @@ class _Reporter:
     when the queue reaches PALIVANE_MCP_BATCH items or PALIVANE_MCP_FLUSH_MS elapses — one
     request for many tool calls instead of one per call. Fully fail-open."""
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, state: dict | None = None):
         self.cfg = cfg
+        self.state = state if state is not None else {}
         self.batch = max(1, int(os.getenv("PALIVANE_MCP_BATCH", "20")))
         self.flush_s = max(0.1, float(os.getenv("PALIVANE_MCP_FLUSH_MS", "2000")) / 1000.0)
         self.q: list[dict] = []
@@ -348,7 +415,10 @@ class _Reporter:
                 items, self.q = self.q, []
                 done = self.stopped and not items
             if items:
-                scan_mcp_batch(items, self.cfg)
+                # The batch verdicts carry the org's enforce stance too: once the console
+                # turns enforcement on, the next calls are scanned inline and blocked.
+                for v in scan_mcp_batch(items, self.cfg):
+                    note_org_stance(self.state, v)
             if done:
                 return
 
@@ -360,10 +430,19 @@ class _Reporter:
 
 
 def _pump_child_to_client(child, cfg: dict, state: dict, lock: threading.Lock,
-                          reporter: "_Reporter | None") -> None:
-    """Forward server→client frames; inspect tools/list results (tool poisoning)."""
+                          reporter: "_Reporter | None",
+                          client_gone: threading.Event | None = None) -> None:
+    """Forward server→client frames; inspect tools/list results (tool poisoning).
+
+    A write to the client can fail (client exited: BrokenPipe). That used to kill this
+    thread, after which nobody read the child's stdout: the child blocked on a full pipe and
+    main() hung in child.wait() forever. Now a dead client closes the child's stdin so it
+    sees EOF, and this loop keeps DRAINING the child's output (discarding it) until EOF."""
     out = sys.stdout.buffer
+    gone = client_gone if client_gone is not None else threading.Event()
     for line in iter(child.stdout.readline, b""):
+        if gone.is_set():
+            continue  # nobody to deliver to — keep draining so the child never blocks
         replaced = None
         try:
             obj = parse_jsonrpc(line)
@@ -373,18 +452,41 @@ def _pump_child_to_client(child, cfg: dict, state: dict, lock: threading.Lock,
                     state["server"] = name
                 activity = extract_response_activity(obj)
                 if activity is not None:
-                    if cfg["enforce"] and cfg["url"] and cfg["token"]:
+                    if enforcing(cfg, state) and cfg["url"] and cfg["token"]:
                         v = scan_mcp(activity, state["server"], cfg["url"],
                                      cfg["token"], cfg["user"], cfg["timeout"])
-                        if v.get("action") == "block":
+                        note_org_stance(state, v)
+                        if should_block(v, cfg["enforce"]):
                             replaced = block_reply(obj.get("id"), v)
                     elif reporter is not None:
                         reporter.enqueue(activity, state["server"])
         except Exception:
             pass  # inspection must never break the pipe
-        with lock:
-            out.write(replaced if replaced is not None else line)
-            out.flush()
+        try:
+            with lock:
+                out.write(replaced if replaced is not None else line)
+                out.flush()
+        except (OSError, ValueError):
+            gone.set()
+            try:
+                child.stdin.close()   # client is gone: let the server see EOF and exit
+            except (OSError, ValueError):
+                pass
+
+
+def _reap(child, grace: float) -> int:
+    """Wait for the child to exit after its stdin closed; terminate, then kill, if it
+    doesn't — an unbounded wait() is how a stuck server used to hang the wrapper."""
+    try:
+        return child.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    child.terminate()
+    try:
+        return child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        return child.wait()
 
 
 def main() -> int:
@@ -406,6 +508,8 @@ def main() -> int:
         "enforce": os.getenv("PALIVANE_MCP_ENFORCE", "").lower() in ("1", "true", "yes"),
         "user": os.getenv("PALIVANE_USER", ""),
         "timeout": float(os.getenv("PALIVANE_MCP_TIMEOUT", "8")),
+        # Seconds the server gets to exit on its own once the client hangs up.
+        "exit_grace": float(os.getenv("PALIVANE_MCP_EXIT_GRACE", "10")),
     }
     state = {"server": name_override or os.getenv("PALIVANE_MCP_SERVER", "") or guess_server_name(cmd)}
 
@@ -415,10 +519,12 @@ def main() -> int:
     fp = server_fingerprint(cmd)
     pin_status = check_pin(fp)
     if cfg["url"] and cfg["token"]:
-        scan_mcp({"method": "initialize", "command": fp["command"],
-                  "binary_sha256": fp["sha256"], "pin_status": pin_status},
-                 state["server"], cfg["url"], cfg["token"], cfg["user"], cfg["timeout"])
-    if pin_status == "mismatch" and cfg["enforce"]:
+        # Inline even in monitor mode: this verdict also tells us the org's enforce stance.
+        note_org_stance(state, scan_mcp(
+            {"method": "initialize", "command": fp["command"],
+             "binary_sha256": fp["sha256"], "pin_status": pin_status},
+            state["server"], cfg["url"], cfg["token"], cfg["user"], cfg["timeout"]))
+    if pin_status == "mismatch" and enforcing(cfg, state):
         sys.exit(f"palivane-mcp: refusing to start '{state['server']}' — its binary no longer "
                  f"matches the pinned hash ({fp['binary']}). Re-vet the server, then re-run "
                  "with PALIVANE_MCP_REPIN=1 to accept the new version.")
@@ -426,10 +532,13 @@ def main() -> int:
     child = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              bufsize=0)  # stderr inherited
     lock = threading.Lock()
-    # Monitor mode batches reports; enforce mode scans inline (needs the verdict now).
-    reporter = _Reporter(cfg) if (not cfg["enforce"] and cfg["url"] and cfg["token"]) else None
+    client_gone = threading.Event()
+    # Monitor mode batches reports; enforce mode scans inline (needs the verdict now). The
+    # reporter stays available even when the org starts out enforcing: the console can
+    # turn enforcement off mid-session.
+    reporter = _Reporter(cfg, state) if (not cfg["enforce"] and cfg["url"] and cfg["token"]) else None
     pump = threading.Thread(target=_pump_child_to_client,
-                            args=(child, cfg, state, lock, reporter), daemon=True)
+                            args=(child, cfg, state, lock, reporter, client_gone), daemon=True)
     pump.start()
 
     out = sys.stdout.buffer
@@ -441,10 +550,12 @@ def main() -> int:
                 if obj is not None:
                     activity = extract_request_activity(obj)
                     if activity is not None:
-                        if cfg["enforce"] and cfg["url"] and cfg["token"] and obj.get("id") is not None:
+                        if enforcing(cfg, state) and cfg["url"] and cfg["token"] \
+                                and obj.get("id") is not None:
                             v = scan_mcp(activity, state["server"], cfg["url"],
                                          cfg["token"], cfg["user"], cfg["timeout"])
-                            if v.get("action") == "block":
+                            note_org_stance(state, v)
+                            if should_block(v, cfg["enforce"]):
                                 blocked = block_reply(obj.get("id"), v)
                         elif reporter is not None:
                             reporter.enqueue(activity, state["server"])
@@ -455,16 +566,18 @@ def main() -> int:
                     out.write(blocked)
                     out.flush()
                 continue  # not forwarded to the server
+            if client_gone.is_set():
+                break  # the client hung up on stdout; the pump already closed child stdin
             child.stdin.write(line)
             child.stdin.flush()
-    except (BrokenPipeError, OSError):
+    except (OSError, ValueError):   # BrokenPipe, or child stdin closed by the pump
         pass
     finally:
         try:
             child.stdin.close()
-        except OSError:
+        except (OSError, ValueError):
             pass
-        rc = child.wait()
+        rc = _reap(child, cfg["exit_grace"])
         # The pump is a daemon thread: exiting right after child.wait() raced it and could
         # drop the tail of the server→client stream (frames the child wrote just before
         # exit, still in its stdout pipe). After child exit the pipe hits EOF so the pump
@@ -474,6 +587,14 @@ def main() -> int:
         pump.join(timeout=cfg["timeout"] + 1)
         if reporter is not None:
             reporter.close()  # flush any queued reports
+        if client_gone.is_set():
+            # Point fd 1 at /dev/null so the interpreter's exit-time flush of the dead
+            # stdout doesn't print a BrokenPipe traceback and exit 120.
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, sys.stdout.fileno())
+            except (OSError, ValueError):
+                pass
     return rc
 
 

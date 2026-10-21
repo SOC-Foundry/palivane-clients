@@ -216,8 +216,10 @@ palivane_git_scan.py [--staged | --range A..B | <files…>] [--strict] [--fail-c
 | `--staged` | Scan staged changes (default; pre-commit). |
 | `--range A..B` | Scan files changed in a diff range (CI). |
 | `--strict` | Exit non-zero on **warn** findings too, not just blocks. |
-| `--fail-closed` | Treat a backend/network error as a failure (recommended for CI). |
+| `--fail-closed` | Treat a backend/network error, or a file that could not be fully scanned, as a failure (recommended for CI). |
 | `--record` | Persist findings to the Palivane console. |
 
-Exit `0` = clean/allowed, `1` = blocking finding (or any finding with `--strict`). Binary
-and >1 MB files are skipped.
+Exit `0` = clean/allowed, `1` = blocking finding (or any finding with `--strict`). Added,
+copied, modified and renamed files are scanned. Binary files are skipped; non-UTF-8 text is
+scanned with undecodable bytes replaced; a file over 1 MB is scanned up to its first 1 MB and
+a warning is printed. With `--fail-closed`, an unreadable or truncated file fails the run.

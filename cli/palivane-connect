@@ -139,14 +139,148 @@ def _in_repo_checkout() -> bool:
     return os.path.isdir(os.path.join(os.path.dirname(here), ".git"))
 
 
-def _download_script(url: str, dest: str) -> None:
-    """Fetch one script and write it atomically (tmp + rename) so a partial download never
-    leaves a half-written, executable plane on disk."""
-    req = urllib.request.Request(url, headers={"User-Agent": "palivane-connect/1.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        data = r.read()
+# >>> palivane release-verify (keep identical in every client script that carries it;
+# test_release_verify.py checks they match and that the key is release_signing's)
+# Everything these scripts download after install is checked the way install.sh checks the
+# install itself: /cli/manifest.sig (ECDSA P-256 / SHA-256 over the canonical {name: sha256}
+# map) must verify under the PINNED release key, then each file's sha256 must match the
+# manifest. Anything else is refused and the installed copy is kept. TLS alone proves who
+# served the bytes, not that they are a release the vendor signed.
+_VENDOR_RELEASE_PUBKEY = """-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtwIOdXmgRU12/7oDPzpkLqrud1DN
+s2ngn344uoGU+MF5HUF7gFG2emj+UG3aPvm5Jbh+ggQdxs9R7ZZ1PwoP9Q==
+-----END PUBLIC KEY-----
+"""
+_RELEASE_PUBKEY_PATH = "~/.palivane/release-pubkey.pem"      # written by install.sh
+_RELEASE_REQUIRE_SIG_PATH = "~/.palivane/release-require-sig"  # "0" = deployment unsigned
+
+
+def _release_pubkey() -> str:
+    """The pinned key: PALIVANE_RELEASE_PUBKEY, else the key install.sh persisted from the
+    deployment it installed from (a self-host's own key), else the vendor key above."""
+    import os
+    pem = (os.environ.get("PALIVANE_RELEASE_PUBKEY") or "").strip()
+    if pem:
+        return pem
+    try:
+        with open(os.path.expanduser(_RELEASE_PUBKEY_PATH)) as f:
+            pem = f.read().strip()
+        if "BEGIN PUBLIC KEY" in pem:
+            return pem
+    except OSError:
+        pass
+    return _VENDOR_RELEASE_PUBKEY.strip()
+
+
+def _unsigned_release_allowed() -> bool:
+    """An unsigned manifest is accepted only when the install recorded that its deployment
+    does not sign (install.sh REQUIRE_SIG=0/skip), or PALIVANE_RELEASE_REQUIRE_SIG=0 says so.
+    No record means a signature is required: fail closed."""
+    import os
+    v = (os.environ.get("PALIVANE_RELEASE_REQUIRE_SIG") or "").strip()
+    if not v:
+        try:
+            with open(os.path.expanduser(_RELEASE_REQUIRE_SIG_PATH)) as f:
+                v = f.read().strip()
+        except OSError:
+            v = ""
+    return v in ("0", "skip")
+
+
+def _verify_release_sig(message: bytes, sig_b64: bytes, pubkey_pem: str):
+    """True = verified, False = rejected, None = nothing on this machine can verify (no
+    `cryptography`, no openssl). Same check as install.sh's `openssl dgst -sha256 -verify`."""
+    import base64
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    try:
+        sig = base64.b64decode(sig_b64.strip(), validate=True)
+    except (ValueError, TypeError):
+        return False
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+    except ImportError:
+        pass
+    else:
+        try:
+            load_pem_public_key(pubkey_pem.encode()).verify(
+                sig, message, ec.ECDSA(hashes.SHA256()))
+            return True
+        except (InvalidSignature, ValueError, TypeError):
+            return False
+    openssl = shutil.which("openssl")
+    if not openssl:
+        return None
+    d = tempfile.mkdtemp(prefix="palivane-verify-")      # 0700: private to this user
+    try:
+        paths = []
+        for name, blob in (("pub.pem", pubkey_pem.encode()), ("sig.der", sig), ("msg", message)):
+            p = os.path.join(d, name)
+            with open(p, "wb") as f:
+                f.write(blob)
+            paths.append(p)
+        r = subprocess.run([openssl, "dgst", "-sha256", "-verify", paths[0],
+                            "-signature", paths[1], paths[2]],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _verified_manifest(fetch):
+    """The release manifest, or None unless it is authentic. `fetch(name)` returns the bytes
+    of <base>/cli/<name>, or None on any failure (a 404 for manifest.sig included)."""
+    import json
+    raw = fetch("manifest.json")
+    if raw is None:
+        return None
+    try:
+        manifest = json.loads(raw)
+        hashes = {str(k): str(v["sha256"]) for k, v in manifest["files"].items()}
+    except Exception:                                           # noqa: BLE001
+        return None
+    # Must match release_signing.canonical_files_digest byte for byte.
+    message = json.dumps(hashes, separators=(",", ":"), sort_keys=True).encode()
+    sig = fetch("manifest.sig")
+    ok = _verify_release_sig(message, sig, _release_pubkey()) if sig else None
+    if ok is False:
+        return None
+    if ok is None and not _unsigned_release_allowed():
+        return None
+    return manifest
+
+
+def _matches_manifest(manifest: dict, name: str, blob: bytes) -> bool:
+    import hashlib
+    want = ((manifest.get("files") or {}).get(name) or {}).get("sha256", "")
+    return bool(want) and hashlib.sha256(blob).hexdigest() == want
+# <<< palivane release-verify
+
+
+def _http_get(url: str) -> bytes | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "palivane-connect/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.read() if 200 <= r.status < 300 else None
+    except Exception:
+        return None
+
+
+def _download_script(base: str, name: str, dest: str, manifest: dict) -> None:
+    """Fetch one script, check it against the verified release manifest, and write it
+    atomically (tmp + rename) so a partial or tampered download never lands on disk."""
+    data = _http_get(f"{base}/cli/{name}")
     if not data:
-        raise ValueError("empty script")
+        raise ValueError("download failed")
+    if not _matches_manifest(manifest, name, data):
+        raise ValueError("sha256 does not match the signed manifest")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + ".tmp"
     with open(tmp, "wb") as f:
@@ -164,10 +298,14 @@ def _refresh_planes(console: str) -> list[str]:
     if _in_repo_checkout():
         return ["skipped plane self-update (running from a source checkout)"]
     base = console.rstrip("/")
+    manifest = _verified_manifest(lambda name: _http_get(f"{base}/cli/{name}"))
+    if manifest is None:
+        return [f"skipped plane self-update: the release manifest from {base} did not "
+                "verify against the pinned signing key (kept existing scripts)"]
     updated, failed = [], []
     for name in _PLANE_SCRIPTS:
         try:
-            _download_script(f"{base}/cli/{name}", os.path.join(_MANAGED_BIN, name))
+            _download_script(base, name, os.path.join(_MANAGED_BIN, name), manifest)
             updated.append(name)
         except Exception:
             failed.append(name)
@@ -176,7 +314,7 @@ def _refresh_planes(console: str) -> list[str]:
     addon = os.path.expanduser("~/.palivane/palivane_addon.py")
     if os.path.exists(addon):
         try:
-            _download_script(f"{base}/cli/palivane_addon.py", addon)
+            _download_script(base, "palivane_addon.py", addon, manifest)
             updated.append("palivane_addon.py")
         except Exception:
             failed.append("palivane_addon.py")
@@ -186,6 +324,19 @@ def _refresh_planes(console: str) -> list[str]:
     if failed:
         msgs.append(f"could not update {', '.join(failed)} (kept existing) — see {base}/cli/")
     return msgs
+
+
+def _write_private_json(path: str, data) -> None:
+    """Write a settings/creds file that holds the capture token, readable by this user only.
+    open('w') + chmod left a window where the token sat in a 0644 file (default umask);
+    O_CREAT with 0600 creates it private, and fchmod tightens a file that already existed."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):   # no fchmod on Windows; ACLs govern there
+            pass
+        json.dump(data, f, indent=2)
 
 
 def _merge_hook(data: dict, event: str, command: str, timeout: int | None = None) -> bool:
@@ -209,7 +360,7 @@ def _write_claude_code(token: str, backend: str, user: str,
                        route_gateway: bool = False,
                        enforce: bool | None = None) -> tuple[str, list[str]]:
     path = os.path.expanduser("~/.claude/settings.json")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)   # holds the token
     data = {}
     if os.path.exists(path):
         try:
@@ -263,9 +414,7 @@ def _write_claude_code(token: str, backend: str, user: str,
     else:
         installed.append("palivane-posture not found — skipped posture hook")
 
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(path, 0o600)
+    _write_private_json(path, data)
     return path, installed
 
 
@@ -303,9 +452,7 @@ def _write_cursor(token: str, backend: str, user: str,
     creds = {"url": backend.rstrip("/"), "token": token, "user": user}
     if enforce is not None:   # org stance from the console; absent on older consoles
         creds["enforce"] = enforce
-    with open(wj, "w") as f:
-        json.dump(creds, f, indent=2)
-    os.chmod(wj, 0o600)
+    _write_private_json(wj, creds)
 
     hpath = os.path.join(cdir, "hooks.json")
     data = {}
@@ -317,9 +464,7 @@ def _write_cursor(token: str, backend: str, user: str,
     if not isinstance(data.get("version"), int):
         data["version"] = 1
     added = sum(1 for ev in _CURSOR_EVENTS if _merge_cursor_hook(data, ev, hook))
-    with open(hpath, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(hpath, 0o600)
+    _write_private_json(hpath, data)
     msg = f"Cursor hooks installed ({added} event{'s' if added != 1 else ''})" if added \
         else "Cursor hooks already present"
     return hpath, [msg]
@@ -364,9 +509,7 @@ def _write_codex(token: str, backend: str, user: str,
     creds = {"url": backend.rstrip("/"), "token": token, "user": user}
     if enforce is not None:   # org stance from the console; absent on older consoles
         creds["enforce"] = enforce
-    with open(wj, "w") as f:
-        json.dump(creds, f, indent=2)
-    os.chmod(wj, 0o600)
+    _write_private_json(wj, creds)
 
     hpath = os.path.join(cdir, "hooks.json")
     data = {}
@@ -376,9 +519,7 @@ def _write_codex(token: str, backend: str, user: str,
         except (ValueError, OSError):
             data = {}
     added = sum(1 for ev, m in _CODEX_EVENTS if _merge_codex_hook(data, ev, m, hook))
-    with open(hpath, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(hpath, 0o600)
+    _write_private_json(hpath, data)
     if added:
         msgs = [f"Codex CLI hooks installed ({added} event{'s' if added != 1 else ''})",
                 "note: Codex asks you to trust the hook once — run /hooks inside Codex"]
@@ -419,9 +560,7 @@ def _write_copilot(token: str, backend: str, user: str,
     creds = {"url": backend.rstrip("/"), "token": token, "user": user}
     if enforce is not None:   # org stance from the console; absent on older consoles
         creds["enforce"] = enforce
-    with open(wj, "w") as f:
-        json.dump(creds, f, indent=2)
-    os.chmod(wj, 0o600)
+    _write_private_json(wj, creds)
 
     hpath = os.path.join(cdir, "hooks", "palivane.json")
     desired = copilot_hook_config(hook)
@@ -434,9 +573,7 @@ def _write_copilot(token: str, backend: str, user: str,
     if current == desired:
         return hpath, ["Copilot hooks already present"]
     os.makedirs(os.path.dirname(hpath), exist_ok=True)
-    with open(hpath, "w") as f:
-        json.dump(desired, f, indent=2)
-    os.chmod(hpath, 0o600)
+    _write_private_json(hpath, desired)
     return hpath, [f"Copilot hooks installed ({len(_COPILOT_EVENTS)} events; "
                    "tool calls deniable, prompts observe-only)"]
 
@@ -481,9 +618,7 @@ def _write_gemini(token: str, backend: str, user: str,
     creds = {"url": backend.rstrip("/"), "token": token, "user": user}
     if enforce is not None:   # org stance from the console; absent on older consoles
         creds["enforce"] = enforce
-    with open(wj, "w") as f:
-        json.dump(creds, f, indent=2)
-    os.chmod(wj, 0o600)
+    _write_private_json(wj, creds)
 
     spath = os.path.join(gdir, "settings.json")
     data = {}
@@ -493,9 +628,7 @@ def _write_gemini(token: str, backend: str, user: str,
         except (ValueError, OSError):
             data = {}
     added = sum(1 for ev, m in _GEMINI_EVENTS if _merge_gemini_hook(data, ev, m, hook))
-    with open(spath, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(spath, 0o600)
+    _write_private_json(spath, data)
     msg = f"Gemini CLI hooks installed ({added} event{'s' if added != 1 else ''})" if added \
         else "Gemini CLI hooks already present"
     return spath, [msg]
@@ -578,8 +711,7 @@ def _uninstall() -> list[str]:
                 env.pop(k, None)
             if not env:
                 data.pop("env", None)
-        with open(claude, "w") as f:
-            json.dump(data, f, indent=2)
+        _write_private_json(claude, data)
         out.append(f"Claude Code: removed {n} hook(s) + Palivane env — {claude}")
     for label, hrel, wrel in (("Cursor", "~/.cursor/hooks.json", "~/.cursor/palivane.json"),
                               ("Gemini CLI", "~/.gemini/settings.json", "~/.gemini/palivane.json"),
@@ -591,8 +723,7 @@ def _uninstall() -> list[str]:
             except (ValueError, OSError):
                 d = {}
             n = _scrub_hook_entries(d["hooks"]) if isinstance(d.get("hooks"), dict) else 0
-            with open(hpath, "w") as f:
-                json.dump(d, f, indent=2)
+            _write_private_json(hpath, d)
             out.append(f"{label}: removed {n} hook(s) — {hpath}")
         wpath = os.path.expanduser(wrel)
         if os.path.exists(wpath):

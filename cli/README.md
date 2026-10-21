@@ -82,8 +82,13 @@ enrollment token — so a device self-heals within one apiKeyHelper TTL, no admi
 ```bash
 palivane-reenroll                    # print a live device key (apiKeyHelper mode)
 palivane-reenroll --refresh          # force a fresh enrollment, ignoring the cache
-palivane-reenroll --setup URL TOKEN  # write ~/.palivane/enroll.json (installer helper)
+PALIVANE_ENROLL_TOKEN=… palivane-reenroll --setup URL   # write ~/.palivane/enroll.json (installer helper)
+palivane-reenroll --setup URL - < token-file           # ...or read the token from stdin
 ```
+
+Pass the enrollment token through `PALIVANE_ENROLL_TOKEN` or stdin, not as an argument:
+`--setup URL TOKEN` still works for compatibility, but an argument is visible to every user
+in `ps` and lands in shell history.
 
 Config (first found wins): `$PALIVANE_URL`/`$PALIVANE_ENROLL_TOKEN` env, else
 `~/.palivane/enroll.json`, else `/etc/palivane/enroll.json` (system-wide, written by the
@@ -397,7 +402,17 @@ What *does* live on disk is the plumbing: these hook scripts, the proxy addon, a
   *before* swapping, and replaces atomically — so a killed process can never leave a
   half-written hook, and a mismatch aborts that file;
 - updates land at session **start**, never mid-invocation, and only over files that already
-  exist and are writable (MDM-managed copies under `/usr/local/bin` stay the MDM's job).
+  exist and are writable (MDM-managed copies under `/usr/local/bin` stay the MDM's job);
+- the manifest itself is trusted only once **`/cli/manifest.sig`** (ECDSA P-256) verifies
+  under the pinned release key — the same check `install.sh` makes. That applies to every
+  post-install download: this self-update, `palivane-connect`'s plane refresh,
+  `palivane-desktop`'s addon fetch, and the scanners' fallback fetch of `palivane_detect.py`
+  (loaded from memory, never from a shared temp dir). The pinned key is the one `install.sh`
+  wrote to `~/.palivane/release-pubkey.pem` (else the vendor key baked into each script;
+  `PALIVANE_RELEASE_PUBKEY` overrides). An unsigned manifest is refused unless the install
+  recorded an unsigned deployment (`~/.palivane/release-require-sig` = `0`) or
+  `PALIVANE_RELEASE_REQUIRE_SIG=0` is set. Verification uses Python's `cryptography` when
+  present, else the `openssl` CLI.
 
 Every client also reports its build in its `User-Agent` (e.g. `palivane-hook/1.1.0`), which
 the console's **Fleet** page shows per sensor and flags when it lags the deployment.
