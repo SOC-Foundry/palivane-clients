@@ -70,7 +70,20 @@ async function resolveConfig() {
 
 // --- sign-in (loopback + /extension-connect, same flow as palivane-connect) ---------------
 
-function connectFlow(consoleUrl) {
+// Stable per-install device id, relayed to /extension-connect so the backend scopes the capture
+// key to this install ("capture:vscode-<uuid>"). Without it the backend falls back to the one
+// per-user "browser-extension" key and rotates it, revoking every other machine's key.
+async function deviceId() {
+  let id = ctx.globalState.get("palivane.deviceId");
+  if (!id) {
+    id = "vscode-" + crypto.randomUUID();
+    await ctx.globalState.update("palivane.deviceId", id);
+  }
+  return id;
+}
+
+async function connectFlow(consoleUrl) {
+  const device = await deviceId();
   return new Promise((resolve, reject) => {
     const state = crypto.randomBytes(9).toString("base64url");
     const server = http.createServer((req, res) => {
@@ -88,7 +101,8 @@ function connectFlow(consoleUrl) {
       const port = server.address().port;
       const redirect = encodeURIComponent(`http://127.0.0.1:${port}/cb`);
       vscode.env.openExternal(vscode.Uri.parse(
-        `${consoleUrl}/extension-connect?redirect_uri=${redirect}&state=${state}`));
+        `${consoleUrl}/extension-connect?redirect_uri=${redirect}&state=${state}` +
+        `&device=${encodeURIComponent(device)}`));
     });
     setTimeout(() => { try { server.close(); } catch {} reject(new Error("sign-in timed out")); },
                5 * 60 * 1000);

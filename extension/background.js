@@ -16,8 +16,22 @@ const DEFAULTS = {
   enforce: true, // when false, "block" verdicts are downgraded to "warn"
 };
 
+// The per-user capture key is a credential for this browser: it lives in chrome.storage.local,
+// never sync (which copies it to every browser signed in to the same Google account and
+// through Google's servers). Older versions stored it in sync, move it over once.
+async function localToken() {
+  const { token: legacy } = await chrome.storage.sync.get({ token: "" });
+  if (legacy) {
+    const { token: have } = await chrome.storage.local.get({ token: "" });
+    if (!have) await chrome.storage.local.set({ token: legacy });
+    await chrome.storage.sync.remove("token");
+  }
+  return (await chrome.storage.local.get({ token: "" })).token;
+}
+
 async function config() {
   const sync = await chrome.storage.sync.get(DEFAULTS);
+  sync.token = await localToken();
   // Enterprise policy (chrome.storage.managed) wins over user settings, so a
   // force-installed deployment is configured centrally and users can't repoint it.
   let managed = {};
@@ -81,8 +95,8 @@ async function signIn() {
   if (frag.get("state") !== state) throw new Error("state mismatch");
   const token = frag.get("token");
   if (!token) throw new Error("no token returned");
+  await chrome.storage.local.set({ token });
   await chrome.storage.sync.set({
-    token,
     backendUrl: frag.get("backend") || consoleUrl,
     user: frag.get("user") || "",
   });
@@ -132,7 +146,16 @@ function skipped(label, reason) {
   return { action: "allow", reason, skipped: label };
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "ui") {
+    // A block/warn/notice raised inside an iframe: show it in the tab's top frame, where it
+    // is fully visible. ok:false tells the frame to draw it itself.
+    const tabId = sender && sender.tab && sender.tab.id;
+    if (tabId == null || !sender.frameId) { sendResponse({ ok: false }); return; }
+    chrome.tabs.sendMessage(tabId, { type: "palivane-ui", kind: msg.kind, data: msg.data }, { frameId: 0 })
+      .then((r) => sendResponse({ ok: !!(r && r.ok) }), () => sendResponse({ ok: false }));
+    return true;
+  }
   if (msg && msg.type === "status") {
     (async () => {
       const c = await config();

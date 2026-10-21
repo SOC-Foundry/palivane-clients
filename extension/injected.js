@@ -1,10 +1,62 @@
 // Runs in the PAGE context. Wraps window.fetch so we can inspect a prompt *before*
 // it's sent to the AI tool, ask Palivane for a verdict, and block/warn inline.
-// Communicates with the content script (isolated world) via window.postMessage.
+// Communicates with the content script (isolated world) over a private DOM-event channel,
+// not window messages: any page script can read and forge those.
 (() => {
   const PENDING = new Map();
   const LATE = new Set();   // scans we stopped waiting for; their answer may still arrive
-  let SEQ = 0;
+
+  // --- Private channel to content.js -------------------------------------------------------
+  // This runs at document_start, before any page script, so everything the channel relies on
+  // is captured here: a page that later patches dispatchEvent, CustomEvent, JSON or crypto
+  // can neither read our traffic nor forge it. content.js hands over a random secret during a
+  // handshake that completes synchronously before the page can listen; events are then named
+  // after the secret, so a page script cannot listen for them or dispatch them.
+  const doc = document;
+  const dispatch = EventTarget.prototype.dispatchEvent;
+  const listen = EventTarget.prototype.addEventListener;
+  const unlisten = EventTarget.prototype.removeEventListener;
+  const CE = CustomEvent;
+  const detailOf = Object.getOwnPropertyDescriptor(CustomEvent.prototype, "detail").get;
+  const toJson = JSON.stringify, fromJson = JSON.parse;
+  // randomUUID exists only in secure contexts; getRandomValues everywhere.
+  const getRandom = crypto.getRandomValues.bind(crypto);
+  const newId = crypto.randomUUID ? crypto.randomUUID.bind(crypto)
+    : () => Array.from(getRandom(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  let CHANNEL = "";
+
+  // Send to content.js. False when there is no channel (no content script in this frame).
+  function post(msg) {
+    if (!CHANNEL) return false;
+    try { dispatch.call(doc, new CE(CHANNEL + ":up", { detail: toJson(msg) })); return true; }
+    catch (_) { return false; }
+  }
+
+  // Answers from content.js. Only these can resolve a scan: nothing the page posts can.
+  function onDown(e) {
+    let d;
+    try { d = fromJson(detailOf.call(e)); } catch (_) { return; }
+    if (!d || d.kind !== "verdict") return;
+    const resolve = PENDING.get(d.id);
+    if (resolve) { PENDING.delete(d.id); resolve(d.verdict || { action: "allow" }); return; }
+    // The answer came after we stopped waiting and the message had already gone out. If it
+    // would have stopped that message, say so instead of leaving the person to assume it was
+    // checked.
+    if (LATE.delete(d.id) && stop(d.verdict)) post({ kind: "late", verdict: d.verdict });
+  }
+
+  // Handshake, whichever of the two scripts loads first: content.js offers the secret on
+  // load, and answers our hello once if it loaded before us. We take the first secret only.
+  function onKey(e) {
+    const k = detailOf.call(e);
+    if (CHANNEL || typeof k !== "string" || !k) return;
+    CHANNEL = "palivane:" + k;
+    unlisten.call(doc, "palivane:key", onKey);
+    listen.call(doc, CHANNEL + ":down", onDown);
+    dispatch.call(doc, new CE("palivane:ack"));
+  }
+  listen.call(doc, "palivane:key", onKey);
+  dispatch.call(doc, new CE("palivane:hello"));
 
   // How long a message waits for Palivane's answer before it goes out unchecked.
   const SCAN_TIMEOUT_MS = 4000;
@@ -98,16 +150,18 @@
 
   function scan(content, destination, endpoint) {
     return new Promise((resolve) => {
-      const id = ++SEQ;
+      const id = newId();
       PENDING.set(id, resolve);
-      window.postMessage({ __palivane: true, kind: "scan", id, content, destination, endpoint }, "*");
+      if (!post({ kind: "scan", id, content, destination, endpoint })) {
+        PENDING.delete(id); resolve({ action: "allow" }); return;   // no content script here
+      }
       // Fail OPEN: never break the user's tool if Palivane is slow/unreachable. But not in
       // silence: a message that went out unchecked is a gap the person has to be able to see.
       setTimeout(() => {
         if (PENDING.has(id)) {
           PENDING.delete(id);
           LATE.add(id);
-          window.postMessage({ __palivane: true, kind: "skipped", reason: "no answer in time" }, "*");
+          post({ kind: "skipped", reason: "no answer in time" });
           resolve({ action: "allow" });
         }
       }, SCAN_TIMEOUT_MS);
@@ -126,24 +180,10 @@
     return verdicts.find(stop) || verdicts.find((v) => v.action === "warn") || { action: "allow" };
   }
 
-  window.addEventListener("message", (e) => {
-    if (e.source !== window) return;   // only our content-script relay, same window
-    const d = e.data;
-    if (!d || !d.__palivane || d.kind !== "verdict") return;
-    const resolve = PENDING.get(d.id);
-    if (resolve) { PENDING.delete(d.id); resolve(d.verdict || { action: "allow" }); return; }
-    // The answer came after we stopped waiting and the message had already gone out. If it
-    // would have stopped that message, say so instead of leaving the person to assume it was
-    // checked.
-    if (LATE.delete(d.id) && stop(d.verdict)) {
-      window.postMessage({ __palivane: true, kind: "late", verdict: d.verdict }, "*");
-    }
-  });
-
   // A send we could see but not read (a stream, or something too big to be a prompt). Reported
   // so the console can show the blind spot; the message itself still goes out.
   function reportBlind() {
-    window.postMessage({ __palivane: true, kind: "blind", destination: location.origin }, "*");
+    post({ kind: "blind", destination: location.origin });
   }
 
   const DEBUG = false; // flip to true to log captured requests/verdicts to the page console (per-site tuning)
@@ -182,11 +222,11 @@
                 if (DEBUG) console.log("[Palivane] ws verdict", verdict.action, verdict.severity, verdict.risk_score);
                 if (stop(verdict)) {
                   // Drop the frame, the prompt never leaves, and show the block UI.
-                  window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
+                  post({ kind: "blocked", verdict });
                   return;
                 }
                 if (verdict.action === "warn") {
-                  window.postMessage({ __palivane: true, kind: "warn", verdict }, "*");
+                  post({ kind: "warn", verdict });
                 }
                 origWsSend(data);   // allowed → send the frame for real
               });
@@ -260,12 +300,12 @@
           const verdict = await scanAll(prompt, location.origin, endpointOf(url));
           if (DEBUG) console.log("[Palivane] verdict", verdict.action, verdict.severity, verdict.risk_score);
           if (stop(verdict)) {
-            window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
+            post({ kind: "blocked", verdict });
             return new Response(JSON.stringify({ error: "Blocked by Palivane: sensitive data detected." }),
               { status: 451, headers: { "content-type": "application/json" } });
           }
           if (verdict.action === "warn") {
-            window.postMessage({ __palivane: true, kind: "warn", verdict }, "*");
+            post({ kind: "warn", verdict });
           }
         }
       }
@@ -299,7 +339,7 @@
           const verdict = await scanAll(prompt, location.origin, endpointOf(info.url));
           if (DEBUG) console.log("[Palivane] xhr verdict", verdict.action, verdict.severity, verdict.risk_score);
           if (stop(verdict)) {
-            window.postMessage({ __palivane: true, kind: "blocked", verdict }, "*");
+            post({ kind: "blocked", verdict });
             // Don't send. Signal a network failure so the app's error path runs;
             // the sensitive body never left the browser.
             try {
@@ -312,7 +352,7 @@
             return;
           }
           if (verdict.action === "warn") {
-            window.postMessage({ __palivane: true, kind: "warn", verdict }, "*");
+            post({ kind: "warn", verdict });
           }
           origSend.apply(xhr, args);   // allowed → send for real
         }).catch(() => { try { origSend.apply(xhr, args); } catch (_) { /* fail open */ } });

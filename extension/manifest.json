@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Palivane, Shadow-AI Guard",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Inspects prompts sent to external AI tools for secrets, PII, and proprietary data, and warns or blocks before they leave.",
   "permissions": [
     "storage",
@@ -129,7 +129,8 @@
       "js": [
         "content.js"
       ],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "all_frames": true
     }
   ]
 }

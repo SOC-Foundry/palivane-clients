@@ -3,6 +3,9 @@ const $ = (id) => document.getElementById(id);
 
 async function load() {
   const c = Object.assign({}, DEFAULTS, await chrome.storage.sync.get(DEFAULTS));
+  // The token lives in local storage (background.js moves a legacy synced one over).
+  const { token: legacy } = await chrome.storage.sync.get({ token: "" });
+  c.token = (await chrome.storage.local.get({ token: "" })).token || legacy;
   let managed = {};
   try { managed = (await chrome.storage.managed.get(null)) || {}; } catch (_) {}
   // Managed (policy-set) values win and are shown read-only.
@@ -26,9 +29,11 @@ async function load() {
 }
 
 async function save() {
+  // The token is a credential for this browser only: local, never synced.
+  await chrome.storage.local.set({ token: $("token").value.trim() });
+  await chrome.storage.sync.remove("token");
   await chrome.storage.sync.set({
     backendUrl: $("backendUrl").value.trim() || DEFAULTS.backendUrl,
-    token: $("token").value.trim(),
     user: $("user").value.trim(),
     enforce: $("enforce").checked,
   });
