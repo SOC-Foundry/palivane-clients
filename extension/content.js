@@ -3,13 +3,38 @@
 // and renders the warn/block UI. injected.js no longer needs to be injected via a
 // <script> tag, that was blocked by strict-CSP sites like Microsoft Copilot.
 
-window.addEventListener("message", async (e) => {
-  // Only accept messages from the interceptor in THIS window (injected.js runs in the
-  // MAIN world of the same window). Rejecting other sources/origins stops a hostile page
-  // script from spoofing verdicts or summoning a fake Palivane block/warn UI (phishing).
-  if (e.source !== window) return;
-  const d = e.data;
-  if (!d || !d.__palivane) return;
+// Private channel to injected.js. window.postMessage is readable and forgeable by every page
+// script (`e.source === window` holds for them too), so a page could summon a fake block modal,
+// file findings in the user's name, or answer a pending scan with "allow". Instead both scripts
+// talk over DOM events named after a random secret that only they know. The secret is handed
+// over at document_start, before any page script exists to listen: we offer it on load (when
+// injected.js loaded first), and answer injected.js's hello once (when we loaded first).
+// injected.js acknowledges, after which neither handshake event is answered again.
+const SECRET = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+                          (b) => b.toString(16).padStart(2, "0")).join("");
+const CHANNEL = "palivane:" + SECRET;
+let linked = false;
+const offerKey = () => document.dispatchEvent(new CustomEvent("palivane:key", { detail: SECRET }));
+document.addEventListener("palivane:ack", function ack() {
+  linked = true;
+  document.removeEventListener("palivane:ack", ack);
+});
+function onHello() {
+  document.removeEventListener("palivane:hello", onHello);
+  if (!linked) offerKey();
+}
+document.addEventListener("palivane:hello", onHello);
+offerKey();
+if (linked) document.removeEventListener("palivane:hello", onHello);
+
+function reply(msg) {
+  document.dispatchEvent(new CustomEvent(CHANNEL + ":down", { detail: JSON.stringify(msg) }));
+}
+
+document.addEventListener(CHANNEL + ":up", async (e) => {
+  let d;
+  try { d = JSON.parse(e.detail); } catch (_) { return; }
+  if (!d) return;
 
   if (d.kind === "scan") {
     let verdict = { action: "allow" };
@@ -23,18 +48,43 @@ window.addEventListener("message", async (e) => {
       verdict = { action: "allow", skipped: "reload this tab" };
     }
     if (verdict && verdict.skipped) noteSkipped(verdict.skipped);
-    window.postMessage({ __palivane: true, kind: "verdict", id: d.id, verdict: verdict || { action: "allow" } }, "*");
-  } else if (d.kind === "blocked") {
-    showBlockModal(d.verdict);
-  } else if (d.kind === "warn") {
-    showWarnBanner(d.verdict);
+    reply({ kind: "verdict", id: d.id, verdict: verdict || { action: "allow" } });
+  } else if (d.kind === "blocked" || d.kind === "warn" || d.kind === "late") {
+    showUi(d.kind, d.verdict);
   } else if (d.kind === "skipped") {
     noteSkipped(d.reason);
-  } else if (d.kind === "late") {
-    showLateNotice(d.verdict);
   } else if (d.kind === "blind") {
     try { chrome.runtime.sendMessage({ type: "blind", destination: d.destination }); } catch (_) { /* fail open */ }
   }
+});
+
+// --- Where the UI goes ---
+// This script runs in every frame (a send from an iframe is checked like any other), but a
+// modal inside a small embedded frame can be clipped or invisible. A subframe asks the
+// background worker to show it in the tab's top frame, and draws it itself only when that
+// fails (the top frame is a site this extension does not run on, say).
+function renderUi(kind, data) {
+  if (kind === "blocked") showBlockModal(data);
+  else if (kind === "warn") showWarnBanner(data);
+  else if (kind === "late") showLateNotice(data);
+  else if (kind === "skipped") showSkippedNotice(data);
+}
+
+async function showUi(kind, data) {
+  if (window !== window.top) {
+    try {
+      const r = await chrome.runtime.sendMessage({ type: "ui", kind, data });
+      if (r && r.ok) return;
+    } catch (_) { /* extension unreachable: draw it here */ }
+  }
+  renderUi(kind, data);
+}
+
+// The top frame's half of the relay. Only the background worker can send this.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (window !== window.top || !msg || msg.type !== "palivane-ui") return;
+  renderUi(msg.kind, msg.data);
+  sendResponse({ ok: true });
 });
 
 const CATEGORY_LABELS = {
@@ -64,7 +114,8 @@ function dataSignals(verdict) {
 function reasonText(verdict) {
   const labels = dataSignals(verdict)
     .filter((s) => s.category !== "unsanctioned_ai")
-    .map((s) => (CATEGORY_LABELS[s.category] || s.category).toLowerCase());
+    .map((s) => escapeHtml(CATEGORY_LABELS[s.category] || s.category).toLowerCase());
+  // Callers interpolate this into innerHTML: an unknown category is free text, escaped above.
   if (!labels.length) return "sensitive content";
   if (labels.length === 1) return labels[0];
   return labels.slice(0, -1).join(", ") + " and " + labels[labels.length - 1];
@@ -302,6 +353,10 @@ function noteSkipped(reason) {
   const now = Date.now();
   if (now - lastSkipNotice < 5 * 60 * 1000) return;
   lastSkipNotice = now;
+  showUi("skipped", String(reason || ""));
+}
+
+function showSkippedNotice(reason) {
   showNotice(`<strong>Palivane could not check that message</strong> ` +
              `<span style="opacity:.95">(${escapeHtml(reason || "unknown")}), so it was sent unchecked.</span>`, "#475569");
 }
