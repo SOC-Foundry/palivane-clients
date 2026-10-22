@@ -82,6 +82,7 @@
     /\/api\/chat\b/,                       // mistral (Le Chat) + generic /api/chat
     /\/app-chat\/conversations\b/,         // grok.com
     /\/gql_POST\b/,                        // poe.com (GraphQL sendMessage)
+    /\/claudeai-rpc\/[^/]*ConversationService\/PerformAction\b/, // claude.ai (current): a Connect/protobuf RPC
   ];
   // The page's own analytics and error reporting ride the same patterns (a RUM beacon posted to a
   // `/completion` route, say) and are not something the person typed. A beacon is not a prompt, so
@@ -116,6 +117,82 @@
   // send THAT; this client holds the message and shows it (content.js), it never lets the
   // original out.
   const stop = (v) => !!v && (v.action === "block" || v.coached === true);
+
+  // claude.ai no longer posts JSON to /completion. A message is a Connect RPC, PerformAction, whose
+  // body is a protobuf: the typed text is one string field among ids (conversation, message and
+  // session uuids), a locale and a timezone. Decoding that as UTF-8 text would scan the ids and
+  // miss nothing, but every uuid is random-looking, so it is walked as protobuf and the ids are set
+  // aside. Which field holds the text is not assumed (the schema is v1alpha): every string that is
+  // not an id is the message.
+  const OPAQUE_ID = [
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,   // uuid
+    /^sess_[0-9a-f]+$/i,                                                 // session id
+    /^\d{9,}-\d+$/,                                                      // timeline cursor
+    /^[a-z]{2,3}(-[A-Za-z]{2,4})?$/,                                     // locale, en-US
+    /^[A-Z][A-Za-z]+(\/[A-Z][A-Za-z_]+)+$/,                              // timezone, America/Chicago
+  ];
+  function protoWalk(buf, out, depth) {
+    const n = buf.length;
+    let i = 0;
+    const found = [];
+    const varint = () => {
+      let v = 0, shift = 0, b;
+      do {
+        if (i >= n) return null;
+        b = buf[i++];
+        v += (b & 0x7f) * Math.pow(2, shift);
+        shift += 7;
+      } while ((b & 0x80) && shift < 63);
+      return v;
+    };
+    while (i < n) {
+      const tag = varint();
+      if (tag === null || tag === 0) return false;
+      const wire = tag % 8;
+      if (wire === 0) { if (varint() === null) return false; }
+      else if (wire === 1) { i += 8; if (i > n) return false; }
+      else if (wire === 5) { i += 4; if (i > n) return false; }
+      else if (wire === 2) {
+        const len = varint();
+        if (len === null || i + len > n) return false;
+        const sub = buf.subarray(i, i + len);
+        i += len;
+        const nested = [];
+        if (depth < 8 && len > 1 && protoWalk(sub, nested, depth + 1) && nested.length) found.push(...nested);
+        else {
+          let t = null;
+          try { t = new TextDecoder("utf-8", { fatal: true }).decode(sub); } catch (_) { /* binary */ }
+          if (t !== null && !/[\u0000-\u0008\u000e-\u001f]/.test(t)) found.push(t);
+        }
+      } else return false;
+    }
+    out.push(...found);
+    return true;
+  }
+  // The typed text of a claude.ai RPC body, "" when it carries none (most calls are state), or null
+  // when the body is not protobuf at all (the caller then scans it as text, never skips it).
+  function protoPrompt(u8) {
+    let buf = u8;
+    if (u8.length > 5 && (u8[0] === 0 || u8[0] === 1)) {          // Connect envelope: flag + length
+      const len = ((u8[1] << 24) | (u8[2] << 16) | (u8[3] << 8) | u8[4]) >>> 0;
+      if (len === u8.length - 5) {
+        if (u8[0] === 1) { reportBlind(); return ""; }               // compressed: cannot read it
+        buf = u8.subarray(5);
+      }
+    }
+    const leaves = [];
+    if (!protoWalk(buf, leaves, 0)) return null;
+    return leaves.filter((t) => t.trim() && !OPAQUE_ID.some((re) => re.test(t))).join("\n");
+  }
+  const isRpc = (url) => /\/claudeai-rpc\//.test(String(url));
+  // What to scan for one captured send: the decoded protobuf text for an RPC body, else the usual shapes.
+  function promptFrom(url, body) {
+    if (isRpc(url) && body.bytes) {
+      const typed = protoPrompt(body.bytes);
+      if (typed !== null) return typed;
+    }
+    return body.text ? extractPrompt(body.text) : "";
+  }
 
   // Gemini and Google AI Studio send `f.req=<json>&at=<xsrf token>`. f.req is [null, "<json>"], and
   // the typed text is the first string of the inner array's first element. Everything else in the
@@ -290,8 +367,10 @@
                                           : { text: await body.text(), unreadable: false };
       }
       if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-        return body.byteLength > MAX_BODY_BYTES ? { text: "", unreadable: true }
-                                                : { text: new TextDecoder().decode(body), unreadable: false };
+        if (body.byteLength > MAX_BODY_BYTES) return { text: "", unreadable: true };
+        const bytes = body instanceof ArrayBuffer ? new Uint8Array(body)
+                                                  : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+        return { text: new TextDecoder().decode(bytes), bytes, unreadable: false };
       }
     } catch (_) { /* fall through */ }
     return { text: "", unreadable: true };
@@ -309,6 +388,10 @@
         let body;
         try {
           if (init && init.body != null) body = await readBody(init.body);
+          else if (isReq && !input.bodyUsed && isRpc(url)) {
+            const bytes = new Uint8Array(await input.clone().arrayBuffer());
+            body = { text: new TextDecoder().decode(bytes), bytes, unreadable: false };
+          }
           else if (isReq && !input.bodyUsed) body = { text: await input.clone().text(), unreadable: false };
           else body = { text: "", unreadable: false };
         } catch (_) { body = { text: "", unreadable: true }; }   // e.g. a locked stream: say so, do not skip in silence
@@ -316,7 +399,7 @@
           console.debug("[Palivane] fetch POST", url, "bodyChars=", body.text.length, "unreadable=", body.unreadable);
         }
         if (body.unreadable) reportBlind();
-        const prompt = body.text ? extractPrompt(body.text) : "";
+        const prompt = promptFrom(url, body);
         if (DEBUG) console.log("[Palivane] captured", url, "promptChars=", (prompt || "").length,
           "snippet=", (prompt || "").slice(0, 80));
         if (prompt && prompt.trim()) {
@@ -357,7 +440,7 @@
         readBody(body).then(async (b) => {
           if (DEBUG) console.debug("[Palivane] xhr POST", info.url, "bodyChars=", b.text.length, "unreadable=", b.unreadable);
           if (b.unreadable) reportBlind();
-          const prompt = b.text ? extractPrompt(b.text) : "";
+          const prompt = promptFrom(info.url, b);
           if (!(prompt && prompt.trim())) { origSend.apply(xhr, args); return; }
           const verdict = await scanAll(prompt, location.origin, endpointOf(info.url));
           if (DEBUG) console.log("[Palivane] xhr verdict", verdict.action, verdict.severity, verdict.risk_score);
