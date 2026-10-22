@@ -376,6 +376,27 @@
     return { text: "", unreadable: true };
   }
 
+  // A page that is told its send failed may simply send it again: claude.ai retries a failed
+  // PerformAction on a backoff (about 0.4s, 0.75s, 1s, 2s, 3s, ...). Each retry was scanned, blocked
+  // and shown as a fresh popup, so one blocked message produced a stream of them. Two defences:
+  // the block is answered the way a Connect client reads as final (HTTP 403, code permission_denied),
+  // and an identical send inside BLOCK_QUIET_MS of a block is not a new event: no new popup, and, when
+  // the block offers no "send anyway" path, no new scan either. A block that does offer one (a
+  // justification) is still re-scanned, so recording the reason and pressing send again works.
+  const BLOCK_QUIET_MS = 30000;
+  const recentBlocks = new Map();                 // send fingerprint -> { until, rescan }
+  function sendKey(url, text) {
+    let h = 5381;
+    for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0;
+    return endpointOf(url) + "|" + text.length + "|" + h;
+  }
+  function blockedResponse(url) {
+    const rpc = isRpc(url);
+    const body = rpc ? { code: "permission_denied", message: "Blocked by Palivane: sensitive data detected." }
+                     : { error: "Blocked by Palivane: sensitive data detected." };
+    return new Response(JSON.stringify(body), { status: rpc ? 403 : 451, headers: { "content-type": "application/json" } });
+  }
+
   const origFetch = window.fetch;
   window.fetch = async function (input, init) {
     try {
@@ -403,13 +424,25 @@
         if (DEBUG) console.log("[Palivane] captured", url, "promptChars=", (prompt || "").length,
           "snippet=", (prompt || "").slice(0, 80));
         if (prompt && prompt.trim()) {
+          const key = sendKey(url, prompt);
+          const prior = recentBlocks.get(key);
+          const repeat = !!prior && prior.until > Date.now();
+          if (repeat && !prior.rescan) {              // a retry of a send already stopped: same answer
+            prior.until = Date.now() + BLOCK_QUIET_MS;
+            return blockedResponse(url);
+          }
           const verdict = await scanAll(prompt, location.origin, endpointOf(url));
           if (DEBUG) console.log("[Palivane] verdict", verdict.action, verdict.severity, verdict.risk_score);
           if (stop(verdict)) {
-            post({ kind: "blocked", verdict });
-            return new Response(JSON.stringify({ error: "Blocked by Palivane: sensitive data detected." }),
-              { status: 451, headers: { "content-type": "application/json" } });
+            recentBlocks.set(key, { until: Date.now() + BLOCK_QUIET_MS,
+                                    rescan: !!(verdict.self_justify && verdict.finding_id) });
+            if (recentBlocks.size > 50) {
+              for (const [k, v] of recentBlocks) if (v.until <= Date.now()) recentBlocks.delete(k);
+            }
+            if (!repeat) post({ kind: "blocked", verdict });   // one popup per stopped send, not per retry
+            return blockedResponse(url);
           }
+          recentBlocks.delete(key);
           if (verdict.action === "warn") {
             post({ kind: "warn", verdict });
           }
