@@ -45,7 +45,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -179,8 +179,9 @@ def intercept_patterns() -> list[str]:
 # Cursor) still get the harvest fallback since we can't parse their bodies.
 STRUCTURED_API_SUFFIXES = (
     "api.openai.com", "api.anthropic.com",
-    # claude.ai is a chat UI, but its completion body is a KNOWN shape ({"prompt": …}), so it
-    # is parsed rather than harvested. Harvesting it was harmless only while the body arrived
+    # claude.ai is a chat UI, but its send is a KNOWN shape, so it is parsed rather than
+    # harvested: {"prompt": …} on the old /completion route, and since autumn 2026 a protobuf
+    # PerformAction RPC (see claude_rpc_text below). Harvesting it was harmless only while the body arrived
     # gzipped and matched nothing; once decoding was fixed, "every string value" meant the
     # 57KB envelope — conversation UUIDs, a device id, a sessionKey, sha256 file hashes —
     # and the entropy detector made a separate "secret" finding out of each one. One prompt,
@@ -313,6 +314,113 @@ def extract_prompt(body: bytes | str) -> str:
     # "" when no recognized prompt shape: the caller harvests ONLY for proprietary hosts
     # (needs_harvest) — a shapeless body on a structured API host is telemetry, not a prompt.
     return structured
+
+
+# --- claude.ai's current send: a Connect RPC with a protobuf body ----------------------------
+# claude.ai no longer posts {"prompt": …} to /completion. A message is
+#   POST /claudeai-rpc/anthropic.bard.api.v1alpha.ConversationService/PerformAction
+# with a protobuf body: the typed text is one string among conversation/message/session uuids, a
+# locale and a timezone. The same service carries state calls with no text (StreamTimeline,
+# ReportViewing, GetNewConversationDefaults, small PerformActions), and the page posts its own
+# Datadog telemetry to the same host as compressed blobs. extract_prompt treats any non-JSON body as
+# raw text, so all of that was scanned as garbage: the message was found, but every uuid and every
+# telemetry blob became a "possible secret". The message is decoded as protobuf and every string that
+# is not an id is the text (no field number assumed: the schema is v1alpha). Mirrors the browser
+# extension's decoder (extension/injected.js protoPrompt) so both planes agree.
+_CLAUDE_RPC_PREFIX = "/claudeai-rpc/"
+_OPAQUE_ID = [
+    re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I),   # uuid
+    re.compile(r"^sess_[0-9a-f]+$", re.I),                                                # session id
+    re.compile(r"^\d{9,}-\d+$"),                                                          # timeline cursor
+    re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$"),                                         # locale
+    re.compile(r"^[A-Z][A-Za-z]+(/[A-Z][A-Za-z_]+)+$"),                                    # timezone
+]
+_CTRL_RE = re.compile(r"[\x00-\x08\x0e-\x1f]")
+
+
+def is_claude_rpc(host: str, path: str) -> bool:
+    return (host or "").lower().endswith("claude.ai") and (path or "").startswith(_CLAUDE_RPC_PREFIX)
+
+
+def is_claude_rpc_send(path: str) -> bool:
+    return _path_only(path).endswith("ConversationService/PerformAction")   # …v1alpha.ConversationService
+
+
+def is_page_telemetry(path: str) -> bool:
+    """The page's own analytics (Datadog RUM rides first-party on claude.ai as a compressed blob):
+    not something the person typed, and no JSON shape to recognise it by."""
+    p = path or ""
+    return p.startswith("/api/v2/rum") or "ddsource=browser" in p
+
+
+def _pb_strings(buf: bytes, depth: int = 0) -> list[str] | None:
+    """Every string leaf of a protobuf message, nested messages included; None if it is not one."""
+    out: list[str] = []
+    i, n = 0, len(buf)
+
+    def varint():
+        nonlocal i
+        v, shift = 0, 0
+        while True:
+            if i >= n:
+                return None
+            b = buf[i]
+            i += 1
+            v |= (b & 0x7F) << shift
+            shift += 7
+            if not b & 0x80:
+                return v
+            if shift >= 64:
+                return None
+
+    while i < n:
+        tag = varint()
+        if not tag:
+            return None
+        wire = tag & 7
+        if wire == 0:
+            if varint() is None:
+                return None
+        elif wire in (1, 5):
+            i += 8 if wire == 1 else 4
+            if i > n:
+                return None
+        elif wire == 2:
+            ln = varint()
+            if ln is None or i + ln > n:
+                return None
+            sub, i = buf[i:i + ln], i + ln
+            nested = _pb_strings(sub, depth + 1) if depth < 8 and ln > 1 else None
+            if nested:
+                out.extend(nested)
+                continue
+            try:
+                t = sub.decode("utf-8")
+            except UnicodeDecodeError:
+                continue                                  # binary, not text
+            if not _CTRL_RE.search(t):
+                out.append(t)
+        else:
+            return None
+    return out
+
+
+def claude_rpc_text(raw: bytes | str) -> str | None:
+    """The typed text of a claude.ai PerformAction body: "" when it carries none, None when the
+    body is not protobuf (or is a compressed envelope) so the caller can say so and not skip it."""
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "surrogatepass")
+    buf = raw
+    if len(raw) > 5 and raw[0] in (0, 1) and int.from_bytes(raw[1:5], "big") == len(raw) - 5:
+        if raw[0] == 1:
+            return None                                   # compressed Connect envelope
+        buf = raw[5:]
+    leaves = _pb_strings(buf)
+    if leaves is None:
+        return None
+    if not leaves and buf and sum(32 <= c < 127 or c in (9, 10, 13) for c in buf) >= 0.9 * len(buf):
+        return None             # readable text that merely parsed as protobuf: not a message to skip
+    return "\n".join(t for t in leaves if t.strip() and not any(r.match(t) for r in _OPAQUE_ID))
 
 
 def harvest_prompt(body: bytes | str) -> str:
@@ -1131,11 +1239,31 @@ class PalivaneGuard:
             # saw the better artefact. Skip ONLY the prompt scan: section 2 below reads the
             # agent's tool USE out of the same request, which is a different exposure and
             # stays covered. An early return here would have silently dropped it.
+            if is_page_telemetry(req.path):
+                return
+            rpc = is_claude_rpc(req.pretty_host, req.path)
+            if rpc and not is_claude_rpc_send(req.path):
+                return              # claude.ai state calls (timeline, viewing, defaults): no typed text
             ua_tool = detect_tool(req.headers.get("user-agent", ""))
             defer_prompt = bool(ua_tool) and ua_tool in await hooked_tools_async()
 
-            prompt = "" if defer_prompt else extract_prompt(raw)
-            if not defer_prompt and not prompt.strip() and needs_harvest(req.pretty_host):
+            if rpc:
+                prompt = ""
+                if not defer_prompt:
+                    decoded = claude_rpc_text(raw)
+                    if decoded is None:
+                        import logging
+                        logging.warning(
+                            "palivane: %s%s was not a readable protobuf (%d bytes) — scanning it as "
+                            "text; shape drift or a compressed envelope?",
+                            req.pretty_host, req.path[:80], len(raw))
+                        decoded = extract_prompt(raw)
+                    prompt = decoded
+            else:
+                prompt = "" if defer_prompt else extract_prompt(raw)
+            if rpc:
+                pass                # decoded above: no harvest, no drift warning for the RPC
+            elif not defer_prompt and not prompt.strip() and needs_harvest(req.pretty_host):
                 prompt = harvest_prompt(raw)
             elif not defer_prompt and not prompt.strip() and raw.strip() \
                     and _carries_a_prompt(req.path):
@@ -1157,6 +1285,8 @@ class PalivaneGuard:
                     flow.response = http.Response.make(
                         400, ai_block_body(verdict), {"Content-Type": "application/json"})
                     return
+            if rpc:
+                return              # a chat message: no tool use or tool definitions to read from it
             # 2) Agentic behavior — the tool the agent is running + its result, visible in
             #    the LLM traffic even for local stdio MCP (agentless).
             act = extract_agentic(raw)
