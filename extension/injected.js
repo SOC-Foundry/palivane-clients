@@ -117,8 +117,27 @@
   // original out.
   const stop = (v) => !!v && (v.action === "block" || v.coached === true);
 
+  // Gemini and Google AI Studio send `f.req=<json>&at=<xsrf token>`. f.req is [null, "<json>"], and
+  // the typed text is the first string of the inner array's first element. Everything else in the
+  // body (an image upload id, a session uuid, page state ids, the `at` token) is opaque state the
+  // page generated, not something the person typed. Scanned as if it were the prompt, each of those
+  // random-looking ids read as a possible secret, so an ordinary message was blocked. Returns the
+  // typed text, or null when the body is not that shape (the caller then scans the whole thing).
+  function geminiPrompt(fReq) {
+    try {
+      const inner = JSON.parse(JSON.parse(fReq)[1]);
+      const first = Array.isArray(inner) ? inner[0] : null;
+      if (Array.isArray(first) && typeof first[0] === "string") return first[0];
+    } catch (_) { /* not that shape */ }
+    return null;
+  }
+
   function extractPrompt(bodyText) {
     if (!bodyText || isTelemetryBody(bodyText)) return "";
+    if (bodyText.includes("f.req=")) {
+      const typed = geminiPrompt(new URLSearchParams(bodyText).get("f.req"));
+      if (typed !== null) return typed;
+    }
     try {
       const j = JSON.parse(bodyText);
       if (Array.isArray(j.messages)) {            // OpenAI/ChatGPT shape
@@ -253,6 +272,10 @@
     if (typeof body === "string") return { text: body, unreadable: false };
     try {
       if (body instanceof URLSearchParams) {
+        if (body.has("f.req")) {
+          const typed = geminiPrompt(body.get("f.req"));
+          if (typed !== null) return { text: typed, unreadable: false };
+        }
         const raw = body.toString();
         try { return { text: decodeURIComponent(raw), unreadable: false }; }
         catch (_) { return { text: raw, unreadable: false }; }
