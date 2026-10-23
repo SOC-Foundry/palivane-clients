@@ -21,8 +21,12 @@ Monitor by default: tool-call verdicts are recorded by a detached child with ~ze
 latency. Prompts (BeforeAgent) are the exception: they are scanned inline even in monitor
 mode so a confirmed secret/PII leak (`force_block`) is stopped before it leaves — same
 rule as the egress proxy: block the certain, monitor the fuzzy. Set PALIVANE_ENFORCE=true
-to scan every event synchronously and DENY on a block verdict. Fails open on any error:
-Palivane being down never breaks the developer.
+to scan every event synchronously and DENY on a block verdict. The same happens while the
+server last said this actor is enforced (the `enforce` field of a prompt verdict, set by the
+console's org stance or a per-user override; remembered for an hour under ~/.palivane). An
+org that turned on ASK (console Settings → Policy) also has a tool call in the warn band put
+to the developer as Gemini's own confirmation (gemini-cli 0.36+; an older CLI runs it). A
+block stays a block. Fails open on any error: Palivane being down never breaks the developer.
 
 Register in ~/.gemini/settings.json (user), <project>/.gemini/settings.json, or the
 system path pushed by MDM (Linux /etc/gemini-cli/settings.json, macOS
@@ -45,16 +49,20 @@ else the pair palivane-connect wrote to ~/.claude/settings.json. Stdlib only.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
 
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 _VER_RE = re.compile(r"^[A-Za-z0-9._+-]{1,24}$")
@@ -238,6 +246,84 @@ def _post(endpoint: str, payload: dict, cfg: dict, ua: str = "") -> dict:
         return {"action": "allow", "reason": "scan-failed"}
 
 
+# --- The server's enforce stance, remembered between runs (#278) ------------------------
+# Tool calls are scanned inline only under enforce. Otherwise a detached child reports them
+# and nothing reads the verdict. PALIVANE_ENFORCE is the device's own stance, but the org can
+# also enforce THIS actor from the console (Settings → Enforcement, or a per-user policy
+# override), and the hook learns that only from the `enforce` field of an inline verdict.
+# Prompts are scanned inline even in monitor mode, so each prompt verdict is a fresh reading:
+# it is remembered here, and tool calls scan inline while it says enforce.
+#
+# The bit only chooses inline over detached. It never blocks anything by itself: the inline
+# verdict decides, with its own live `enforce`. A stale or forged file costs latency at
+# worst, and a missing one is plain monitor mode. The TTL lets a revoked override lapse even
+# when no prompt comes along to clear it; a prompt verdict that says monitor clears it at
+# once. It is keyed to the backend, key and user, so reconnecting as someone else never
+# inherits it. Copied in palivane-hook, -cursor-hook, -codex-hook and -gemini-hook (each is
+# a standalone file); keep the copies identical apart from _ENFORCE_FILE.
+_ENFORCE_TTL = 3600
+_ENFORCE_FILE = "enforce-gemini.json"
+
+
+def _enforce_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, _ENFORCE_FILE)
+
+
+def _enforce_key(cfg: dict) -> str:
+    ident = "\n".join(str(cfg.get(k) or "") for k in ("url", "token", "user"))
+    return hashlib.sha256(ident.encode()).hexdigest()[:16]
+
+
+def remember_enforce(verdict: dict, cfg: dict, authoritative: bool) -> None:
+    """Record the server's enforce stance from an inline verdict. A prompt verdict is
+    `authoritative`: it sets or clears the bit. A tool-call verdict only refreshes a set bit,
+    which keeps a long unattended run inline past the TTL. Its False does not clear, because
+    a monitor override on one tool says nothing about the others. A fail-open verdict
+    carries no `enforce` and changes nothing. Never raises."""
+    v = verdict.get("enforce") if isinstance(verdict, dict) else None
+    if not isinstance(v, bool) or not (v or authoritative):
+        return
+    try:
+        path = _enforce_path()
+        if not v:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        # A unique temp name per write, then an atomic rename: concurrent hook runs never
+        # see a half-written file.
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".enforce.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"key": _enforce_key(cfg), "until": time.time() + _ENFORCE_TTL}, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        pass
+
+
+def server_enforced(cfg: dict) -> bool:
+    """True while the last server verdict for this backend, key and user said enforce and is
+    younger than _ENFORCE_TTL. An `until` further out than the TTL is not one this code wrote
+    (or the clock moved), so it does not count. Any error is False: plain monitor mode."""
+    try:
+        with open(_enforce_path()) as fh:
+            st = json.load(fh)
+        until, now = st.get("until"), time.time()
+        if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
+            return False
+        return st.get("key") == _enforce_key(cfg) and now < until <= now + _ENFORCE_TTL
+    except Exception:
+        return False
+
+
 def should_block(verdict: dict, enforce: bool) -> bool:
     """Mirror of the proxy's rule: a confirmed secret/PII leak (force_block) is blocked
     even in monitor mode — block the certain, monitor the fuzzy. Everything else blocks
@@ -260,6 +346,43 @@ def block_output(event_name: str, verdict: dict) -> dict:
     if fixes:
         reason += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
     return {"decision": "deny", "reason": reason}
+
+
+# Events whose answer may be "ask". Gemini CLI 0.36+ turns a BeforeTool
+# {"decision": "ask"} into its own confirmation prompt, showing `systemMessage`
+# (google-gemini/gemini-cli#21146). An older CLI does not know the value and treats it as
+# non-blocking, so the call runs as it did before. BeforeAgent cannot ask.
+_ASK_EVENTS = frozenset({"BeforeTool"})
+
+
+def should_ask(event_name: str, verdict: dict) -> bool:
+    """The org's ASK verdict: a tool call in the warn band that the org wants a person to
+    approve rather than run silently. The server decides (it sets `ask` only for an enforced
+    actor in a tenant that opted in), so this honors it on the events that can carry one.
+    Callers check should_block first: a block is never softened into an ask. The same rule
+    is copied in every hook; only _ASK_EVENTS differs."""
+    return event_name in _ASK_EVENTS and bool(verdict.get("ask"))
+
+
+def _ask_message(verdict: dict) -> str:
+    """The question put to the developer. The reader is the user, so it carries the fix."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    msg = (f"Palivane flagged this tool call ({cats or 'policy'}) — "
+           f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'suspicious')}. "
+           f"Approve it only if you meant to run it.")
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        msg += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return msg
+
+
+def ask_output(verdict: dict) -> dict:
+    """Gemini's own tool confirmation, with the reason in `systemMessage` (what the prompt
+    shows). In a non-interactive run nobody can answer, so Gemini refuses the call, the
+    same as Claude Code under `claude -p`."""
+    msg = _ask_message(verdict)
+    return {"decision": "ask", "systemMessage": msg, "reason": msg}
 
 
 def _send_detached(endpoint: str, payload: dict, cfg: dict) -> None:
@@ -328,11 +451,17 @@ def main() -> int:
 
     # Prompts are always scanned inline (even in monitor mode): a confirmed secret/PII
     # leak (force_block) must be stopped before it leaves the device. Tool calls scan
-    # inline only under enforce. No stdout on allow — Gemini treats that as proceed.
-    if name == "BeforeAgent" or cfg["enforce"]:
+    # inline only under enforce: the device's own (PALIVANE_ENFORCE), or the server's as
+    # last reported (the console's org stance or a per-user override, #278). No stdout on
+    # allow — Gemini treats that as proceed.
+    prompt = name == "BeforeAgent"
+    if prompt or cfg["enforce"] or server_enforced(cfg):
         verdict = _post(endpoint, payload, cfg)
+        remember_enforce(verdict, cfg, authoritative=prompt)
         if should_block(verdict, cfg["enforce"]):
             print(json.dumps(block_output(name, verdict)))
+        elif should_ask(name, verdict):
+            print(json.dumps(ask_output(verdict)))
         return 0
 
     _send_detached(endpoint, payload, cfg)

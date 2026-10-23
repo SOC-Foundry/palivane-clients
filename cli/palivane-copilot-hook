@@ -27,7 +27,10 @@ stageable per user/tool via policy overrides), so a centrally-flipped enforcemen
 high-risk tool calls here immediately — no device re-config. `force_block` is honored
 too, though the MCP surface deliberately doesn't emit it today (a secret in a local
 shell command isn't a confirmed egress the way a prompt is). Set PALIVANE_ENFORCE=true to
-deny high-risk verdicts based on device-local stance as well.
+deny high-risk verdicts based on device-local stance as well. An org that turned on ASK
+(console Settings → Policy) also has a tool call in the warn band answered
+`permissionDecision: "ask"`, so Copilot CLI shows its own permission prompt; in the cloud
+coding agent (GitHub Actions), where Copilot would turn an ask into a deny, it runs.
 
 Fail-open discipline needs care here: Copilot treats a NON-ZERO EXIT as deny (fail-
 closed) and a timeout as allow, so this script always exits 0 — Palivane being down never
@@ -60,7 +63,7 @@ import urllib.request
 
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 _VER_RE = re.compile(r"^[A-Za-z0-9._+-]{1,24}$")
@@ -289,6 +292,47 @@ def block_output(verdict: dict) -> dict:
             "permissionDecisionReason": _reason(verdict, "tool call")}
 
 
+# Events whose answer may be "ask". preToolUse takes allow|deny|ask; an interactive Copilot
+# CLI shows its hook-permission prompt. Prompts are observe-only, so they never ask.
+_ASK_EVENTS = frozenset({"preToolUse"})
+
+
+def _unattended() -> bool:
+    """True inside the Copilot cloud coding agent, which runs on GitHub Actions. Copilot
+    treats "ask" as "deny" there because nobody can answer, which would turn a warn into a
+    block. A warn keeps running there instead, as it always has. (CLI autopilot also denies
+    an ask and cannot be told apart from here: that matches `claude -p`, where the developer
+    chose to run unattended under an org that asks.)"""
+    return os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+
+
+def should_ask(event_name: str, verdict: dict) -> bool:
+    """The org's ASK verdict: a tool call in the warn band that the org wants a person to
+    approve rather than run silently. The server decides (it sets `ask` only for an enforced
+    actor in a tenant that opted in), so this honors it on the events that can carry one.
+    Callers check should_block first: a block is never softened into an ask. The same rule
+    is copied in every hook; only _ASK_EVENTS differs (and here, the cloud agent)."""
+    return event_name in _ASK_EVENTS and bool(verdict.get("ask")) and not _unattended()
+
+
+def _ask_message(verdict: dict) -> str:
+    """The question put to the developer. The reader is the user, so it carries the fix."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    msg = (f"Palivane flagged this tool call ({cats or 'policy'}) — "
+           f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'suspicious')}. "
+           f"Approve it only if you meant to run it.")
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        msg += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return msg
+
+
+def ask_output(verdict: dict) -> dict:
+    """Copilot's preToolUse ask: a top-level permissionDecision, like the deny."""
+    return {"permissionDecision": "ask", "permissionDecisionReason": _ask_message(verdict)}
+
+
 def _send_detached(endpoint: str, payload: dict, cfg: dict) -> None:
     """Report in a detached child so the hook returns instantly (observe-only events)."""
     p = subprocess.Popen(
@@ -367,6 +411,8 @@ def main() -> int:
         verdict = _post(endpoint, payload, cfg)
         if should_block(verdict, cfg["enforce"]):
             print(json.dumps(block_output(verdict)))
+        elif should_ask("preToolUse", verdict):
+            print(json.dumps(ask_output(verdict)))
         return 0
 
     _send_detached(endpoint, payload, cfg)
