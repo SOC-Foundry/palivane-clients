@@ -22,7 +22,9 @@ Set PALIVANE_ENFORCE=true to also block on ordinary high-risk verdicts — tool 
 then scanned synchronously and denied with the reason shown to the model; blocked prompts
 are erased with the reason shown to the user. The org can set that stance centrally
 (console Settings → Enforcement): `palivane-connect` provisions it at connect time, and
-inline verdicts carry the live value in their `enforce` field. Under enforce, an org that
+inline verdicts carry the live value in their `enforce` field. That value (which a per-user
+policy override also sets) is remembered for an hour under ~/.palivane, so tool calls scan
+inline whenever the server last said this actor is enforced. Under enforce, an org that
 turned on ASK (console Settings → Policy) also has a tool call that scores in the warn band
 put to the developer as Claude Code's own permission prompt, with the reason, instead of
 running silently; a block stays a block. Fails open on any error: Palivane being down never
@@ -57,7 +59,7 @@ import urllib.request
 
 # Tool calls with no security surface — pure agent bookkeeping. Never reported.
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 _VER_RE = re.compile(r"^[A-Za-z0-9._+-]{1,24}$")
 
 
@@ -415,6 +417,84 @@ def _auth_rejected(verdict: dict) -> bool:
     return str(verdict.get("reason", "")).startswith(("scan-failed:401", "scan-failed:403"))
 
 
+# --- The server's enforce stance, remembered between runs (#278) ------------------------
+# Tool calls are scanned inline only under enforce. Otherwise a detached child reports them
+# and nothing reads the verdict. PALIVANE_ENFORCE is the device's own stance, but the org can
+# also enforce THIS actor from the console (Settings → Enforcement, or a per-user policy
+# override), and the hook learns that only from the `enforce` field of an inline verdict.
+# Prompts are scanned inline even in monitor mode, so each prompt verdict is a fresh reading:
+# it is remembered here, and tool calls scan inline while it says enforce.
+#
+# The bit only chooses inline over detached. It never blocks anything by itself: the inline
+# verdict decides, with its own live `enforce`. A stale or forged file costs latency at
+# worst, and a missing one is plain monitor mode. The TTL lets a revoked override lapse even
+# when no prompt comes along to clear it; a prompt verdict that says monitor clears it at
+# once. It is keyed to the backend, key and user, so reconnecting as someone else never
+# inherits it. Copied in palivane-hook, -cursor-hook, -codex-hook and -gemini-hook (each is
+# a standalone file); keep the copies identical apart from _ENFORCE_FILE.
+_ENFORCE_TTL = 3600
+_ENFORCE_FILE = "enforce-claude-code.json"
+
+
+def _enforce_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, _ENFORCE_FILE)
+
+
+def _enforce_key(cfg: dict) -> str:
+    ident = "\n".join(str(cfg.get(k) or "") for k in ("url", "token", "user"))
+    return hashlib.sha256(ident.encode()).hexdigest()[:16]
+
+
+def remember_enforce(verdict: dict, cfg: dict, authoritative: bool) -> None:
+    """Record the server's enforce stance from an inline verdict. A prompt verdict is
+    `authoritative`: it sets or clears the bit. A tool-call verdict only refreshes a set bit,
+    which keeps a long unattended run inline past the TTL. Its False does not clear, because
+    a monitor override on one tool says nothing about the others. A fail-open verdict
+    carries no `enforce` and changes nothing. Never raises."""
+    v = verdict.get("enforce") if isinstance(verdict, dict) else None
+    if not isinstance(v, bool) or not (v or authoritative):
+        return
+    try:
+        path = _enforce_path()
+        if not v:
+            if os.path.exists(path):
+                os.unlink(path)
+            return
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        # A unique temp name per write, then an atomic rename: concurrent hook runs never
+        # see a half-written file.
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".enforce.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"key": _enforce_key(cfg), "until": time.time() + _ENFORCE_TTL}, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        pass
+
+
+def server_enforced(cfg: dict) -> bool:
+    """True while the last server verdict for this backend, key and user said enforce and is
+    younger than _ENFORCE_TTL. An `until` further out than the TTL is not one this code wrote
+    (or the clock moved), so it does not count. Any error is False: plain monitor mode."""
+    try:
+        with open(_enforce_path()) as fh:
+            st = json.load(fh)
+        until, now = st.get("until"), time.time()
+        if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
+            return False
+        return st.get("key") == _enforce_key(cfg) and now < until <= now + _ENFORCE_TTL
+    except Exception:
+        return False
+
+
 def should_block(verdict: dict, enforce: bool) -> bool:
     """Mirror of the proxy's rule: a confirmed secret/PII leak (force_block) is blocked
     even in monitor mode — block the certain, monitor the fuzzy. Everything else blocks
@@ -438,31 +518,40 @@ def deny_output(verdict: dict) -> dict:
     }}
 
 
-def should_ask(verdict: dict) -> bool:
+# Events whose answer may be "ask". UserPromptSubmit can only block.
+_ASK_EVENTS = frozenset({"PreToolUse"})
+
+
+def should_ask(event_name: str, verdict: dict) -> bool:
     """The org's ASK verdict: a tool call in the warn band that the org wants a person to
-    approve rather than run silently. The server decides — it only sets `ask` for an actor
-    who is enforced, in a tenant that opted in — so this just honors it. Callers check
-    should_block first: a block is never softened into an ask."""
-    return bool(verdict.get("ask"))
+    approve rather than run silently. The server decides (it sets `ask` only for an enforced
+    actor in a tenant that opted in), so this honors it on the events that can carry one.
+    Callers check should_block first: a block is never softened into an ask. The same rule
+    is copied in every hook; only _ASK_EVENTS differs."""
+    return event_name in _ASK_EVENTS and bool(verdict.get("ask"))
+
+
+def _ask_message(verdict: dict) -> str:
+    """The question put to the developer. The reader is the user, so it carries the fix."""
+    cats = ", ".join(dict.fromkeys(
+        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
+    msg = (f"Palivane flagged this tool call ({cats or 'policy'}) — "
+           f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'suspicious')}. "
+           f"Approve it only if you meant to run it.")
+    fixes = verdict.get("remediation") or []
+    if fixes:
+        msg += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    return msg
 
 
 def ask_output(verdict: dict) -> dict:
     """PreToolUse ask — Claude Code shows its normal permission prompt and the developer
     approves or refuses. The reason is shown to the USER in that prompt (a deny's goes to the
-    model), so it carries the fix the way a blocked prompt does. In a run nobody can answer
-    (`claude -p`), Claude Code denies the call instead."""
-    cats = ", ".join(dict.fromkeys(
-        s.get("category", "") for s in verdict.get("signals", []) if s.get("category")))
-    reason = (f"Palivane flagged this tool call ({cats or 'policy'}) — "
-              f"risk {verdict.get('risk_score', 0)}/{verdict.get('severity', 'suspicious')}. "
-              f"Approve it only if you meant to run it.")
-    fixes = verdict.get("remediation") or []
-    if fixes:
-        reason += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    model). In a run nobody can answer (`claude -p`), Claude Code denies the call instead."""
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "ask",
-        "permissionDecisionReason": reason,
+        "permissionDecisionReason": _ask_message(verdict),
     }}
 
 
@@ -628,6 +717,7 @@ def main() -> int:
                        cfg["user"], cfg["timeout"])
         if verdict.get("overridden"):
             _clear_override_token()               # one grant, one send
+        remember_enforce(verdict, cfg, authoritative=True)
         if should_block(verdict, cfg["enforce"]):
             out = prompt_block_output(verdict)
             if verdict.get("self_justify") and verdict.get("finding_id"):
@@ -658,17 +748,20 @@ def main() -> int:
     if not cfg["url"] or not cfg["token"]:
         return 0  # not connected to Palivane — nothing to report to
 
-    if cfg["enforce"]:
+    # Inline under enforce: the device's own (PALIVANE_ENFORCE), or the server's as last
+    # reported (the console's org stance or a per-user override, #278). Otherwise monitor
+    # mode stays zero-latency: a detached child posts the report.
+    if cfg["enforce"] or server_enforced(cfg):
         verdict = scan_mcp(activity, cfg["url"], cfg["token"], cfg["user"], cfg["timeout"])
-        if should_block(verdict, True):
+        remember_enforce(verdict, cfg, authoritative=False)
+        if should_block(verdict, cfg["enforce"]):
             print(json.dumps(deny_output(verdict)))
             return 0
-        if should_ask(verdict):
+        if should_ask("PreToolUse", verdict):
             print(json.dumps(ask_output(verdict)))
             return 0
         return 1 if _auth_rejected(verdict) else 0
-    else:
-        _send_detached("/api/ingest/mcp", activity, cfg)
+    _send_detached("/api/ingest/mcp", activity, cfg)
     return 0
 
 

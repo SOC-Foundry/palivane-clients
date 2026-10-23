@@ -116,11 +116,18 @@ only thing that sees it.
 - **Org-wide default:** an admin sets the stance once in the console (Settings →
   *Device enforcement*). `palivane-connect` provisions it into every device it connects,
   and inline verdicts carry the live value (`enforce`) so prompt blocking follows the
-  console without a reconnect. A local `PALIVANE_ENFORCE=true` still wins.
+  console without a reconnect. Tool calls follow it too: the hook remembers the last
+  verdict's `enforce` in `~/.palivane/enforce-claude-code.json` for an hour (refreshed by
+  every prompt, cleared by a prompt verdict that says monitor), and scans tool calls inline
+  while it is on. The file only picks inline over background; the inline verdict decides
+  what happens. A local `PALIVANE_ENFORCE=true` still wins.
 - **Staged rollout:** a policy override (console → Policies) can force enforce/monitor
   for one user, a group glob (`*@pilot.acme.com`), or a single tool — pilot a team on
   enforcement while the rest of the org stays in monitor. Overrides ride the same
-  verdict `enforce` field, so no device config changes.
+  verdict `enforce` field, so no device config changes; they reach tool calls from the
+  developer's next prompt. A per-tool override is applied when a call is scanned inline,
+  but does not by itself switch a monitored device to inline scanning (the prompt verdict
+  that does that is for the agent's channel, not the tool).
 - **Ask (opt-in):** with *Ask before risky tool calls* on (console → Settings → Policy),
   a tool call that scores above allow but below the block severity is not run silently:
   the hook answers `permissionDecision: "ask"` and Claude Code shows its normal
@@ -164,9 +171,12 @@ API** (Cursor 1.7+) to inspect from *inside* Cursor — one script dispatched on
 
 - **Monitor (default):** verdict recorded via a detached child; the action is explicitly
   allowed with ~zero latency.
-- **Enforce (`PALIVANE_ENFORCE=true`):** synchronous scan; blocks are returned as Cursor's
-  `permission: deny` (or `continue: false` for a prompt), with the reason shown to the
-  user and agent. `afterFileEdit` is always monitor (Cursor accepts no output there).
+- **Enforce (`PALIVANE_ENFORCE=true`, or the server's stance):** synchronous scan; blocks
+  are returned as Cursor's `permission: deny` (or `continue: false` for a prompt), with the
+  reason shown to the user and agent. As with `palivane-hook`, the console's stance or a
+  per-user override reaches tool calls through the last prompt verdict's `enforce`
+  (`~/.palivane/enforce-cursor.json`, one hour). `afterFileEdit` is always monitor
+  (Cursor accepts no output there).
 - **Ask (opt-in):** the same *Ask before risky tool calls* setting. A shell or MCP call
   in the warn band is answered `permission: ask`, so Cursor shows its own approval prompt
   instead of running it silently. `beforeReadFile` never asks (Cursor takes allow/deny
@@ -203,7 +213,10 @@ Code's) to inspect from *inside* Codex:
 | `PreToolUse` | shell / MCP tool calls, before execution | `/api/ingest/mcp` |
 
 Same monitor/enforce semantics as `palivane-hook` (prompts scan inline even in monitor
-mode; `force_block` always wins). Registered by `palivane-connect` in `~/.codex/hooks.json`
+mode; `force_block` always wins; the server's stance reaches tool calls through
+`~/.palivane/enforce-codex.json`). **No ask:** Codex parses `permissionDecision: "ask"`
+but does not support it (the hook run is marked failed and the call runs), so with *Ask
+before risky tool calls* on, a warn still runs here. Registered by `palivane-connect` in `~/.codex/hooks.json`
 (Codex asks for a one-time trust approval — `/hooks` inside Codex), or pushed fleet-wide
 as **managed hooks** via Codex's `requirements.toml` (auto-trusted;
 `allow_managed_hooks_only = true` locks out user hooks). The policy pack emits a
@@ -227,7 +240,11 @@ at this plane, so they report via a detached child (zero latency; the proxy rema
 prompt-DLP backstop), while **tool calls scan inline even in monitor mode** — every
 verdict carries the org's live enforce stance (stageable per user/tool), so centrally
 flipping enforcement denies high-risk tool calls immediately, no device re-config.
-`PALIVANE_ENFORCE=true` denies on device-local stance as well.
+`PALIVANE_ENFORCE=true` denies on device-local stance as well. With *Ask before risky tool
+calls* on, a warn-band tool call is answered `permissionDecision: "ask"` and Copilot CLI
+shows its permission prompt (autopilot denies it, as `claude -p` does). In the cloud coding
+agent (`GITHUB_ACTIONS=true`) Copilot treats ask as deny, so the hook does not ask there
+and the call runs.
 
 Copilot-specific semantics: a hook's **non-zero exit denies** (fail-closed) and a
 **timeout allows** (fail-open) — so the adapter always exits 0 and lets the JSON verdict
@@ -252,8 +269,11 @@ mode ignores it entirely. This adapter uses **Gemini CLI's hooks system**
 | `BeforeTool` | shell / file / MCP tool calls, before execution | `/api/ingest/mcp` |
 
 Same monitor/enforce semantics as `palivane-hook` (prompts scan inline even in monitor
-mode; `force_block` always wins); blocks return Gemini's `{"decision": "deny"}` with the
-reason. Registered by `palivane-connect` in `~/.gemini/settings.json` (note: Gemini hook
+mode; `force_block` always wins; the server's stance reaches tool calls through
+`~/.palivane/enforce-gemini.json`); blocks return Gemini's `{"decision": "deny"}` with the
+reason. With *Ask before risky tool calls* on, a warn-band `BeforeTool` is answered
+`{"decision": "ask"}` and Gemini CLI 0.36+ shows its own confirmation with the reason; an
+older CLI does not know the value and runs the call. Registered by `palivane-connect` in `~/.gemini/settings.json` (note: Gemini hook
 timeouts are **milliseconds**), or pushed fleet-wide to the system settings path (Linux
 `/etc/gemini-cli/settings.json`, macOS `/Library/Application Support/GeminiCli/`,
 Windows `C:\ProgramData\gemini-cli\`). The policy pack emits a ready-to-merge
