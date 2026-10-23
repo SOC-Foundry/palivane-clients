@@ -35,6 +35,7 @@ import json
 import math
 import os
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -45,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -766,6 +767,179 @@ def _breaker_record_locked(token: str, status) -> None:
     _breaker_save(st)
 
 
+# --- Scan-failed ledger (SEC-01) --------------------------------------------------------
+# Every scan error still fails open: Palivane being unreachable never blocks the user. What
+# changed is that a failed scan is no longer folded silently into "allow". Each one is
+# counted here (how many, first and last time, a reason from a fixed vocabulary, never any
+# content) and the tally rides along on the next request that reaches the backend, which
+# adds it to this sensor's heartbeat. The console's Fleet view then says "N scans failed
+# open since T, reason X" instead of showing a healthy, quiet sensor. No extra request is
+# ever made for it, and the happy path pays one rename that finds no file.
+#
+# Claim-by-rename keeps concurrent runs from reporting the same tally twice: a sender
+# atomically renames the pending file to a private claim and attaches it, then deletes the
+# claim once the backend accepted the request or folds it back in when the request failed.
+# A claim left behind by a killed process is folded back by the next failure. Counting is a
+# read-modify-write under a lock (threads) with an atomic replace (processes), so two
+# processes failing at the same instant can drop a count, and a request the backend took but
+# never answered is counted again: off by one at the edges, never by an episode. If the
+# backend stays unreachable nothing is delivered, and the sensor's
+# last-seen ages into the console's stale/dark buckets and the gone-dark alert instead.
+# Copied in every hook and the proxy (each is a standalone file); keep the copies identical
+# apart from _FAILOPEN_FILE.
+_FAILOPEN_FILE = "scan-failed-proxy.json"
+_FAILOPEN_REASONS = ("timeout", "network", "server-error", "auth-rejected", "rate-limited",
+                     "http-error", "bad-response", "breaker-open", "error")
+_FAILOPEN_MAX = 1000000
+_FAILOPEN_ORPHAN_SECS = 120
+_FAILOPEN_LOCK = threading.Lock()
+
+
+def _failopen_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, _FAILOPEN_FILE)
+
+
+def failure_reason(exc) -> str:
+    """Bucket a failed scan into the fixed reason vocabulary. Never the error's text: that
+    can quote a URL or a server message, and the report must carry nothing but counts."""
+    if isinstance(exc, str):
+        return exc if exc in _FAILOPEN_REASONS else "error"
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code if isinstance(exc.code, int) else 0
+        if code in (401, 403):
+            return "auth-rejected"
+        if code == 429:
+            return "rate-limited"
+        return "server-error" if code >= 500 else "http-error"
+    if isinstance(exc, (TimeoutError, socket.timeout)) or isinstance(
+            getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(exc, OSError):
+        return "network"
+    if isinstance(exc, ValueError):
+        return "bad-response"
+    return "error"
+
+
+def _failopen_clean(st) -> dict:
+    """Only well-formed fields survive: the file is writable by anything running as this
+    user, so a known reason with a positive int count, and finite positive timestamps."""
+    if not isinstance(st, dict):
+        return {}
+    reasons = {}
+    raw = st.get("reasons")
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k in _FAILOPEN_REASONS and isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                reasons[k] = min(v, _FAILOPEN_MAX)
+    if not reasons:
+        return {}
+    out = {"count": min(sum(reasons.values()), _FAILOPEN_MAX), "reasons": reasons}
+    for k in ("first", "last"):
+        v = st.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0:
+            out[k] = int(v)
+    return out
+
+
+def _failopen_merge(a: dict, b: dict) -> dict:
+    reasons = dict(a.get("reasons") or {})
+    for k, v in (b.get("reasons") or {}).items():
+        reasons[k] = reasons.get(k, 0) + v
+    firsts = [x["first"] for x in (a, b) if "first" in x]
+    lasts = [x["last"] for x in (a, b) if "last" in x]
+    return _failopen_clean({"reasons": reasons, "first": min(firsts) if firsts else None,
+                            "last": max(lasts) if lasts else None})
+
+
+def _failopen_read(path: str) -> dict:
+    try:
+        with open(path) as fh:
+            return _failopen_clean(json.load(fh))
+    except Exception:
+        return {}
+
+
+def _failopen_write(path: str, st: dict) -> None:
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".scan-failed.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(st, fh)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def record_scan_failure(reason, claim: str = "") -> None:
+    """Count one scan that failed open (`reason`: the exception, or a vocabulary word),
+    and fold back an undelivered claim plus any claim a killed process left behind. Runs
+    only on the failure path. Never raises."""
+    try:
+        with _FAILOPEN_LOCK:
+            path, now = _failopen_path(), int(time.time())
+            back = [claim] if claim else []
+            d, prefix = os.path.dirname(path), "." + _FAILOPEN_FILE + ".claim."
+            try:
+                for name in os.listdir(d):
+                    p = os.path.join(d, name)
+                    if (name.startswith(prefix) and p != claim
+                            and time.time() - os.path.getmtime(p) > _FAILOPEN_ORPHAN_SECS):
+                        back.append(p)
+            except OSError:
+                pass
+            st = _failopen_read(path)
+            for p in back:
+                st = _failopen_merge(st, _failopen_read(p))
+            st = _failopen_merge(st, {"reasons": {failure_reason(reason): 1},
+                                      "first": now, "last": now})
+            _failopen_write(path, st)
+            for p in back:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def claim_scan_failures() -> tuple:
+    """Take the pending tally for the request about to be sent: (claim path, report), or
+    ("", {}) when nothing is pending, which costs one rename that finds no file. The report
+    is counts, reasons and two timestamps; nothing else is ever in it."""
+    try:
+        path = _failopen_path()
+        claim = os.path.join(os.path.dirname(path), "." + _FAILOPEN_FILE + ".claim."
+                             + str(os.getpid()) + "." + os.urandom(4).hex())
+        os.rename(path, claim)
+    except Exception:
+        return "", {}
+    try:
+        os.utime(claim)          # a fresh claim, so the orphan sweep leaves it alone
+    except OSError:
+        pass
+    report = _failopen_read(claim)
+    if not report:
+        scan_failures_delivered(claim)
+        return "", {}
+    return claim, report
+
+
+def scan_failures_delivered(claim: str) -> None:
+    """The backend accepted the request that carried this claim: drop it."""
+    if claim:
+        try:
+            os.unlink(claim)
+        except OSError:
+            pass
+
+
 def scan(content: str, destination: str, tool: str = "",
          url: str | None = None, token: str | None = None, timeout: float = 8.0) -> dict:
     """Call the Palivane ai-usage endpoint; fail open (action=allow) on any error. A revoked
@@ -774,24 +948,38 @@ def scan(content: str, destination: str, tool: str = "",
     tok = token if token is not None else os.getenv("PALIVANE_TOKEN", "")
     skip = _breaker_skip(tok)
     if skip:
+        record_scan_failure("auth-rejected" if skip == "deauthorized" else "breaker-open")
         return {"action": "allow", "reason": f"scan-skipped:{skip}"}
+    body = {"content": content, "destination": destination, "tool": tool,
+            "user": os.getenv("PALIVANE_PROXY_USER", "")}
+    claim, report = claim_scan_failures()
+    if report:
+        body["scan_failed"] = report
     try:
         req = urllib.request.Request(
             base + "/api/ingest/ai-usage", method="POST",
-            data=json.dumps({"content": content, "destination": destination, "tool": tool,
-                             "user": os.getenv("PALIVANE_PROXY_USER", "")}).encode(),
+            data=json.dumps(body).encode(),
             headers={"content-type": "application/json", "User-Agent": f"palivane-proxy/{VERSION}", "X-Palivane-Token": tok},
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            out = json.loads(r.read())
-        _breaker_record(tok, 200)
-        return out
+            raw = r.read()
     except urllib.error.HTTPError as e:
         _breaker_record(tok, e.code)
+        record_scan_failure(e, claim)
         return {"action": "allow", "reason": f"scan-failed:{e.code}"}
-    except Exception:
+    except Exception as e:
         _breaker_record(tok, None)
+        record_scan_failure(e, claim)
         return {"action": "allow", "reason": "scan-failed"}
+    scan_failures_delivered(claim)          # the backend took the request, and the tally
+    try:
+        out = json.loads(raw)
+    except Exception as e:
+        _breaker_record(tok, None)
+        record_scan_failure(e)
+        return {"action": "allow", "reason": "scan-failed"}
+    _breaker_record(tok, 200)
+    return out
 
 
 def should_block(verdict: dict, enforce: bool) -> bool:
@@ -1062,11 +1250,15 @@ def scan_mcp(activity: dict, server: str = "", transport: str = "http",
     tok = token if token is not None else os.getenv("PALIVANE_TOKEN", "")
     skip = _breaker_skip(tok)
     if skip:
+        record_scan_failure("auth-rejected" if skip == "deauthorized" else "breaker-open")
         return {"action": "allow", "reason": f"scan-skipped:{skip}"}
     payload = {"server": server, "transport": transport,
                "user": os.getenv("PALIVANE_PROXY_USER", ""), **activity}
     if authorization:
         payload["authorization"] = authorization
+    claim, report = claim_scan_failures()
+    if report:
+        payload["scan_failed"] = report
     try:
         req = urllib.request.Request(
             base + "/api/ingest/mcp", method="POST",
@@ -1074,15 +1266,24 @@ def scan_mcp(activity: dict, server: str = "", transport: str = "http",
             headers={"content-type": "application/json", "User-Agent": f"palivane-proxy/{VERSION}", "X-Palivane-Token": tok},
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            out = json.loads(r.read())
-        _breaker_record(tok, 200)
-        return out
+            raw = r.read()
     except urllib.error.HTTPError as e:
         _breaker_record(tok, e.code)
+        record_scan_failure(e, claim)
         return {"action": "allow", "reason": f"scan-failed:{e.code}"}
-    except Exception:
+    except Exception as e:
         _breaker_record(tok, None)
+        record_scan_failure(e, claim)
         return {"action": "allow", "reason": "scan-failed"}
+    scan_failures_delivered(claim)          # the backend took the request, and the tally
+    try:
+        out = json.loads(raw)
+    except Exception as e:
+        _breaker_record(tok, None)
+        record_scan_failure(e)
+        return {"action": "allow", "reason": "scan-failed"}
+    _breaker_record(tok, 200)
+    return out
 
 
 def _sig_summary(verdict: dict) -> str:

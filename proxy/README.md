@@ -159,7 +159,10 @@ list of AI domains".
 The proxy must never become the outage. Three layers, all shipped:
 
 - **Scoring fails open** — if the Palivane backend is unreachable or the key is revoked,
-  requests pass (a circuit breaker stops the hammering).
+  requests pass (a circuit breaker stops the hammering). Each pass is counted locally
+  (`~/.palivane/scan-failed-proxy.json`: counts and reasons, never content) and reported
+  with the next request that gets through, so the console's Fleet view shows how many
+  requests went out unscanned and why.
 - **CLI shims fail open** — each shim probes the proxy port at launch and runs the tool
   *direct* (with a stderr note) if the proxy is down, instead of exporting a dead proxy.
 - **The system proxy fails open** (Linux, `palivane-desktop`) — a systemd user timer
