@@ -24,6 +24,13 @@ All of them are **monitor by default, fail-open always**: Palivane being down or
 never blocks a developer. Enforcement is opt-in per plane (env vars below). `palivane-otel`
 is inherently monitor-only — it reads *post-hoc* telemetry, so it observes but can't block.
 
+Fail-open is not silent: the agent hooks count every scan that could not complete (timeout,
+network error, 5xx, rejected key, circuit breaker open) in `~/.palivane/scan-failed-<plane>.json`
+— counts, reasons and times, never content — and attach the tally to the next request that
+reaches Palivane. The console's **Fleet** view shows it per sensor ("N scans failed open since
+T, reason X"). A device that never reaches Palivane again ages into the stale/dark buckets
+and the gone-dark alert instead.
+
 ## `palivane-connect` — self-serve onboarding
 
 The terminal equivalent of the browser-extension sign-in: a user connects **Claude Code**
