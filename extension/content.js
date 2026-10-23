@@ -41,6 +41,7 @@ document.addEventListener(CHANNEL + ":up", async (e) => {
     try {
       verdict = await chrome.runtime.sendMessage({
         type: "scan", content: d.content, destination: d.destination, endpoint: d.endpoint,
+        partial: !!d.partial,
       });
     } catch (_) {
       // The extension was updated or reloaded under this tab: its old content script can no

@@ -244,11 +244,13 @@
     return String(bodyText);
   }
 
-  function scan(content, destination, endpoint) {
+  // partial: this content is only part of the message (the rest was never scanned), so its verdict
+  // must not read as a clean check of the whole message (background.js keeps the "unchecked" mark).
+  function scan(content, destination, endpoint, partial = false) {
     return new Promise((resolve) => {
       const id = newId();
       PENDING.set(id, resolve);
-      if (!post({ kind: "scan", id, content, destination, endpoint })) {
+      if (!post({ kind: "scan", id, content, destination, endpoint, ...(partial ? { partial: true } : {}) })) {
         PENDING.delete(id); resolve({ action: "allow" }); return;   // no content script here
       }
       // Fail OPEN: never break the user's tool if Palivane is slow/unreachable. But not in
@@ -266,13 +268,16 @@
 
   async function scanAll(prompt, destination, endpoint) {
     if (prompt.length <= WINDOW) return scan(prompt, destination, endpoint);
-    if (prompt.length > WINDOW * MAX_WINDOWS) { reportBlind(); prompt = prompt.slice(0, WINDOW * MAX_WINDOWS); }
+    // Past the cap the tail is never scored: report it, and mark every window's scan partial so an
+    // allow on the prefix does not clear the "sent unchecked" notice. Still fail open: it goes out.
+    const truncated = prompt.length > WINDOW * MAX_WINDOWS;
+    if (truncated) { reportBlind(); prompt = prompt.slice(0, WINDOW * MAX_WINDOWS); }
     const parts = [];
     for (let i = 0; ; i += WINDOW - OVERLAP) {
       parts.push(prompt.slice(i, i + WINDOW));
       if (i + WINDOW >= prompt.length) break;
     }
-    const verdicts = await Promise.all(parts.map((p) => scan(p, destination, endpoint)));
+    const verdicts = await Promise.all(parts.map((p) => scan(p, destination, endpoint, truncated)));
     return verdicts.find(stop) || verdicts.find((v) => v.action === "warn") || { action: "allow" };
   }
 
