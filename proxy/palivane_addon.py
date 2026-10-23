@@ -45,7 +45,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -1098,6 +1098,23 @@ def ai_block_body(verdict: dict) -> bytes:
     }}).encode()
 
 
+def connect_block_body(verdict: dict) -> bytes:
+    """A Connect-protocol error for claude.ai's RPC. A client reads `code`, and permission_denied
+    is a final answer, where the Anthropic-API-shaped body above carries no code and was taken for
+    a transient failure and retried."""
+    return json.dumps({"code": "permission_denied",
+                       "message": f"Blocked by Palivane: sensitive data ({_sig_summary(verdict)}) "
+                                  f"— risk {verdict.get('risk_score')}/{verdict.get('severity')}. "
+                                  f"Remove the secret/PII and start a new chat to continue."}).encode()
+
+
+# A client told its send failed may send it again (claude.ai retries on a growing backoff), and each
+# retry was scanned, blocked and counted as another sighting of the same finding, for as long as the
+# app kept trying. An identical send inside this window of a block is the same stopped send: it gets
+# the same answer without another scan. Sliding, so a long backoff stays quiet.
+_BLOCK_QUIET_SECS = 30.0
+
+
 def mcp_block_body(verdict: dict) -> bytes:
     """JSON-RPC error envelope so the agent surfaces the block cleanly."""
     return json.dumps({"jsonrpc": "2.0", "id": None, "error": {
@@ -1113,6 +1130,7 @@ class PalivaneGuard:
     def __init__(self) -> None:
         self.enforce = os.getenv("PALIVANE_PROXY_ENFORCE", "").lower() in ("1", "true", "yes")
         self._tls_warned: set[str] = set()   # hosts we've already explained a TLS failure for
+        self._recent_blocks: dict[str, tuple[float, dict]] = {}   # send fingerprint -> (until, verdict)
 
     def running(self) -> None:
         """Scope TLS interception to the hosts we actually inspect. Everything else is
@@ -1186,6 +1204,14 @@ class PalivaneGuard:
             flow.response.stream = tee
         else:
             flow.response.stream = True
+
+    @staticmethod
+    def _blocked(http, rpc: bool, verdict: dict):
+        """The refusal: a Connect error (403, permission_denied) for claude.ai's RPC, which a client
+        takes as final; the Anthropic-API-shaped 400 for everything else."""
+        if rpc:
+            return http.Response.make(403, connect_block_body(verdict), {"Content-Type": "application/json"})
+        return http.Response.make(400, ai_block_body(verdict), {"Content-Type": "application/json"})
 
     async def request(self, flow) -> None:
         # Async so backend scan calls run in a worker thread: a sync hook blocks
@@ -1278,12 +1304,21 @@ class PalivaneGuard:
                     "palivane: %s%s carried no recognizable prompt (%d bytes) — shape drift? "
                     "This request was NOT scanned.", req.pretty_host, req.path[:80], len(raw))
             if prompt.strip():
+                key = hashlib.sha1(f"{req.pretty_host}\0{prompt}".encode("utf-8", "replace")).hexdigest()[:20]
+                now = time.time()
+                prior = self._recent_blocks.get(key)
+                if prior and prior[0] > now:        # a retry of a send already stopped: same answer
+                    self._recent_blocks[key] = (now + _BLOCK_QUIET_SECS, prior[1])
+                    flow.response = self._blocked(http, rpc, prior[1])
+                    return
                 tool = detect_tool(req.headers.get("user-agent", ""))
                 verdict = await asyncio.to_thread(
                     scan, prompt, f"https://{req.pretty_host}", tool=tool)
                 if should_block(verdict, self.enforce):
-                    flow.response = http.Response.make(
-                        400, ai_block_body(verdict), {"Content-Type": "application/json"})
+                    self._recent_blocks[key] = (now + _BLOCK_QUIET_SECS, verdict)
+                    if len(self._recent_blocks) > 100:
+                        self._recent_blocks = {k: v for k, v in self._recent_blocks.items() if v[0] > now}
+                    flow.response = self._blocked(http, rpc, verdict)
                     return
             if rpc:
                 return              # a chat message: no tool use or tool definitions to read from it
