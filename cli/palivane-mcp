@@ -289,8 +289,11 @@ def _breaker_record_locked(token: str, status) -> None:
         first = st.get("deauth_fp") != fp
         _breaker_save({"deauth_fp": fp, "deauth_until": now + _DEAUTH_SECS})
         if first:
-            sys.stderr.write("palivane: capture key rejected (revoked or invalid) — standing "
-                             "down; re-run `palivane connect` to re-issue.\n")
+            try:   # the host may have closed our stderr; a notice is not worth a crash
+                sys.stderr.write("palivane: capture key rejected (revoked or invalid) — "
+                                 "standing down; re-run `palivane connect` to re-issue.\n")
+            except Exception:
+                pass
         return
     prev = st.get("fails")
     fails = (prev if isinstance(prev, int) and not isinstance(prev, bool) and prev > 0 else 0) + 1
@@ -417,8 +420,14 @@ class _Reporter:
             if items:
                 # The batch verdicts carry the org's enforce stance too: once the console
                 # turns enforcement on, the next calls are scanned inline and blocked.
-                for v in scan_mcp_batch(items, self.cfg):
-                    note_org_stance(self.state, v)
+                # Nothing here may end the thread: a dead reporter stops the telemetry and
+                # the org-stance updates for the rest of the session while enqueue() keeps
+                # growing a queue nobody drains. A batch that raises is dropped, fail-open.
+                try:
+                    for v in scan_mcp_batch(items, self.cfg) or []:
+                        note_org_stance(self.state, v)
+                except Exception:
+                    pass
             if done:
                 return
 
