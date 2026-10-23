@@ -441,6 +441,28 @@ What *does* live on disk is the plumbing: these hook scripts, the proxy addon, a
   `PALIVANE_RELEASE_REQUIRE_SIG=0` is set. Verification uses Python's `cryptography` when
   present, else the `openssl` CLI.
 
+**The proxy addon has its own schedule.** posture only runs where Claude Code does, so a
+machine that uses the egress proxy for desktop apps alone never refreshed its addon. The
+proxy install now adds a periodic `palivane-desktop update-addon` (Linux:
+`palivane-proxy-update.timer`, every 6h; macOS: the `io.palivane.proxy-update` launch agent,
+every 6h; Windows: the `PalivaneProxyUpdate` task, at logon and daily), and posture/connect
+hand the addon to it instead of swapping it themselves. It:
+
+- verifies the addon against the signed manifest and keeps the installed copy on any
+  failure;
+- does nothing at all when the hash is unchanged;
+- otherwise swaps it in atomically. mitmdump re-imports a replaced `-s` script by itself
+  within a second, between flows, with no dropped connections; the addon's `running()` then
+  writes `~/.palivane/proxy-loaded.json` with the sha256 it loaded, which confirms it;
+- restarts the proxy service once only if that confirmation does not arrive (a restart
+  drops in-flight connections for a second or two), and if even that does not load the new
+  build, puts the previous file back, restarts on it, and counts `update-failed` in the
+  proxy's scan-failed ledger so Fleet shows it.
+
+```bash
+~/.palivane/bin/palivane-desktop update-addon   # update the proxy addon now
+```
+
 Every client also reports its build in its `User-Agent` (e.g. `palivane-hook/1.1.0`), which
 the console's **Fleet** page shows per sensor and flags when it lags the deployment.
 

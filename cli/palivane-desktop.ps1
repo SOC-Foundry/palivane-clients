@@ -51,7 +51,7 @@ PowerShell 5.1+ (ships with Windows 10/11); no modules beyond the in-box ones.
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("install", "uninstall", "status")]
+    [ValidateSet("install", "uninstall", "status", "update-addon")]
     [string]$Command = "install",
     [switch]$CliOnly
 )
@@ -376,6 +376,187 @@ function Fetch-Addon([string]$palivaneUrl) {
         Save-VerifiedFile $palivaneUrl $manifest "palivane_addon.py" $Addon
     } catch {
         Die "could not download a verified palivane_addon.py from $palivaneUrl ($($_.Exception.Message))"
+    }
+}
+
+# ---------- addon updates for an installed proxy ----------
+# The Windows side of the bash `update-addon` (same steps, same reasoning):
+#   1. Fetch palivane_addon.py and verify it against the signed manifest; any failure keeps
+#      the installed copy and changes nothing else.
+#   2. Same sha256 as the installed copy: done, nothing restarts.
+#   3. Otherwise move it into place. The downloaded file has a fresh LastWriteTime, and
+#      mitmdump 12.x re-imports its -s script within a second of the mtime moving, in place
+#      (no dropped connections). The new module's running() writes proxy-loaded.json with
+#      the sha256 it loaded; seeing ours there confirms the update.
+#   4. Not confirmed: restart the proxy once (stop our mitmdump, Start-ScheduledTask).
+#   5. Still not confirmed: put the previous file back, restart, and count "update-failed"
+#      in the proxy's scan-failed ledger. The proxy is never left stopped by an update.
+# Runs from the PalivaneProxyUpdate task (at logon + daily) out of a verified copy of this
+# script in ~\.palivane\bin, and when palivane-posture / palivane-connect hand the addon to it.
+$UpdateTaskName = "PalivaneProxyUpdate"
+$InstalledSelf  = Join-Path $ShimDir "palivane-desktop.ps1"
+$UpdateVbs      = Join-Path $WDir "palivane-proxy-update.vbs"
+$StateDir       = if ($env:PALIVANE_STATE_DIR) { $env:PALIVANE_STATE_DIR } else { $WDir }
+$LoadedMarker   = Join-Path $StateDir "proxy-loaded.json"
+$ProxyLedger    = Join-Path $StateDir "scan-failed-proxy.json"
+$UpdateWait     = if ($env:PALIVANE_UPDATE_WAIT) { [int]$env:PALIVANE_UPDATE_WAIT } else { 15 }
+
+# The backend URL without dying when the token is missing (the update needs no token).
+function Resolve-UpdateUrl {
+    $settings = $null
+    try {
+        $f = Join-Path $HomeDir ".claude\settings.json"
+        $data = Get-Content -LiteralPath $f -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($data.env -and $data.env.PALIVANE_URL) { $settings = [pscustomobject]@{ Url = "$($data.env.PALIVANE_URL)" } }
+    } catch {}
+    return Resolve-PalivaneUrl $settings
+}
+
+function Get-LoadedSha {
+    try { return "$((Get-Content -LiteralPath $LoadedMarker -Raw -ErrorAction Stop | ConvertFrom-Json).sha256)" }
+    catch { return "" }
+}
+
+function Wait-Loaded([string]$sha) {
+    for ($i = 0; $i -lt $UpdateWait; $i++) {
+        if ((Get-LoadedSha) -eq $sha) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return ((Get-LoadedSha) -eq $sha)
+}
+
+function Restart-Proxy {
+    try {
+        Get-Process -Name "mitmdump" -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -like "$MitmDir*" } catch { $false }
+        } | ForEach-Object { try { Stop-Process -Id $_.Id -Force } catch {} }
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    } catch { return $false }
+    for ($i = 0; $i -lt $UpdateWait; $i++) {
+        if (Test-ProxyListening) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return (Test-ProxyListening)
+}
+
+# Move <src> over <dest> with a fresh LastWriteTime (Copy-Item keeps the old one, and an
+# mtime that did not move forward is never reloaded).
+function Set-FileInPlace([string]$src, [string]$dest) {
+    $tmp = "$dest.palivane-new"
+    Copy-Item -LiteralPath $src -Destination $tmp -Force
+    (Get-Item -LiteralPath $tmp).LastWriteTime = Get-Date
+    Move-Item -LiteralPath $tmp -Destination $dest -Force
+}
+
+function Add-UpdateFailure {
+    try {
+        $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $reasons = @{}; $first = $now
+        if (Test-Path -LiteralPath $ProxyLedger) {
+            try {
+                $st = Get-Content -LiteralPath $ProxyLedger -Raw | ConvertFrom-Json
+                foreach ($p in $st.reasons.PSObject.Properties) {
+                    if ($p.Value -is [int] -or $p.Value -is [long]) { if ($p.Value -gt 0) { $reasons[$p.Name] = [int]$p.Value } }
+                }
+                if ($st.first) { $first = [int]$st.first }
+            } catch {}
+        }
+        $reasons["update-failed"] = 1 + $(if ($reasons.ContainsKey("update-failed")) { $reasons["update-failed"] } else { 0 })
+        $total = 0; foreach ($v in $reasons.Values) { $total += $v }
+        $out = @{ count = $total; reasons = $reasons; first = $first; last = $now } | ConvertTo-Json -Compress
+        $tmp = "$ProxyLedger.palivane-new"
+        Set-Content -LiteralPath $tmp -Value $out -Encoding ascii
+        Move-Item -LiteralPath $tmp -Destination $ProxyLedger -Force
+    } catch {}
+}
+
+# Keep the installed copy of this script current (the update task runs it). PowerShell has
+# already parsed the running script, so replacing the file underneath it is safe.
+function Update-InstalledSelf([string]$palivaneUrl, [object]$manifest) {
+    if (-not (Test-Path -LiteralPath $InstalledSelf)) { return }
+    $want = "$($manifest.files.'palivane-desktop.ps1'.sha256)"
+    if (-not $want) { return }
+    $have = (Get-FileHash -LiteralPath $InstalledSelf -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($have -eq $want) { return }
+    try { Save-VerifiedFile $palivaneUrl $manifest "palivane-desktop.ps1" $InstalledSelf; Log "updated $InstalledSelf." } catch {}
+}
+
+function Invoke-UpdateAddon {
+    if (-not (Test-Path -LiteralPath $Addon)) { Log "no proxy addon installed at $Addon - nothing to update."; return 0 }
+    if ("$env:PALIVANE_NO_SELF_UPDATE" -match '^(1|true|yes)$') { Log "self-update disabled (PALIVANE_NO_SELF_UPDATE)."; return 0 }
+    $palivaneUrl = Resolve-UpdateUrl
+    $manifest = Get-VerifiedManifest $palivaneUrl
+    if (-not $manifest) { Log "no verified release manifest from $palivaneUrl - kept the installed addon."; return 1 }
+    $want = "$($manifest.files.'palivane_addon.py'.sha256)"
+    $have = (Get-FileHash -LiteralPath $Addon -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($want -and $have -eq $want) {
+        Log "addon is current - nothing to do."
+        Update-InstalledSelf $palivaneUrl $manifest
+        return 0
+    }
+    $download = "$Addon.download"
+    try {
+        Save-VerifiedFile $palivaneUrl $manifest "palivane_addon.py" $download
+    } catch {
+        Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
+        Log "could not get a verified addon ($($_.Exception.Message)) - kept the installed copy."
+        return 1
+    }
+    $prev = "$Addon.prev"
+    Copy-Item -LiteralPath $Addon -Destination $prev -Force
+    Remove-Item -LiteralPath $LoadedMarker -Force -ErrorAction SilentlyContinue
+    Set-FileInPlace $download $Addon
+    Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
+    $rc = 0
+    if (-not (Test-ProxyListening)) {
+        Log "addon updated; the proxy is not running, it loads the new addon when it starts."
+    } elseif (Wait-Loaded $want) {
+        Log "addon updated; the running proxy reloaded it in place (no restart)."
+    } elseif ((Restart-Proxy) -and (Wait-Loaded $want)) {
+        Log "addon updated; the proxy was restarted to load it."
+    } else {
+        Log "the proxy did not load the new addon - restoring the previous one."
+        try { Set-FileInPlace $prev $Addon } catch {}
+        if (-not (Restart-Proxy)) { Log "warning: the proxy is not listening after the rollback." }
+        Add-UpdateFailure
+        $rc = 1
+    }
+    if ($rc -eq 0) { Remove-Item -LiteralPath $prev -Force -ErrorAction SilentlyContinue }
+    Update-InstalledSelf $palivaneUrl $manifest
+    return $rc
+}
+
+function Install-UpdateTask([string]$palivaneUrl) {
+    try {
+        $manifest = Get-VerifiedManifest $palivaneUrl
+        if (-not $manifest) { throw "the release manifest did not verify" }
+        New-Item -ItemType Directory -Force -Path $ShimDir | Out-Null
+        Save-VerifiedFile $palivaneUrl $manifest "palivane-desktop.ps1" $InstalledSelf
+    } catch {
+        Log "addon auto-update not scheduled: could not install a verified palivane-desktop.ps1 ($($_.Exception.Message))."
+        return
+    }
+    # wscript launcher, window style 0: no console flashes when the task runs.
+    $ps = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File """"$InstalledSelf"""" update-addon"
+    Set-Content -LiteralPath $UpdateVbs -Value "CreateObject(""WScript.Shell"").Run ""$ps"", 0, True" -Encoding ascii
+    $action   = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "//B ""$UpdateVbs"""
+    $triggers = @((New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"),
+                  (New-ScheduledTaskTrigger -Daily -At 12pm))
+    $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    try {
+        Register-ScheduledTask -TaskName $UpdateTaskName -Action $action -Trigger $triggers -Settings $settings `
+            -Description "Palivane proxy addon update (verified; reloads the running proxy only on change)" -Force | Out-Null
+        Log "addon updates scheduled (task '$UpdateTaskName': at logon and daily)."
+    } catch {
+        Log "addon auto-update: could not register '$UpdateTaskName': $($_.Exception.Message)"
+    }
+}
+
+function Remove-UpdateTask {
+    try { Unregister-ScheduledTask -TaskName $UpdateTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    foreach ($p in @($UpdateVbs, $InstalledSelf, "$Addon.prev", $LoadedMarker)) {
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -794,6 +975,7 @@ function Invoke-Install {
     if (-not $CliOnly) { Set-UserProxy }   # only after the proxy is confirmed listening
     Wire-CliCapture           # both modes — Node CLIs ignore the WinINET proxy/cert store
     Install-SecretsScan $palivaneUrl $settings.Token $settings.User
+    Install-UpdateTask $palivaneUrl   # verified addon updates reach the running proxy
     if ($CliOnly) {
         Log "done. CLIs ($($CliShimTools -join ' ')) now route through Palivane. Enforce mode: $enforce."
         Log "Verify: open a NEW terminal and run 'claude'; check findings in the console."
@@ -809,6 +991,7 @@ function Invoke-Uninstall {
     Unset-UserProxy
     Remove-ProxyTask
     Remove-SecretsScan
+    Remove-UpdateTask
     Untrust-CA
     Log "stopped. (mitmproxy binaries and ~/.mitmproxy keys left under $WDir / $HomeDir\.mitmproxy;"
     Log "         delete them manually to fully revert.)"
@@ -862,4 +1045,5 @@ switch ($Command) {
     "install"   { Invoke-Install }
     "uninstall" { Invoke-Uninstall }
     "status"    { Invoke-Status }
+    "update-addon" { exit (Invoke-UpdateAddon) }
 }

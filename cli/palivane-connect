@@ -289,6 +289,23 @@ def _download_script(base: str, name: str, dest: str, manifest: dict) -> None:
     os.replace(tmp, dest)
 
 
+def _addon_updater() -> list[str] | None:
+    """The installed palivane-desktop's `update-addon`, when it has one (None for installs
+    that predate it). Same function as palivane-posture's."""
+    if os.name == "nt":
+        path = os.path.expanduser("~/.palivane/bin/palivane-desktop.ps1")
+        argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                "Bypass", "-File", path, "update-addon"]
+    else:
+        path = os.path.expanduser("~/.palivane/bin/palivane-desktop")
+        argv = [path, "update-addon"]
+    try:
+        with open(path, "rb") as f:
+            return argv if b"update-addon" in f.read() else None
+    except OSError:
+        return None
+
+
 def _refresh_planes(console: str) -> list[str]:
     """Upgrade the installed capture-plane scripts to the console's current versions so a
     re-run of `palivane connect` picks up new plane code. Best-effort: on any failure we keep
@@ -311,13 +328,31 @@ def _refresh_planes(console: str) -> list[str]:
             failed.append(name)
     # The egress-proxy addon lives outside bin and only when the proxy is installed — refresh
     # it in place too (so the proxy gets the breaker), but never create it here.
+    # palivane-desktop's update-addon does it when the install has one: same verification,
+    # and it also gets the RUNNING proxy to load the new addon (rollback if it will not).
     addon = os.path.expanduser("~/.palivane/palivane_addon.py")
     if os.path.exists(addon):
-        try:
-            _download_script(base, "palivane_addon.py", addon, manifest)
-            updated.append("palivane_addon.py")
-        except Exception:
-            failed.append("palivane_addon.py")
+        updater = _addon_updater()
+        if updater:
+            import subprocess
+            try:
+                subprocess.run(updater, env={**os.environ, "PALIVANE_URL": base},
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=180)
+            except Exception:
+                pass
+            try:
+                with open(addon, "rb") as f:
+                    current = _matches_manifest(manifest, "palivane_addon.py", f.read())
+            except OSError:
+                current = False
+            (updated if current else failed).append("palivane_addon.py")
+        else:
+            try:
+                _download_script(base, "palivane_addon.py", addon, manifest)
+                updated.append("palivane_addon.py")
+            except Exception:
+                failed.append("palivane_addon.py")
     msgs = []
     if updated:
         msgs.append(f"updated {len(updated)} capture-plane script(s) to the latest version")

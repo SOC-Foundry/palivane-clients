@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -789,7 +789,7 @@ def _breaker_record_locked(token: str, status) -> None:
 # apart from _FAILOPEN_FILE.
 _FAILOPEN_FILE = "scan-failed-proxy.json"
 _FAILOPEN_REASONS = ("timeout", "network", "server-error", "auth-rejected", "rate-limited",
-                     "http-error", "bad-response", "breaker-open", "error")
+                     "http-error", "bad-response", "breaker-open", "error", "update-failed")
 _FAILOPEN_MAX = 1000000
 _FAILOPEN_ORPHAN_SECS = 120
 _FAILOPEN_LOCK = threading.Lock()
@@ -1325,6 +1325,44 @@ def mcp_block_body(verdict: dict) -> bytes:
     }}).encode()
 
 
+# --- Loaded marker: which addon build the running proxy actually executes -------------
+# palivane-desktop's updater swaps this file in place, and mitmproxy (12.x) re-imports a
+# script whose mtime changes within about a second, then calls running() on the new module.
+# running() records the sha256 of the file it was loaded from; the updater reads it back to
+# confirm the new build is live, restarts the service if it is not, and puts the previous
+# file back if even a restart does not load it. Never raises: a marker that cannot be
+# written only makes the updater fall back to a restart.
+_LOADED_FILE = "proxy-loaded.json"
+
+
+def _loaded_marker_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, _LOADED_FILE)
+
+
+def write_loaded_marker(source: str | None = None) -> None:
+    try:
+        with open(source or __file__, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        path = _loaded_marker_path()
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".proxy-loaded.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"version": VERSION, "sha256": digest, "pid": os.getpid(),
+                           "at": int(time.time())}, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        pass
+
+
 # --- mitmproxy hook (thin wrapper around the functions above) -------------------------
 
 class PalivaneGuard:
@@ -1339,7 +1377,11 @@ class PalivaneGuard:
         bundles, and VPN/ZTNA clients that do their own TLS inspection (Zscaler, Netskope,
         Tailscale-gated services) keep working even with the system proxy pointed at us.
         PALIVANE_PROXY_INTERCEPT_ALL=true restores full interception for orgs that want it;
-        PALIVANE_PROXY_INTERCEPT_EXTRA adds hosts (e.g. remote MCP servers) to the list."""
+        PALIVANE_PROXY_INTERCEPT_EXTRA adds hosts (e.g. remote MCP servers) to the list.
+
+        mitmproxy calls this again after it reloads a replaced script, so it is also where
+        this build tells the updater it is live (write_loaded_marker)."""
+        write_loaded_marker()
         if os.getenv("PALIVANE_PROXY_INTERCEPT_ALL", "").lower() in ("1", "true", "yes"):
             return
         import logging

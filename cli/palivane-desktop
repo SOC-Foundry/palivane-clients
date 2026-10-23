@@ -11,6 +11,8 @@
 #   palivane-desktop install --cli-only   # CLIs only (Claude Code, Codex, Gemini) — no sudo
 #   palivane-desktop uninstall            # stop it; remove system proxy, CA trust, CLI shims
 #   palivane-desktop status
+#   palivane-desktop update-addon         # fetch + verify the addon; the running proxy loads it
+#                                         # (runs on its own 6h timer; restarts only if needed)
 #
 # macOS and Linux (GNOME/KDE; other desktops fall back to manual/env-var setup).
 # On Linux the CA is trusted in BOTH the system bundle and the per-user NSS store
@@ -282,6 +284,218 @@ fetch_addon() {
   log "fetching capture addon (verifying the signed release)…"
   fetch_verified palivane_addon.py "$ADDON" \
     || die "could not get a verified palivane_addon.py from $PALIVANE_URL (unreachable, or its release signature/hash did not check out)."
+}
+
+# --- Addon updates for an installed proxy ---------------------------------------------------
+# Without this, a device kept the addon it was installed with: the only other refreshes are
+# palivane-posture (runs at a Claude Code session start, so never on a desktop-apps-only
+# machine) and a manual re-run of `palivane connect`. `update-addon` runs on its own timer
+# (palivane-proxy-update.timer on Linux, the io.palivane.proxy-update launch agent on
+# macOS) and when posture/connect hand the addon to it:
+#
+#   1. Fetch palivane_addon.py and verify it against the signed manifest (fetch_verified).
+#      Any failure keeps the installed copy and changes nothing else.
+#   2. Same sha256 as the installed copy: done. Nothing is touched and nothing restarts.
+#   3. Otherwise swap it in atomically (a fresh file renamed over the old one). mitmdump
+#      12.x polls its -s script's mtime every second and re-imports it in place, between
+#      flows, so no connection drops. The new module's running() writes proxy-loaded.json
+#      with the sha256 it loaded; seeing ours there confirms the update.
+#   4. Not confirmed in time: restart the service once (drops in-flight connections for a
+#      second or two) and look again.
+#   5. Still not confirmed, or the restart failed: put the previous file back, restart, and
+#      count "update-failed" in the proxy's scan-failed ledger, which the proxy reports with
+#      its next scan (SEC-01). The proxy is never left stopped by an update.
+UPDATE_WAIT="${PALIVANE_UPDATE_WAIT:-15}"            # seconds to wait for each confirmation
+PROXY_LABEL="io.palivane.proxy"                      # macOS launchd label of the proxy
+UPDATE_LABEL="io.palivane.proxy-update"
+state_dir() { printf '%s' "${PALIVANE_STATE_DIR:-$WDIR}"; }
+
+loaded_sha() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("sha256", ""))' \
+    "$(state_dir)/proxy-loaded.json" 2>/dev/null || true
+}
+
+wait_loaded() {                                       # wait_loaded <sha256>
+  local i=0
+  while [ "$i" -lt "$UPDATE_WAIT" ]; do
+    [ "$(loaded_sha)" = "$1" ] && return 0
+    sleep 1; i=$((i + 1))
+  done
+  [ "$(loaded_sha)" = "$1" ]
+}
+
+wait_listening() {
+  local i=0
+  while [ "$i" -lt "$UPDATE_WAIT" ]; do
+    proxy_port_open && return 0
+    sleep 1; i=$((i + 1))
+  done
+  proxy_port_open
+}
+
+restart_proxy() {
+  case "$OS" in
+    Darwin) launchctl kickstart -k "gui/$(id -u)/${PROXY_LABEL}" ;;
+    Linux)  systemctl --user restart palivane-proxy.service ;;
+    *)      return 1 ;;
+  esac
+}
+
+# Atomic replace with a FRESH mtime (cp, then rename): mitmproxy reloads on an mtime that
+# moved forward, so a copy that kept an old mtime (cp -p, mv of an old file) is never seen.
+swap_into_place() {                                   # swap_into_place <src> <dest>
+  cp "$1" "${2}.palivane-new" && mv -f "${2}.palivane-new" "$2"
+}
+
+# Count one "update-failed" in the proxy's ledger, merged the way the addon's own
+# record_scan_failure merges (vocabulary + positive counts + first/last), atomic replace.
+record_update_failure() {
+  python3 - "$(state_dir)/scan-failed-proxy.json" <<'PY' || true
+import json, os, sys, tempfile, time
+path, now = sys.argv[1], int(time.time())
+try:
+    st = json.load(open(path))
+    reasons = {k: v for k, v in (st.get("reasons") or {}).items()
+               if isinstance(v, int) and not isinstance(v, bool) and v > 0}
+    first = st.get("first") if isinstance(st.get("first"), int) else now
+except Exception:
+    reasons, first = {}, now
+reasons["update-failed"] = reasons.get("update-failed", 0) + 1
+out = {"count": sum(reasons.values()), "reasons": reasons, "first": first, "last": now}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".scan-failed.", suffix=".tmp")
+with os.fdopen(fd, "w") as fh:
+    json.dump(out, fh)
+os.replace(tmp, path)
+PY
+}
+
+cmd_update_addon() {
+  if [ ! -f "$ADDON" ]; then log "no proxy addon installed at $ADDON — nothing to update."; return 0; fi
+  case "${PALIVANE_NO_SELF_UPDATE:-}" in 1|true|yes) log "self-update disabled (PALIVANE_NO_SELF_UPDATE)."; return 0 ;; esac
+  command -v python3 >/dev/null 2>&1 || { log "python3 is needed to verify an addon update."; return 1; }
+  ensure_update_timer
+  local t new_sha old_sha prev="${ADDON}.prev" rc=0
+  t="$(mktemp -d)" || return 1
+  if ! fetch_verified palivane_addon.py "$t/palivane_addon.py"; then
+    rm -rf "$t"
+    log "no verified addon available from $PALIVANE_URL — kept the installed copy."
+    return 1
+  fi
+  new_sha="$(sha256_of "$t/palivane_addon.py")"; old_sha="$(sha256_of "$ADDON")"
+  if [ "$new_sha" = "$old_sha" ]; then
+    rm -rf "$t"; log "addon is current — nothing to do."
+    refresh_self; return 0
+  fi
+  cp -p "$ADDON" "$prev"
+  rm -f "$(state_dir)/proxy-loaded.json"       # so only the build we swap in can confirm
+  if ! swap_into_place "$t/palivane_addon.py" "$ADDON"; then
+    rm -rf "$t"; log "could not write $ADDON — kept the installed copy."; return 1
+  fi
+  rm -rf "$t"
+  if ! proxy_port_open; then
+    log "addon updated; the proxy is not running, it loads the new addon when it starts."
+  elif wait_loaded "$new_sha"; then
+    log "addon updated; the running proxy reloaded it in place (no restart)."
+  elif restart_proxy && wait_loaded "$new_sha"; then
+    log "addon updated; the proxy was restarted to load it."
+  else
+    log "the proxy did not load the new addon — restoring the previous one."
+    swap_into_place "$prev" "$ADDON" || true
+    restart_proxy || true
+    wait_listening || log "warning: the proxy is not listening after the rollback; the watchdog fails the system proxy open if it stays down."
+    record_update_failure
+    rc=1
+  fi
+  [ "$rc" = 0 ] && rm -f "$prev"
+  refresh_self
+  return "$rc"
+}
+
+# Keep the installed copy of this script current too (the timer runs it), but only that copy:
+# a source checkout or a one-off download is left alone. bash keeps reading the file it
+# opened, so replacing it by rename under a running instance is safe.
+refresh_self() {
+  local self t
+  self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  [ "$self" = "$(readlink -f "${WDIR}/bin/palivane-desktop" 2>/dev/null)" ] || return 0
+  t="$(mktemp -d)" || return 0
+  if fetch_verified palivane-desktop "$t/palivane-desktop" \
+     && [ "$(sha256_of "$t/palivane-desktop")" != "$(sha256_of "$self")" ]; then
+    chmod 755 "$t/palivane-desktop" && swap_into_place "$t/palivane-desktop" "$self" \
+      && log "updated palivane-desktop itself."
+  fi
+  rm -rf "$t"
+  return 0
+}
+
+# The periodic job that runs update-addon. Idempotent: written only when missing or changed,
+# so posture/connect handing the addon to an existing install arms it there too. Points at
+# the installed copy of this script only (never a source checkout or a temp download).
+ensure_update_timer() {
+  local self
+  self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+  case "$self" in "${WDIR}/bin/"*) ;; *) return 0 ;; esac
+  case "$OS" in
+    Linux)
+      command -v systemctl >/dev/null 2>&1 || return 0
+      local dir="${HOME_DIR}/.config/systemd/user" svc tmr
+      svc="[Unit]
+Description=Palivane proxy addon update (verified; reloads the running proxy only on change)
+[Service]
+Type=oneshot
+Environment=PALIVANE_URL=${PALIVANE_URL}
+ExecStart=${self} update-addon"
+      tmr="[Unit]
+Description=Palivane proxy addon update timer
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+[Install]
+WantedBy=timers.target"
+      if [ "$(cat "$dir/palivane-proxy-update.service" 2>/dev/null)" = "$svc" ] \
+         && [ "$(cat "$dir/palivane-proxy-update.timer" 2>/dev/null)" = "$tmr" ]; then
+        return 0
+      fi
+      mkdir -p "$dir"
+      printf '%s\n' "$svc" > "$dir/palivane-proxy-update.service"
+      printf '%s\n' "$tmr" > "$dir/palivane-proxy-update.timer"
+      systemctl --user daemon-reload 2>/dev/null || true
+      systemctl --user enable --now palivane-proxy-update.timer 2>/dev/null || true
+      log "addon updates armed: palivane-proxy-update.timer checks every 6h." ;;
+    Darwin)
+      local plist="${HOME_DIR}/Library/LaunchAgents/${UPDATE_LABEL}.plist" body
+      body="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>${UPDATE_LABEL}</string>
+  <key>ProgramArguments</key><array><string>${self}</string><string>update-addon</string></array>
+  <key>EnvironmentVariables</key><dict><key>PALIVANE_URL</key><string>${PALIVANE_URL}</string></dict>
+  <key>StartInterval</key><integer>21600</integer>
+</dict></plist>"
+      [ "$(cat "$plist" 2>/dev/null)" = "$body" ] && return 0
+      mkdir -p "$(dirname "$plist")"
+      printf '%s\n' "$body" > "$plist"
+      launchctl unload "$plist" 2>/dev/null || true
+      launchctl load "$plist" 2>/dev/null || true
+      log "addon updates armed: ${UPDATE_LABEL} checks every 6h." ;;
+  esac
+  return 0
+}
+
+remove_update_timer() {
+  case "$OS" in
+    Linux)
+      systemctl --user disable --now palivane-proxy-update.timer 2>/dev/null || true
+      rm -f "${HOME_DIR}/.config/systemd/user/palivane-proxy-update.service" \
+            "${HOME_DIR}/.config/systemd/user/palivane-proxy-update.timer"
+      systemctl --user daemon-reload 2>/dev/null || true ;;
+    Darwin)
+      launchctl unload "${HOME_DIR}/Library/LaunchAgents/${UPDATE_LABEL}.plist" 2>/dev/null || true
+      rm -f "${HOME_DIR}/Library/LaunchAgents/${UPDATE_LABEL}.plist" ;;
+  esac
+  return 0
 }
 
 bootstrap_ca() {
@@ -956,6 +1170,7 @@ cmd_install() {
     wire_electron_apps  # --proxy-server override for Electron AI apps (they ignore env/DE proxy)
   fi
   wire_cli_capture      # PATH shims for Node CLIs (needed in both modes — Node ignores the OS proxy/trust)
+  ensure_update_timer   # both modes: verified addon updates reach the running proxy
   if [ "$cli_only" = "1" ]; then
     log "done. CLIs (${CLI_SHIM_TOOLS}) now route through Palivane. Enforce mode: ${PALIVANE_PROXY_ENFORCE:-false} (monitor)."
     log "Verify: open a NEW terminal and run 'claude'; check findings in the console."
@@ -972,6 +1187,8 @@ cmd_uninstall() {
   unwire_cli_capture
   remove_mitm_conf
   unwire_electron_apps
+  remove_update_timer
+  rm -f "${ADDON}.prev" "$(state_dir)/proxy-loaded.json"
   case "$OS" in
     Darwin)
       local svc; svc="$(macos_primary_service || true)"
@@ -1030,6 +1247,7 @@ cmd_status() {
     Linux)
       printf 'proxy: %s\n' "$(systemctl --user is-active palivane-proxy.service 2>/dev/null || echo 'not running')"
       printf 'watchdog: %s\n' "$(systemctl --user is-active palivane-proxy-watchdog.timer 2>/dev/null || echo 'not installed')"
+      printf 'addon updates: %s\n' "$(systemctl --user is-active palivane-proxy-update.timer 2>/dev/null || echo 'not installed')"
       [ -f "$WATCHDOG_MARKER" ] && echo "system proxy: FAILED OPEN (proxy down — re-applies on recovery)" ;;
   esac
   local name active=""
@@ -1128,6 +1346,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     uninstall)     cmd_uninstall ;;
     status)        cmd_status ;;
     watchdog-tick) cmd_watchdog_tick ;;   # invoked by the systemd user timer, not by hand
-    *) die "usage: palivane-desktop [install [--cli-only]|uninstall|status]" ;;
+    update-addon)  cmd_update_addon ;;    # the update timer, posture and connect call this
+    *) die "usage: palivane-desktop [install [--cli-only]|uninstall|status|update-addon]" ;;
   esac
 fi
