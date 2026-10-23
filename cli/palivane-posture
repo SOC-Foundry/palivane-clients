@@ -54,7 +54,7 @@ CACHE_PATH = "~/.palivane/posture-cache.json"
 
 # Reported in the User-Agent so the console's Fleet view can show which client build each
 # device runs (and flag the stale ones). Bump when the client contract changes.
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # MCP config files posted raw (path label → filesystem path).
 _RAW_MCP_CONFIGS = (
@@ -715,6 +715,34 @@ def _replace_atomic(path: str, blob: bytes) -> bool:
         return False
 
 
+def _addon_updater() -> list[str] | None:
+    """The installed palivane-desktop's `update-addon`, when it has one. It verifies the
+    proxy addon against the same signed manifest and also gets it loaded by the RUNNING
+    proxy (confirming the reload, restarting if needed, rolling back if the new build will
+    not load), which a bare file swap here cannot. None for installs that predate it."""
+    if os.name == "nt":
+        path = os.path.expanduser("~/.palivane/bin/palivane-desktop.ps1")
+        argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                "Bypass", "-File", path, "update-addon"]
+    else:
+        path = os.path.expanduser("~/.palivane/bin/palivane-desktop")
+        argv = [path, "update-addon"]
+    try:
+        with open(path, "rb") as f:
+            return argv if b"update-addon" in f.read() else None
+    except OSError:
+        return None
+
+
+def _update_addon_via_desktop(argv: list[str], base: str) -> None:
+    try:
+        subprocess.run(argv, env={**os.environ, "PALIVANE_URL": base},
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=180)
+    except Exception:
+        pass
+
+
 def self_update(cfg: dict, cache: dict, force: bool = False,
                 dry_run: bool = False, say=print) -> int:
     """Refresh installed Palivane scripts whose hash differs from the backend's manifest.
@@ -751,9 +779,22 @@ def self_update(cfg: dict, cache: dict, force: bool = False,
                 continue
             if have == want:
                 continue
+            # The proxy addon goes through palivane-desktop when it can (see _addon_updater);
+            # sorted() puts palivane-desktop first, so it is already the current build here.
+            updater = _addon_updater() if name == "palivane_addon.py" else None
             if dry_run:
-                say(f"would update {name} ({path})")
+                say(f"would update {name} ({path}{', via palivane-desktop' if updater else ''})")
                 updated += 1
+                continue
+            if updater:
+                _update_addon_via_desktop(updater, base)
+                try:
+                    with open(path, "rb") as f:
+                        if hashlib.sha256(f.read()).hexdigest() == want:
+                            updated += 1
+                            say(f"updated {name} -> {manifest.get('version', '?')} ({path})")
+                except OSError:
+                    pass
                 continue
             blob = _fetch(f"{base}/cli/{name}", cfg["token"])
             if blob is None:
