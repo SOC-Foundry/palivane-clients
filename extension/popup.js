@@ -14,7 +14,9 @@ function render(state) {
   // failed check otherwise looks exactly like a clean one.
   const sk = state.lastSkip;
   const skipEl = $("skip");
-  if (sk && (!v || sk.at > (v.at || 0))) {
+  // A partial verdict (only part of a long message was scored) is not a clean check either: it
+  // never hides the notice. Only a newer verdict on a whole message does.
+  if (sk && (!v || v.partial || sk.at > (v.at || 0))) {
     skipEl.hidden = false;
     skipEl.textContent = `Last message was sent unchecked: ${sk.label} (${new Date(sk.at).toLocaleTimeString()})`;
   } else {
@@ -30,7 +32,7 @@ function render(state) {
   el.className = "verdict";
   el.innerHTML =
     `<div>last verdict, <span class="sev sev-${esc(v.severity)}">${esc(v.coached ? "held (coached)" : v.action)} · ${esc(v.severity)}</span> ` +
-    `(risk ${esc(v.risk_score ?? "?")})</div>` +
+    `(risk ${esc(v.risk_score ?? "?")})${v.partial ? ", first part only" : ""}</div>` +
     `<div class="sigs">${sigs}</div>` +
     `<div class="muted" style="margin-top:4px;font-size:11px;">${when}</div>`;
 }

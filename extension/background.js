@@ -110,16 +110,18 @@ async function sha256Hex(text) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function recordVerdict(verdict) {
+async function recordVerdict(verdict, partial = false) {
   // Keep a session block counter + the last verdict for the popup, and reflect blocks
-  // on the toolbar badge.
+  // on the toolbar badge. A partial verdict covered only part of a message (the rest was never
+  // scored): it is shown, but it is not a clean check and does not clear an "unchecked" mark.
   const { blockCount = 0 } = await chrome.storage.local.get({ blockCount: 0 });
   // A coached verdict is held like a block (injected.js), so it counts as one.
   const next = verdict.action === "block" || verdict.coached ? blockCount + 1 : blockCount;
   await chrome.storage.local.set({
     blockCount: next,
-    lastVerdict: { ...verdict, at: Date.now() },
+    lastVerdict: { ...verdict, at: Date.now(), ...(partial ? { partial: true } : {}) },
   });
+  if (partial) return;   // the caller records a skip next, and that owns the badge
   try {
     if (next > 0) {
       await chrome.action.setBadgeText({ text: String(next) });
@@ -225,14 +227,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "blind") {
     (async () => {
       try {
-        // A send we saw but could not read. Tell the console once per site per ten minutes
+        // A send we saw but could not read. The person is told every time (a good check in
+        // between must not hide this one); the console once per site per ten minutes
         // (parse_miss: no content, it only moves the sensor's drift counter).
         const origin = String(msg.destination || "");
+        await recordSkip("could not read a message on " + origin.replace(/^https?:\/\//, ""));
         const k = "blindAt:" + origin;
         const seen = (await chrome.storage.session.get({ [k]: 0 }))[k];
         if (Date.now() - seen < 10 * 60 * 1000) return;
         await chrome.storage.session.set({ [k]: Date.now() });
-        await recordSkip("could not read a message on " + origin.replace(/^https?:\/\//, ""));
         const c = await config();
         const key = await getIngestKey(c);
         if (!key) return;
@@ -289,7 +292,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.session.set({
           ["blockedHash:" + verdict.finding_id]: await sha256Hex(msg.content) });
       }
-      await recordVerdict(verdict);
+      await recordVerdict(verdict, !!msg.partial);
+      // Only part of the message was scored: it went out partly unchecked, and must say so.
+      if (msg.partial) await recordSkip("message too long, only the first part was checked");
       sendResponse(verdict);
     } catch (e) {
       sendResponse(skipped("could not reach Palivane", String(e))); // fail open
