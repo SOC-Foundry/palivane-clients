@@ -296,19 +296,31 @@ def list_objects(s3, bucket: str, prefix: str, max_objects: int) -> list[dict]:
     return out
 
 
-def read_object(s3, bucket: str, key: str) -> str | None:
-    """One object's readable text: plain text directly, and PDFs / Office documents
-    through the shared extractor, since a bucket of exported reports is exactly where a
-    customer record sits. Returns None for what nothing here can open (an image needs OCR,
-    which is not available in a stdlib scanner) — the caller counts those, so an unopened
-    object is never mistaken for a clean one."""
+def read_object_detail(s3, bucket: str, key: str) -> tuple[str, bool] | None:
+    """One object's readable text and whether only part of it was read: plain text
+    directly, and PDFs / Office documents through the shared extractor, since a bucket of
+    exported reports is exactly where a customer record sits. Returns None for what nothing
+    here can open (an image needs OCR, which is not available in a stdlib scanner) — the
+    caller counts those, so an unopened object is never mistaken for a clean one. A partial
+    read (a PDF stream that would not inflate) is counted too, for the same reason."""
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
         raw = resp["Body"].read()
     except Exception:
         return None
-    text = detect.extract_text(key, raw)
-    return text[:MAX_CONTENT] if text else None
+    if hasattr(detect, "extract_text_detail"):
+        text, partial = detect.extract_text_detail(key, raw)
+    else:                     # an older palivane_detect.py installed beside this script
+        text, partial = detect.extract_text(key, raw), False
+    if not text:
+        return None
+    return text[:MAX_CONTENT], partial or len(text) > MAX_CONTENT
+
+
+def read_object(s3, bucket: str, key: str) -> str | None:
+    """read_object_detail's text alone."""
+    got = read_object_detail(s3, bucket, key)
+    return got[0] if got else None
 
 
 def read_config(url_flag: str) -> dict:
@@ -371,15 +383,17 @@ def main() -> int:
     # Read scannable objects: within the size cap and utf-8-decodable (binary skipped).
     objects: list[dict] = []
     scanned_keys: list[str] = []
-    skipped_large = skipped_binary = 0
+    skipped_large = skipped_binary = partial_reads = 0
     for o in listing:
         if o["size"] > args.max_object_bytes:
             skipped_large += 1
             continue
-        content = read_object(s3, args.bucket, o["key"])
-        if content is None:
+        got = read_object_detail(s3, args.bucket, o["key"])
+        if got is None:
             skipped_binary += 1
             continue
+        content, partial = got
+        partial_reads += partial
         # Detect HERE. Only what was found travels: category, label, line, masked
         # preview. The object's bytes stay in the account that owns them, which is the
         # same contract palivane-secrets keeps for endpoints.
@@ -392,7 +406,8 @@ def main() -> int:
 
     print(f"Listed {len(listing)} object(s); scanned {len(scanned_keys)} locally, "
           f"{len(objects)} with findings "
-          f"(skipped {skipped_large} over size cap, {skipped_binary} binary/unreadable).")
+          f"(skipped {skipped_large} over size cap, {skipped_binary} binary/unreadable"
+          f"{f', {partial_reads} only partly read' if partial_reads else ''}).")
 
     if args.dry_run:
         for k in scanned_keys:
@@ -401,7 +416,9 @@ def main() -> int:
         return 0
 
     if not objects:
-        print("✓ Nothing sensitive found." if scanned_keys
+        print(("✓ Nothing sensitive found"
+               + (f" in what was read ({partial_reads} object(s) only partly read)."
+                  if partial_reads else ".")) if scanned_keys
               else "✓ Nothing scannable, bucket empty or all objects skipped.")
         return 0
 
