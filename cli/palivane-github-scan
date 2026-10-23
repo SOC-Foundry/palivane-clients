@@ -330,31 +330,41 @@ def repo_blobs(repo: dict, args, token: str, api: str) -> list[dict]:
 
 
 def scan_blob(item: dict, token: str, api: str) -> dict | None:
+    """scan_blob_detail's result alone."""
+    return scan_blob_detail(item, token, api)[0]
+
+
+def scan_blob_detail(item: dict, token: str, api: str) -> tuple[dict | None, bool]:
     """Fetch a blob, decode it, and scan it locally. Returns the file's findings labelled
     owner/repo@branch:path, None if it scanned clean (a clean file is not reported at all —
     "we looked and found nothing" needs no evidence sent anywhere), or UNREADABLE if it
-    could not be decoded as text.
+    could not be decoded as text. The bool is True when only part of the file was read (a
+    PDF stream that would not inflate): a clean result on it is not a clean file.
 
     The blob's text is read into memory here and dropped here. It is never returned to the
     caller, so there is no path by which it reaches the request body."""
     blob = _gh_get(f"/repos/{item['owner']}/{item['repo']}/git/blobs/{item['sha']}", token, api)
     if not isinstance(blob, dict) or blob.get("encoding") != "base64":
-        return UNREADABLE
+        return UNREADABLE, False
     try:
         raw = base64.b64decode(blob.get("content", ""))
     except ValueError:
-        return UNREADABLE
+        return UNREADABLE, False
     # Plain source directly; a PDF or Office document in the repo through the extractor —
     # design docs and exported spreadsheets get committed, and they hold the same secrets.
-    text = detect.extract_text(item.get("path", ""), raw)
+    if hasattr(detect, "extract_text_detail"):
+        text, partial = detect.extract_text_detail(item.get("path", ""), raw)
+    else:                     # an older palivane_detect.py installed beside this script
+        text, partial = detect.extract_text(item.get("path", ""), raw), False
     if not text:
-        return UNREADABLE
+        return UNREADABLE, False
+    partial = partial or len(text) > MAX_CONTENT
     found = detect.scan_all(text[:MAX_CONTENT])
     if not found:
-        return None
+        return None, partial
     label = f"{item['owner']}/{item['repo']}@{item['branch']}:{item['path']}"
     return {"path": label, "findings": [{"category": c, "label": lbl, "line": ln, "masked": mk}
-                                        for c, lbl, ln, mk in found]}
+                                        for c, lbl, ln, mk in found]}, partial
 
 
 def scan_batch(url: str, token: str, files: list[dict], record: bool) -> dict:
@@ -426,7 +436,7 @@ def main() -> int:
         print("palivane: no repos to scan.")
         return 0
 
-    total_scanned, total_flagged, total_binary, blocking = 0, 0, 0, False
+    total_scanned, total_flagged, total_binary, total_partial, blocking = 0, 0, 0, 0, False
     remaining = args.max_files
 
     for repo in repos:
@@ -440,11 +450,12 @@ def main() -> int:
             # into `files`, and they carry findings rather than text.
             files: list[dict] = []
             for it in items:
-                hit = scan_blob(it, gh_token, api)
+                hit, partial = scan_blob_detail(it, gh_token, api)
                 if hit is UNREADABLE:
                     total_binary += 1
                     continue
                 total_scanned += 1
+                total_partial += partial
                 if hit is not None:
                     files.append(hit)
             remaining -= len(items)
@@ -488,6 +499,7 @@ def main() -> int:
             print(f"  {label}: clean ✓")
 
     binary = f", skipped {total_binary} binary/unreadable" if total_binary else ""
+    binary += f", {total_partial} only partly read" if total_partial else ""
     print(f"\npalivane: scanned {total_scanned} file(s) across {len(repos)} repo(s) "
           f"locally{binary} — {total_flagged} flagged. No file contents left this machine.")
     return 1 if blocking else 0
