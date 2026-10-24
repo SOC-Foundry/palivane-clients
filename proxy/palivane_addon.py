@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -375,6 +375,113 @@ _CTRL_RE = re.compile(r"[\x00-\x08\x0e-\x1f]")
 
 def is_claude_rpc(host: str, path: str) -> bool:
     return (host or "").lower().endswith("claude.ai") and (path or "").startswith(_CLAUDE_RPC_PREFIX)
+
+
+# Cloud agent sessions on claude.ai: Claude in Chrome's side panel (and Claude Code on the
+# web) send the user's message as a session event, not a chat completion:
+#   POST claude.ai/v1/code/sessions/<id>/events
+#   {"events": [{"payload": {"type": "user", "message": {"role": "user", "content": …}}},
+#               {"payload": {"type": "control_request", …}}, …]}
+# Seen from Chrome 2026-10-23 (origin https://claude.ai, platform web_claude_ai). The proxy
+# parsed none of it, and claude.ai is never harvested, so the prompt went out unscanned.
+_CODE_SESSION_EVENTS_RE = re.compile(r"^/v1/code/sessions/[^/]+/events$")
+
+
+def is_code_session_events(host: str, path: str) -> bool:
+    h = (host or "").lower()
+    return (h == "claude.ai" or h.endswith(".claude.ai")) and \
+        bool(_CODE_SESSION_EVENTS_RE.match(_path_only(path)))
+
+
+def code_session_user_text(body: bytes | str) -> str | None:
+    """The typed text of the `user` events in a session-events POST: string content, or the
+    `text` blocks of block content. Tool results (page text, command output the agent's
+    tools produced) are skipped, as on every other plane in v1. None when the body is not
+    the expected shape, so the caller can say so instead of passing it silently."""
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    try:
+        j = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    events = j.get("events") if isinstance(j, dict) else None
+    if not isinstance(events, list):
+        return None
+    parts: list[str] = []
+    for ev in events:
+        payload = ev.get("payload") if isinstance(ev, dict) else None
+        if not isinstance(payload, dict) or payload.get("type") != "user":
+            continue
+        msg = payload.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            parts.extend(b.get("text") or "" for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return "\n".join(p for p in parts if p.strip())
+
+
+def _what_matched(verdict: dict, limit: int = 3) -> str:
+    """The strongest signals' masked evidence ("SSN", "AWS access key id"), else their
+    category. A format-less token's 10-character prefix is cut to 4, as in palivane-hook."""
+    def strength(s: dict) -> float:
+        try:
+            return float(s.get("weight", 0) or 0) * float(s.get("confidence", 1) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    out: list[str] = []
+    for sig in sorted((x for x in verdict.get("signals") or [] if isinstance(x, dict)),
+                      key=strength, reverse=True):
+        parts = [p.strip() for p in str(sig.get("evidence") or "").split(",") if p.strip()]
+        what = ", ".join(p[:4] + "…" if p.endswith("…") else p for p in parts)[:80] \
+            or str(sig.get("category") or "")
+        if what and what not in out:
+            out.append(what)
+        if len(out) == limit:
+            break
+    return "; ".join(out) or "sensitive data"
+
+
+def session_block_notice(verdict: dict) -> str:
+    """What replaces a blocked message in a session-events POST. It shows in the transcript
+    as the person's own message, so it is written to them, not as an instruction to the
+    model; the model reads it and answers in kind, and the panel stays usable."""
+    return (f"[Palivane blocked this message before it left your device because it contained "
+            f"sensitive data: {_what_matched(verdict)}. It was not sent. Send it again without "
+            f"that information.]")
+
+
+def replace_user_event_text(body: bytes | str, notice: str) -> bytes | None:
+    """The session-events body with the typed text of every `user` event replaced by
+    `notice`; other events (the session's own setup, sent in the same batch as the first
+    message) and non-text blocks are kept as they are. None when there was nothing to
+    replace, so the caller falls back to refusing the request."""
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    try:
+        j = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    changed = False
+    for ev in j.get("events") or [] if isinstance(j, dict) else []:
+        payload = ev.get("payload") if isinstance(ev, dict) else None
+        if not isinstance(payload, dict) or payload.get("type") != "user":
+            continue
+        msg = payload.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"], changed = notice, True
+        elif isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "text" for b in content):
+            msg["content"] = [{"type": "text", "text": notice}] + [
+                b for b in content if not (isinstance(b, dict) and b.get("type") == "text")]
+            changed = True
+    return json.dumps(j).encode() if changed else None
 
 
 def is_claude_rpc_send(path: str) -> bool:
@@ -1485,6 +1592,22 @@ class PalivaneGuard:
         else:
             flow.response.stream = True
 
+    def _refuse(self, flow, http, rpc: bool, verdict: dict) -> None:
+        """Stop a prompt. A cloud agent session's events POST is let through with the typed
+        text replaced: the same batch carries the session's own setup, and refusing it left
+        the side panel stuck with nothing to type into. Everything else gets the refusal."""
+        req = flow.request
+        if is_code_session_events(req.pretty_host, req.path):
+            try:
+                body = req.content or b""
+            except Exception:
+                body = req.raw_content or b""
+            rewritten = replace_user_event_text(body, session_block_notice(verdict))
+            if rewritten is not None:
+                req.content = rewritten
+                return
+        flow.response = self._blocked(http, rpc, verdict)
+
     @staticmethod
     def _blocked(http, rpc: bool, verdict: dict):
         """The refusal: a Connect error (403, permission_denied) for claude.ai's RPC, which a client
@@ -1565,6 +1688,16 @@ class PalivaneGuard:
                             req.pretty_host, req.path[:80], len(raw))
                         decoded = extract_prompt(raw)
                     prompt = decoded
+            elif is_code_session_events(req.pretty_host, req.path):
+                prompt = ""
+                if not defer_prompt:
+                    text = code_session_user_text(raw)
+                    if text is None and raw.strip():
+                        import logging
+                        logging.warning(
+                            "palivane: %s%s was not the expected session-events shape (%d bytes) "
+                            "— this request was NOT scanned.", req.pretty_host, req.path[:80], len(raw))
+                    prompt = text or ""
             else:
                 prompt = "" if defer_prompt else extract_prompt(raw)
             if rpc:
@@ -1589,7 +1722,7 @@ class PalivaneGuard:
                 prior = self._recent_blocks.get(key)
                 if prior and prior[0] > now:        # a retry of a send already stopped: same answer
                     self._recent_blocks[key] = (now + _BLOCK_QUIET_SECS, prior[1])
-                    flow.response = self._blocked(http, rpc, prior[1])
+                    self._refuse(flow, http, rpc, prior[1])
                     return
                 tool = detect_tool(req.headers.get("user-agent", ""))
                 verdict = await asyncio.to_thread(
@@ -1598,7 +1731,7 @@ class PalivaneGuard:
                     self._recent_blocks[key] = (now + _BLOCK_QUIET_SECS, verdict)
                     if len(self._recent_blocks) > 100:
                         self._recent_blocks = {k: v for k, v in self._recent_blocks.items() if v[0] > now}
-                    flow.response = self._blocked(http, rpc, verdict)
+                    self._refuse(flow, http, rpc, verdict)
                     return
             if rpc:
                 return              # a chat message: no tool use or tool definitions to read from it
