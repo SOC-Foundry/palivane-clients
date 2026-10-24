@@ -29,7 +29,8 @@ the value.
 Runs are cheap and idempotent: a sha256 cache (~/.palivane/posture-cache.json) skips the
 POST when nothing changed, so repeated runs don't spam findings. palivane-connect installs
 a SessionStart hook that fires `palivane-posture --async --quiet` whenever a Claude Code
-session starts; a cron/launchd job works too. Fails open: errors never block anything.
+session starts, and the Cursor/Codex/Gemini/Copilot hooks start it every few hours on
+machines without Claude Code; a cron/launchd job works too. Fails open: errors never block anything.
 
     palivane-posture [--force] [--dry-run] [--quiet] [--async]
 
