@@ -18,7 +18,13 @@ Google" / Code Assist (`cloudcode-pa.googleapis.com`), and Vertex
 **Browser AI extensions** run in Chrome's own network stack, so the system proxy sees them
 like any page, which Palivane's browser extension can't (Chrome isolates extensions from
 each other). **Claude in Chrome** talks to `api.anthropic.com`, `claude.ai` and
-`platform.claude.com`. The **AI sidebar extensions** that use their own backend are
+`platform.claude.com`. Its side panel is a cloud agent session: the typed message goes out
+as a session event (`POST claude.ai/v1/code/sessions/<id>/events`), in the same batch as the
+session's own setup on the first message. Refusing that request leaves the panel stuck, so a
+blocked message is **replaced** instead: the batch goes through with the text swapped for a
+notice ("Palivane blocked this message before it left your device because it contained
+sensitive data: SSN…"). Claude answers the notice and the panel stays usable. The same
+applies to Claude Code on the web, which uses that protocol. The **AI sidebar extensions** that use their own backend are
 covered by host: Monica (`api.monica.im`), Sider (`*.sider.ai`), Merlin
 (`www.getmerlin.in`), HARPA AI (`api.harpa.ai`) and MaxAI (`api.maxai.me`). On those hosts
 only the chat endpoints are scanned (`SIDEBAR_PROMPT_PATHS`); their analytics, sync and
