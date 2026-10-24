@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -989,7 +989,10 @@ def should_block(verdict: dict, enforce: bool) -> bool:
     # Enforcement) returned on every verdict, so the console governs deployed proxies live.
     if verdict.get("force_block"):
         return True
-    return (enforce or bool(verdict.get("enforce"))) and verdict.get("action") == "block"
+    # A coached verdict is a block the org softened on the assumption that the client shows
+    # the cleaned copy (only the extension can). Under enforce it still stops the prompt.
+    return (enforce or bool(verdict.get("enforce"))) and (
+        verdict.get("action") == "block" or verdict.get("coached") is True)
 
 
 # --- MCP inspection (agentic tool-use) -----------------------------------------------
