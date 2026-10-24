@@ -66,7 +66,7 @@ import urllib.request
 
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 
 _VER_RE = re.compile(r"^[A-Za-z0-9._+-]{1,24}$")
@@ -566,7 +566,10 @@ def should_block(verdict: dict, enforce: bool) -> bool:
     which the server returns on every verdict."""
     if verdict.get("force_block"):
         return True
-    return (enforce or bool(verdict.get("enforce"))) and verdict.get("action") == "block"
+    # A coached verdict is a block the org softened on the assumption that the client shows
+    # the cleaned copy (only the extension can). Under enforce it still stops the prompt.
+    return (enforce or bool(verdict.get("enforce"))) and (
+        verdict.get("action") == "block" or verdict.get("coached") is True)
 
 
 def _reason(verdict: dict) -> str:

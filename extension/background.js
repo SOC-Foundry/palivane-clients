@@ -285,8 +285,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // certain, monitor the fuzzy.
       if (!c.enforce && verdict.action === "block" && !verdict.force_block) verdict.action = "warn";
       // Monitor mode never holds a message, and a coached verdict is held: it falls back to the
-      // plain warning the org's softer action already was.
-      if (!c.enforce && verdict.coached) verdict.coached = false;
+      // plain warning the org's softer action already was. A confirmed leak (force_block) is
+      // the exception, as above: it stays held, with the cleaned copy to send instead.
+      if (!c.enforce && verdict.coached && !verdict.force_block) verdict.coached = false;
       if (verdict.overridden) await chrome.storage.session.remove("overrideGrant");  // consumed
       if (verdict.action === "block" && verdict.finding_id && verdict.self_justify) {
         await chrome.storage.session.set({

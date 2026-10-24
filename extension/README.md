@@ -39,7 +39,8 @@ worker for a verdict (which calls Palivane), and:
   into a warning on the assumption that the client will show the cleaned version. The
   original message is still **held, never sent**; the modal shows the cleaned copy
   (sensitive values replaced) with a **Copy cleaned message** button, plus the approved
-  tools. In monitor mode (Enforce off in Options) it is the plain amber warning instead.
+  tools. In monitor mode (Enforce off in Options) it is the plain amber warning instead,
+  unless the leak is confirmed (`force_block`): that is held with the cleaned copy either way.
 
 It reads the body of a send however the page builds it: a string, `URLSearchParams`,
 `FormData` text fields, a `Blob`, an `ArrayBuffer` or typed array, or a `Request` object

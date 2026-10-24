@@ -61,7 +61,7 @@ import urllib.request
 
 # Tool calls with no security surface — pure agent bookkeeping. Never reported.
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 _VER_RE = re.compile(r"^[A-Za-z0-9._+-]{1,24}$")
 
 
@@ -692,7 +692,10 @@ def should_block(verdict: dict, enforce: bool) -> bool:
     (Settings → Enforcement), which the server returns on every verdict."""
     if verdict.get("force_block"):
         return True
-    return (enforce or bool(verdict.get("enforce"))) and verdict.get("action") == "block"
+    # A coached verdict is a block the org softened on the assumption that the client shows
+    # the cleaned copy (only the extension can). Under enforce it still stops the prompt.
+    return (enforce or bool(verdict.get("enforce"))) and (
+        verdict.get("action") == "block" or verdict.get("coached") is True)
 
 
 def deny_output(verdict: dict) -> dict:
@@ -787,6 +790,12 @@ def prompt_block_output(verdict: dict) -> dict:
     fixes = verdict.get("remediation") or []
     if fixes:
         reason += "\nHow to fix:\n" + "\n".join(f"  • {f}" for f in fixes[:4])
+    # Coaching mode: the org wants the user handed a cleaned copy to send instead. A hook
+    # can't swap the prompt, so it stops it and shows the copy to paste back.
+    cleaned = verdict.get("redacted_content")
+    if verdict.get("coached") and isinstance(cleaned, str) and cleaned.strip():
+        reason += ("\nYour org allows this prompt with the sensitive values taken out. "
+                   "Cleaned copy to send instead:\n" + cleaned)
     # suppressOriginalPrompt: by default Claude Code ends the block message with
     # "Original prompt: <the text>" and writes that message to the session transcript, so
     # the secret we just stopped was shown again and put on disk. Checked against Claude
