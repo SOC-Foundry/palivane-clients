@@ -13,7 +13,18 @@ Google" / Code Assist (`cloudcode-pa.googleapis.com`), and Vertex
 (`aiplatform.googleapis.com`). Also Cohere/Mistral/Perplexity, **GitHub Copilot**
 (`*.githubcopilot.com`, `copilot-proxy.githubusercontent.com`), **Microsoft Copilot**
 (`copilot.microsoft.com`), and **Cursor** (`*.cursor.sh`, `cursor.com`) — see
-`AI_HOST_SUFFIXES` in `palivane_addon.py`. The tool is identified from the User-Agent
+`AI_HOST_SUFFIXES` in `palivane_addon.py`.
+
+**Browser AI extensions** run in Chrome's own network stack, so the system proxy sees them
+like any page, which Palivane's browser extension can't (Chrome isolates extensions from
+each other). **Claude in Chrome** talks to `api.anthropic.com`, `claude.ai` and
+`platform.claude.com`. The **AI sidebar extensions** that use their own backend are
+covered by host: Monica (`api.monica.im`), Sider (`*.sider.ai`), Merlin
+(`www.getmerlin.in`), HARPA AI (`api.harpa.ai`) and MaxAI (`api.maxai.me`). On those hosts
+only the chat endpoints are scanned (`SIDEBAR_PROMPT_PATHS`); their analytics, sync and
+websites pass through unscanned, so their ids and tokens don't become findings. An
+extension mode that sends prompts straight to OpenAI, Anthropic or Google with the user's
+own key is covered by those hosts. The tool is identified from the User-Agent
 (`detect_tool`), so the backend's per-tool policy suppresses routine `source_code_leak`
 for coding tools (`claude-code`, `cursor`, `copilot`, `gemini-cli`) while still catching
 secrets and PII.
