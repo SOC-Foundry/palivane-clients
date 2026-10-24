@@ -441,7 +441,15 @@ What *does* live on disk is the plumbing: these hook scripts, the proxy addon, a
   `PALIVANE_RELEASE_REQUIRE_SIG=0` is set. Verification uses Python's `cryptography` when
   present, else the `openssl` CLI.
 
-**The proxy addon has its own schedule.** posture only runs where Claude Code does, so a
+**Without Claude Code.** posture is wired as a Claude Code `SessionStart` hook, so the
+Cursor, Codex, Gemini and Copilot hooks start it themselves: detached, at most every 6
+hours, with their own URL and token. A machine that runs only one of those tools updates
+the same way. They do this only when installed in `~/.palivane/bin` (the copies posture may
+replace) and honor `PALIVANE_NO_SELF_UPDATE`. Hooks older than this (cursor/codex/gemini
+before 1.3.3, copilot before 1.2.3) can't update themselves into it: run
+`palivane-posture --force` (or `palivane-connect` again) once on those machines.
+
+**The proxy addon has its own schedule.** posture only runs where a session starts it, so a
 machine that uses the egress proxy for desktop apps alone never refreshed its addon. The
 proxy install now adds a periodic `palivane-desktop update-addon` (Linux:
 `palivane-proxy-update.timer`, every 6h; macOS: the `io.palivane.proxy-update` launch agent,

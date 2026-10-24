@@ -65,7 +65,7 @@ import urllib.request
 
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 
 
 _VER_RE = re.compile(r"^[A-Za-z0-9._+-]{1,24}$")
@@ -608,6 +608,45 @@ def _is_excluded(cwd: str, exclude: list) -> bool:
     return any(rp == d or rp.startswith(d + os.sep) for d in exclude)
 
 
+# --- keeping the plumbing current ---------------------------------------------------------
+# palivane-posture refreshes the installed scripts (signed manifest, sha256 checked, atomic
+# swap), but palivane-connect wires it only as a Claude Code SessionStart hook, so a machine
+# that runs this tool and not Claude Code never updated. So the hook starts it, detached, at
+# most every few hours, handing it this tool's URL and token (posture otherwise reads only
+# Claude Code's settings). Posture keeps its own once-a-day throttle on the update itself.
+# Only for an install in ~/.palivane/bin: that is the only copy posture is allowed to replace.
+_POSTURE_KICK_S = 6 * 3600
+
+
+def kick_posture(cfg: dict) -> None:
+    try:
+        if (os.getenv("PALIVANE_NO_SELF_UPDATE", "") or "").lower() in ("1", "true", "yes"):
+            return
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here != os.path.abspath(os.path.expanduser("~/.palivane/bin")):
+            return
+        posture = os.path.join(here, "palivane-posture")
+        if not os.path.isfile(posture):
+            return
+        d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+        stamp = os.path.join(d, "posture-kick")
+        try:
+            if time.time() - os.path.getmtime(stamp) < _POSTURE_KICK_S:
+                return
+        except OSError:
+            pass
+        os.makedirs(d, exist_ok=True)
+        with open(stamp, "a"):
+            pass
+        os.utime(stamp, None)
+        subprocess.Popen([sys.executable, posture, "--quiet"],
+                         env={**os.environ, "PALIVANE_URL": cfg["url"], "PALIVANE_TOKEN": cfg["token"]},
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass   # never in the way of the hook's own job
+
+
 def main() -> int:
     if "--send" in sys.argv[1:]:
         try:
@@ -639,6 +678,7 @@ def main() -> int:
 
     if not cfg["url"] or not cfg["token"]:
         return 0  # not connected to Palivane — nothing to report to
+    kick_posture(cfg)
 
     # Prompts are always scanned inline (even in monitor mode): a confirmed secret/PII
     # leak (force_block) must be stopped before it leaves the device. Tool calls scan
