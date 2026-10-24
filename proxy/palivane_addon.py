@@ -46,13 +46,17 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
     # so the suffix match sweeps in every subdomain the desktop app uses.
     "api.openai.com", "chatgpt.com", "chat.openai.com",
     "api.anthropic.com", "claude.ai",
+    # Claude in Chrome: Anthropic lists its chat traffic as claude.ai, api.anthropic.com and
+    # platform.claude.com (the Claude in Chrome admin controls article). The extension runs
+    # in Chrome's own network stack, so the system proxy sees it like any page.
+    "platform.claude.com",
     "generativelanguage.googleapis.com", "gemini.google.com",
     # Gemini CLI: API-key mode hits generativelanguage (above); the default OAuth
     # "log in with Google" mode routes through Code Assist, and Vertex mode through
@@ -72,7 +76,35 @@ AI_HOST_SUFFIXES = (
     # Cursor (AI IDE): model calls route through Cursor's backend (api2/api3.cursor.sh,
     # newer cursor.com). detect_tool() tags these "cursor".
     "cursor.sh", "cursor.com",
+    # AI sidebar browser extensions that send prompts to their own backend, not to the
+    # model vendors above (read from each extension's shipped code, 2026-10-23). Only
+    # their chat endpoints are scanned: see SIDEBAR_PROMPT_PATHS.
+    "api.monica.im", "sider.ai", "www.getmerlin.in", "api.harpa.ai", "api.maxai.me",
 )
+
+# For the AI sidebar extension hosts: the request paths that carry a prompt. Their bodies
+# are proprietary, so a scanned request is harvested, and these hosts also carry the
+# extension's analytics (event.sider.ai), sync and, for www.getmerlin.in, a marketing
+# site. Harvesting all of that turns every id and token into a finding, so anything off
+# these paths is let through unscanned. Matched as substrings of the path.
+SIDEBAR_PROMPT_PATHS = {
+    "api.monica.im": ("/custom_bot/chat", "/custom_bot/preview_chat", "/agent_v1/"),
+    "sider.ai": ("/chat/v1/completions",),
+    "www.getmerlin.in": ("/arcane/api/v2/extension/",),
+    "api.harpa.ai": ("/ai/ask",),
+    "api.maxai.me": ("/gpt/",),
+}
+
+
+def sidebar_skip(host: str, path: str) -> bool:
+    """True for a request to an AI sidebar extension's host that is not one of its prompt
+    endpoints: decrypted (the host is on the list) but not scanned."""
+    host = (host or "").lower()
+    for suffix, paths in SIDEBAR_PROMPT_PATHS.items():
+        if host == suffix or host.endswith("." + suffix):
+            p = (path or "").split("?", 1)[0]
+            return not any(x in p for x in paths)
+    return False
 
 _ACTION_RANK = {"benign": 0, "low": 1, "suspicious": 2, "high": 3, "critical": 4}
 
@@ -188,6 +220,8 @@ STRUCTURED_API_SUFFIXES = (
     # and the entropy detector made a separate "secret" finding out of each one. One prompt,
     # four findings, none of them the user's data.
     "claude.ai",
+    # Anthropic's own API shape; never harvested, for the same reason as api.anthropic.com.
+    "platform.claude.com",
     "generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com",
     "aiplatform.googleapis.com", "api.cohere.ai", "api.mistral.ai", "api.perplexity.ai",
     "githubcopilot.com", "copilot-proxy.githubusercontent.com",
@@ -1511,7 +1545,7 @@ class PalivaneGuard:
             # saw the better artefact. Skip ONLY the prompt scan: section 2 below reads the
             # agent's tool USE out of the same request, which is a different exposure and
             # stays covered. An early return here would have silently dropped it.
-            if is_page_telemetry(req.path):
+            if is_page_telemetry(req.path) or sidebar_skip(req.pretty_host, req.path):
                 return
             rpc = is_claude_rpc(req.pretty_host, req.path)
             if rpc and not is_claude_rpc_send(req.path):
