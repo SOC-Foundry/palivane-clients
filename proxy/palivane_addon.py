@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -237,6 +237,60 @@ _PROMPT_PATHS = ("/completion", "/messages", "/chat/completions", "/generateCont
 def _carries_a_prompt(path: str) -> bool:
     p = (path or "").split("?", 1)[0]
     return any(p.endswith(s) or s in p for s in _PROMPT_PATHS)
+
+
+# A request the proxy decrypted but neither parsed nor harvested passes unscanned, and the
+# failure is silent: Claude in Chrome's side panel sent prompts for weeks in a shape nothing
+# parsed (fixed in 1.4.4), and only a live test showed it. This flags the next one. It looks
+# for an actual sentence (3+ words) under a key a prompt lives in, outside the paths that are
+# known telemetry, and counts it as "unparsed-prompt" in the fail-open ledger Fleet shows.
+_TEXTY_KEYS = frozenset({"content", "text", "prompt", "message", "query", "input", "question"})
+_TELEMETRY_PATH_PARTS = ("event_logging", "/rum", "metrics", "telemetry", "/log", "analytics",
+                         "/track", "/ping", "/heartbeat", "safety_flags", "reflections")
+
+
+def looks_like_typed_text(body: bytes | str, path: str = "") -> bool:
+    """True when an unparsed body carries what reads like something a person typed."""
+    p = _path_only(path).lower()
+    if any(part in p for part in _TELEMETRY_PATH_PARTS):
+        return False
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", "replace")
+    try:
+        j = json.loads(body)
+    except (ValueError, TypeError):
+        return False
+    stack, seen = [j], 0
+    while stack and seen < 5000:
+        node = stack.pop()
+        seen += 1
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, str) and k.lower() in _TEXTY_KEYS \
+                        and len(v) >= 12 and len(v.split()) >= 3:
+                    return True
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(x for x in node if isinstance(x, (dict, list)))
+    return False
+
+
+_UNPARSED_WARNED: dict[str, float] = {}
+
+
+def note_unparsed_prompt(host: str, path: str) -> None:
+    """Count one unparsed prompt-like request for Fleet, and say so in the log at most once
+    an hour per host and path shape (ids collapsed), never with any of the content."""
+    record_scan_failure("unparsed-prompt")
+    shape = re.sub(r"/[0-9a-zA-Z_-]{16,}(?=/|$)", "/<id>", _path_only(path))[:120]
+    key, now = f"{host}{shape}", time.time()
+    if now - _UNPARSED_WARNED.get(key, 0) > 3600:
+        _UNPARSED_WARNED[key] = now
+        import logging
+        logging.warning("palivane: %s%s carried what looks like a typed prompt in a shape the "
+                        "proxy does not parse — this request was NOT scanned (counted for Fleet "
+                        "as unparsed-prompt).", host, shape)
 
 
 def needs_harvest(host: str) -> bool:
@@ -930,7 +984,8 @@ def _breaker_record_locked(token: str, status) -> None:
 # apart from _FAILOPEN_FILE.
 _FAILOPEN_FILE = "scan-failed-proxy.json"
 _FAILOPEN_REASONS = ("timeout", "network", "server-error", "auth-rejected", "rate-limited",
-                     "http-error", "bad-response", "breaker-open", "error", "update-failed")
+                     "http-error", "bad-response", "breaker-open", "error", "update-failed",
+                     "unparsed-prompt")
 _FAILOPEN_MAX = 1000000
 _FAILOPEN_ORPHAN_SECS = 120
 _FAILOPEN_LOCK = threading.Lock()
@@ -1704,6 +1759,9 @@ class PalivaneGuard:
                 pass                # decoded above: no harvest, no drift warning for the RPC
             elif not defer_prompt and not prompt.strip() and needs_harvest(req.pretty_host):
                 prompt = harvest_prompt(raw)
+            elif not defer_prompt and not prompt.strip() and raw.strip() \
+                    and looks_like_typed_text(raw, req.path):
+                note_unparsed_prompt(req.pretty_host, req.path)
             elif not defer_prompt and not prompt.strip() and raw.strip() \
                     and _carries_a_prompt(req.path):
                 # A structured host whose prompt-carrying endpoint parsed to nothing means the
