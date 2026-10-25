@@ -28,7 +28,12 @@ applies to Claude Code on the web, which uses that protocol. The **AI sidebar ex
 covered by host: Monica (`api.monica.im`), Sider (`*.sider.ai`), Merlin
 (`www.getmerlin.in`), HARPA AI (`api.harpa.ai`) and MaxAI (`api.maxai.me`). On those hosts
 only the chat endpoints are scanned (`SIDEBAR_PROMPT_PATHS`); their analytics, sync and
-websites pass through unscanned, so their ids and tokens don't become findings. An
+websites pass through unscanned, so their ids and tokens don't become findings. Each reads
+errors its own way, so a blocked prompt gets the shape that extension shows as "Blocked by
+Palivane…": Monica a 403 with `code` + `msg` (otherwise a bare `INVALID_MESSAGE_CONTENT`),
+Merlin a 200 event stream with an `error` event (it never reads a non-2xx body), HARPA the
+message as a JSON string, and Sider and MaxAI the top-level `message` the API-shaped 400 now
+carries. An
 extension mode that sends prompts straight to OpenAI, Anthropic or Google with the user's
 own key is covered by those hosts. The tool is identified from the User-Agent
 (`detect_tool`), so the backend's per-tool policy suppresses routine `source_code_leak`
