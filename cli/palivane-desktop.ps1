@@ -310,7 +310,7 @@ function Get-VerifiedManifest([string]$palivaneUrl) {
 function Save-VerifiedFile([string]$palivaneUrl, [object]$manifest, [string]$name, [string]$dest) {
     $want = "$($manifest.files.$name.sha256)"
     if (-not $want) { throw "$name is not in the signed release manifest" }
-    $tmp = "$dest.palivane-new"
+    $tmp = "$dest.palivane-new.$PID.$(Get-Random)"
     try {
         Invoke-WebRequest -Uri "$palivaneUrl/cli/$name" -OutFile $tmp -TimeoutSec 60 -UseBasicParsing
         $got = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -442,7 +442,7 @@ function Restart-Proxy {
 # Move <src> over <dest> with a fresh LastWriteTime (Copy-Item keeps the old one, and an
 # mtime that did not move forward is never reloaded).
 function Set-FileInPlace([string]$src, [string]$dest) {
-    $tmp = "$dest.palivane-new"
+    $tmp = "$dest.palivane-new.$PID.$(Get-Random)"
     Copy-Item -LiteralPath $src -Destination $tmp -Force
     (Get-Item -LiteralPath $tmp).LastWriteTime = Get-Date
     Move-Item -LiteralPath $tmp -Destination $dest -Force
@@ -464,7 +464,7 @@ function Add-UpdateFailure {
         $reasons["update-failed"] = 1 + $(if ($reasons.ContainsKey("update-failed")) { $reasons["update-failed"] } else { 0 })
         $total = 0; foreach ($v in $reasons.Values) { $total += $v }
         $out = @{ count = $total; reasons = $reasons; first = $first; last = $now } | ConvertTo-Json -Compress
-        $tmp = "$ProxyLedger.palivane-new"
+        $tmp = "$ProxyLedger.palivane-new.$PID.$(Get-Random)"
         Set-Content -LiteralPath $tmp -Value $out -Encoding ascii
         Move-Item -LiteralPath $tmp -Destination $ProxyLedger -Force
     } catch {}
@@ -481,7 +481,24 @@ function Update-InstalledSelf([string]$palivaneUrl, [object]$manifest) {
     try { Save-VerifiedFile $palivaneUrl $manifest "palivane-desktop.ps1" $InstalledSelf; Log "updated $InstalledSelf." } catch {}
 }
 
+# One addon update at a time, as in the bash script: the update task, palivane-posture and
+# palivane-connect all run update-addon, and two at once interleaved the backup, the
+# loaded-marker wait, the restart and the rollback. A second run leaves it to the first.
 function Invoke-UpdateAddon {
+    $mutex = New-Object System.Threading.Mutex($false, "Global\PalivaneProxyAddonUpdate")
+    $owned = $false
+    try {
+        try { $owned = $mutex.WaitOne(0) }
+        catch [System.Threading.AbandonedMutexException] { $owned = $true }   # its owner died
+        if (-not $owned) { Log "another addon update is already running - leaving it to that one."; return 0 }
+        return (Invoke-UpdateAddonLocked)
+    } finally {
+        if ($owned) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Invoke-UpdateAddonLocked {
     if (-not (Test-Path -LiteralPath $Addon)) { Log "no proxy addon installed at $Addon - nothing to update."; return 0 }
     if ("$env:PALIVANE_NO_SELF_UPDATE" -match '^(1|true|yes)$') { Log "self-update disabled (PALIVANE_NO_SELF_UPDATE)."; return 0 }
     $palivaneUrl = Resolve-UpdateUrl

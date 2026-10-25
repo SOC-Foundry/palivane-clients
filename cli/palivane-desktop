@@ -273,7 +273,7 @@ PY
     rm -rf "$t"; return 1
   fi
   mkdir -p "$(dirname "$dest")"
-  cp "$t/file" "${dest}.palivane-new" && mv -f "${dest}.palivane-new" "$dest"
+  swap_into_place "$t/file" "$dest"
   local rc=$?
   rm -rf "$t"
   return $rc
@@ -343,9 +343,36 @@ restart_proxy() {
 
 # Atomic replace with a FRESH mtime (cp, then rename): mitmproxy reloads on an mtime that
 # moved forward, so a copy that kept an old mtime (cp -p, mv of an old file) is never seen.
+# The temp name is unique per call: two writers sharing "<dest>.palivane-new" collided, one
+# renamed it away and the other's mv failed with "could not write". Not pre-created (mktemp
+# would make it 0600 and the swapped-in file would lose its mode); cp creates it.
 swap_into_place() {                                   # swap_into_place <src> <dest>
-  cp "$1" "${2}.palivane-new" && mv -f "${2}.palivane-new" "$2"
+  local tmp="${2}.palivane-new.$$.${RANDOM}"
+  if cp "$1" "$tmp" && mv -f "$tmp" "$2"; then return 0; fi
+  rm -f "$tmp"; return 1
 }
+
+# One addon update at a time. The update timer, palivane-posture and palivane-connect all run
+# update-addon, and two at once interleaved the backup, the loaded-marker wait, the restart
+# and the rollback: one run could restart the proxy, or roll back, under the other's update.
+# mkdir is atomic everywhere this runs (flock is not on macOS). A lock whose owner is gone,
+# or that is older than any update can take, is stale and taken over.
+UPDATE_LOCK_STALE_S=600
+take_update_lock() {
+  local lock pid mtime
+  lock="$(state_dir)/update-addon.lock"
+  mkdir -p "$(state_dir)"
+  if mkdir "$lock" 2>/dev/null; then echo "$$" > "$lock/pid"; return 0; fi
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  mtime="$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || date +%s)"
+  if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } \
+     || [ $(( $(date +%s) - mtime )) -gt "$UPDATE_LOCK_STALE_S" ]; then
+    rm -rf "$lock"
+    if mkdir "$lock" 2>/dev/null; then echo "$$" > "$lock/pid"; return 0; fi
+  fi
+  return 1
+}
+release_update_lock() { rm -rf "$(state_dir)/update-addon.lock"; }
 
 # Count one "update-failed" in the proxy's ledger, merged the way the addon's own
 # record_scan_failure merges (vocabulary + positive counts + first/last), atomic replace.
@@ -371,6 +398,17 @@ PY
 }
 
 cmd_update_addon() {
+  if ! take_update_lock; then
+    log "another addon update is already running — leaving it to that one."
+    return 0
+  fi
+  local rc=0
+  update_addon_locked || rc=$?
+  release_update_lock
+  return "$rc"
+}
+
+update_addon_locked() {
   if [ ! -f "$ADDON" ]; then log "no proxy addon installed at $ADDON — nothing to update."; return 0; fi
   case "${PALIVANE_NO_SELF_UPDATE:-}" in 1|true|yes) log "self-update disabled (PALIVANE_NO_SELF_UPDATE)."; return 0 ;; esac
   command -v python3 >/dev/null 2>&1 || { log "python3 is needed to verify an addon update."; return 1; }
