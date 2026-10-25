@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -617,6 +617,96 @@ def claude_rpc_text(raw: bytes | str) -> str | None:
     if not leaves and buf and sum(32 <= c < 127 or c in (9, 10, 13) for c in buf) >= 0.9 * len(buf):
         return None             # readable text that merely parsed as protobuf: not a message to skip
     return "\n".join(t for t in leaves if t.strip() and not any(r.match(t) for r in _OPAQUE_ID))
+
+
+def _pb_varint(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b, v = v & 0x7F, v >> 7
+        out.append(b | (0x80 if v else 0))
+        if not v:
+            return bytes(out)
+
+
+def _pb_replace(buf: bytes, swap: dict, depth: int = 0) -> bytes | None:
+    """`buf` with each length-delimited field whose bytes are a key of `swap` replaced by its
+    value, at any depth. Only the fields on the way to a replaced one are re-encoded (new
+    lengths); every other byte is copied as it was. None if `buf` is not a message."""
+    out = bytearray()
+    i, n = 0, len(buf)
+
+    def varint():
+        nonlocal i
+        v, shift = 0, 0
+        while True:
+            if i >= n or shift >= 64:
+                return None
+            b = buf[i]
+            i += 1
+            v |= (b & 0x7F) << shift
+            shift += 7
+            if not b & 0x80:
+                return v
+
+    while i < n:
+        start = i
+        tag = varint()
+        if not tag:
+            return None
+        wire = tag & 7
+        if wire == 0:
+            if varint() is None:
+                return None
+            out += buf[start:i]
+        elif wire in (1, 5):
+            i += 8 if wire == 1 else 4
+            if i > n:
+                return None
+            out += buf[start:i]
+        elif wire == 2:
+            tag_end = i
+            ln = varint()
+            if ln is None or i + ln > n:
+                return None
+            sub, i = buf[i:i + ln], i + ln
+            new = swap.get(sub)
+            if new is None and depth < 8 and any(k in sub for k in swap):
+                new = _pb_replace(sub, swap, depth + 1)
+            if new is None or new == sub:
+                out += buf[start:i]
+            else:
+                out += buf[start:tag_end] + _pb_varint(len(new)) + new
+        else:
+            return None
+    return bytes(out)
+
+
+def replace_rpc_text(raw: bytes, notice: str) -> bytes | None:
+    """A claude.ai PerformAction body with the typed text replaced by `notice`, so a blocked
+    send still reaches the conversation (as the notice) and the app shows Claude's answer
+    instead of a bare "failed to send". The typed text is the string fields that read like
+    something typed (they contain whitespace), else the longest one; ids, locales, a model
+    name stay as they are. None when that can't be done safely (a compressed envelope, not
+    protobuf, nothing to replace): the caller refuses the request instead."""
+    framed = len(raw) > 5 and raw[0] in (0, 1) and int.from_bytes(raw[1:5], "big") == len(raw) - 5
+    if framed and raw[0] == 1:
+        return None
+    buf = raw[5:] if framed else raw
+    leaves = _pb_strings(buf)
+    if not leaves:
+        return None
+    typed = [t for t in leaves if t.strip() and not any(r.match(t) for r in _OPAQUE_ID)]
+    targets = [t for t in typed if any(c.isspace() for c in t.strip())] or \
+        ([max(typed, key=len)] if typed else [])
+    if not targets:
+        return None
+    swap = {targets[0].encode(): notice.encode()}
+    for t in targets[1:]:
+        swap.setdefault(t.encode(), b"[removed by Palivane]")
+    new = _pb_replace(buf, swap)
+    if new is None or new == buf:
+        return None
+    return (raw[:1] + len(new).to_bytes(4, "big") + new) if framed else new
 
 
 def harvest_prompt(body: bytes | str) -> str:
@@ -1648,10 +1738,23 @@ class PalivaneGuard:
             flow.response.stream = True
 
     def _refuse(self, flow, http, rpc: bool, verdict: dict) -> None:
-        """Stop a prompt. A cloud agent session's events POST is let through with the typed
-        text replaced: the same batch carries the session's own setup, and refusing it left
-        the side panel stuck with nothing to type into. Everything else gets the refusal."""
+        """Stop a prompt. Where the typed text can be swapped out, the request goes through
+        with a notice in its place, so the person reads why in the conversation:
+        - a cloud agent session's events POST (Claude in Chrome's side panel): the same batch
+          carries the session's own setup, and refusing it left the panel stuck;
+        - a claude.ai PerformAction send (Claude Desktop, claude.ai): a refusal showed only
+          "failed to send".
+        Anything that can't be rewritten safely gets the refusal."""
         req = flow.request
+        if rpc and is_claude_rpc_send(req.path):
+            try:
+                body = req.content or b""
+            except Exception:
+                body = req.raw_content or b""
+            rewritten = replace_rpc_text(body, session_block_notice(verdict))
+            if rewritten is not None:
+                req.content = rewritten
+                return
         if is_code_session_events(req.pretty_host, req.path):
             try:
                 body = req.content or b""
