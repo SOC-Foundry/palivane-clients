@@ -301,7 +301,8 @@ def read_config() -> dict:
 # apart from _FAILOPEN_FILE.
 _FAILOPEN_FILE = "scan-failed-cursor.json"
 _FAILOPEN_REASONS = ("timeout", "network", "server-error", "auth-rejected", "rate-limited",
-                     "http-error", "bad-response", "breaker-open", "error", "update-failed")
+                     "http-error", "bad-response", "breaker-open", "error", "update-failed",
+                     "unparsed-prompt")
 _FAILOPEN_MAX = 1000000
 _FAILOPEN_ORPHAN_SECS = 120
 _FAILOPEN_LOCK = threading.Lock()
