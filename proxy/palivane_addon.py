@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -1579,23 +1579,26 @@ def _sig_summary(verdict: dict) -> str:
     return ", ".join(s.get("category", "") for s in verdict.get("signals", [])[:4])
 
 
+def block_message(verdict: dict) -> str:
+    return (f"Blocked by Palivane: sensitive data ({_sig_summary(verdict)}) "
+            f"— risk {verdict.get('risk_score')}/{verdict.get('severity')}. "
+            f"Remove the secret/PII and start a new chat to continue.")
+
+
 def ai_block_body(verdict: dict) -> bytes:
-    return json.dumps({"type": "error", "error": {
-        "type": "invalid_request_error",
-        "message": f"Blocked by Palivane: sensitive data ({_sig_summary(verdict)}) "
-                   f"— risk {verdict.get('risk_score')}/{verdict.get('severity')}. "
-                   f"Remove the secret/PII and start a new chat to continue.",
-    }}).encode()
+    """The Anthropic-API-shaped error, which the provider SDKs read as `error.message`. The
+    top-level `message` is for the AI sidebar extensions: Sider and MaxAI show only a top-level
+    `message` (Sider showed this body as raw JSON, MaxAI a generic "Something went wrong")."""
+    msg = block_message(verdict)
+    return json.dumps({"type": "error", "message": msg,
+                       "error": {"type": "invalid_request_error", "message": msg}}).encode()
 
 
 def connect_block_body(verdict: dict) -> bytes:
     """A Connect-protocol error for claude.ai's RPC. A client reads `code`, and permission_denied
     is a final answer, where the Anthropic-API-shaped body above carries no code and was taken for
     a transient failure and retried."""
-    return json.dumps({"code": "permission_denied",
-                       "message": f"Blocked by Palivane: sensitive data ({_sig_summary(verdict)}) "
-                                  f"— risk {verdict.get('risk_score')}/{verdict.get('severity')}. "
-                                  f"Remove the secret/PII and start a new chat to continue."}).encode()
+    return json.dumps({"code": "permission_denied", "message": block_message(verdict)}).encode()
 
 
 # A client told its send failed may send it again (claude.ai retries on a growing backoff), and each
@@ -1603,6 +1606,34 @@ def connect_block_body(verdict: dict) -> bytes:
 # app kept trying. An identical send inside this window of a block is the same stopped send: it gets
 # the same answer without another scan. Sliding, so a long backoff stays quiet.
 _BLOCK_QUIET_SECS = 30.0
+
+
+def monica_block_body(verdict: dict) -> bytes:
+    """A refusal Monica shows. Its chat stream reads a JSON reply's top-level `code` and shows
+    "(code) msg"; with no `code` it shows only "INVALID_MESSAGE_CONTENT", which is what the
+    Anthropic-shaped body above got. Its agent_v1 endpoints are Connect, which read `code` and
+    `message`, so the body carries both."""
+    msg = block_message(verdict)
+    return json.dumps({"code": "permission_denied", "msg": msg, "message": msg}).encode()
+
+
+def merlin_block_body(verdict: dict) -> bytes:
+    """A refusal Merlin shows. Its chat call is axios, which turns any non-2xx into "Request failed
+    with status code 400" without reading the body (and 401/403 send it to refresh, then sign out;
+    5xx is retried). A 200 event stream with an `error` event is shown as its `message`."""
+    data = json.dumps({"type": "PALIVANE_BLOCKED", "message": block_message(verdict)})
+    return f"event: error\ndata: {data}\n\n".encode()
+
+
+def harpa_block_body(verdict: dict) -> bytes:
+    """A refusal HARPA shows. It prints a failed reply's whole JSON under "ERROR:", pretty-printed
+    when it is an object, as-is when it is a string, so the body is the message as a JSON string."""
+    return json.dumps(block_message(verdict)).encode()
+
+
+def _host_is(host: str, domain: str) -> bool:
+    host = (host or "").lower()
+    return host == domain or host.endswith("." + domain)
 
 
 def mcp_block_body(verdict: dict) -> bytes:
@@ -1764,12 +1795,19 @@ class PalivaneGuard:
             if rewritten is not None:
                 req.content = rewritten
                 return
-        flow.response = self._blocked(http, rpc, verdict)
+        flow.response = self._blocked(http, rpc, verdict, req.pretty_host)
 
     @staticmethod
-    def _blocked(http, rpc: bool, verdict: dict):
+    def _blocked(http, rpc: bool, verdict: dict, host: str = ""):
         """The refusal: a Connect error (403, permission_denied) for claude.ai's RPC, which a client
-        takes as final; the Anthropic-API-shaped 400 for everything else."""
+        takes as final; the shape each AI sidebar extension shows for Monica, Merlin and HARPA;
+        the Anthropic-API-shaped 400 for everything else (Sider and MaxAI read it too)."""
+        if _host_is(host, "monica.im"):
+            return http.Response.make(403, monica_block_body(verdict), {"Content-Type": "application/json"})
+        if _host_is(host, "getmerlin.in"):
+            return http.Response.make(200, merlin_block_body(verdict), {"Content-Type": "text/event-stream"})
+        if _host_is(host, "harpa.ai"):
+            return http.Response.make(400, harpa_block_body(verdict), {"Content-Type": "application/json"})
         if rpc:
             return http.Response.make(403, connect_block_body(verdict), {"Content-Type": "application/json"})
         return http.Response.make(400, ai_block_body(verdict), {"Content-Type": "application/json"})
