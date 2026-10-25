@@ -139,6 +139,48 @@ revoked/rotated (retries once on a 401). That gives per-device attribution and r
 and means a rotated key self-heals without re-pushing policy. A static `token` still works
 (and wins if both are set); `enrollToken` is what the `/api/provision` installer emits.
 
+## Installed AI extensions (inventory)
+
+Chrome isolates extensions from each other, so this extension can't inspect what an AI
+sidebar (Monica, Sider, HARPA, Claude in Chrome, …) sends. What it can do is list which
+extensions are installed, with `chrome.management.getAll`, and report that list to
+`POST /api/scan/browser-extensions`. The backend recognises AI extensions by Web Store id
+(`backend/app/detectors/ext_guard.py`), records an unsanctioned-AI finding for each enabled
+one the org hasn't sanctioned, and the console's **Discovery** page lists every extension
+with its id, ready to paste into the policy pack's `ExtensionSettings` to block or allow it.
+
+Sent per extension: id, name, version, enabled, install type, and a host-access summary
+("all sites" / "N hosts" / "none"). Never URLs, browsing history or page content.
+Reported on every service-worker start when the list changed or a day has passed since the
+last good report, and straight away when an extension is installed, removed, enabled or
+disabled (the list is hashed, together with the backend URL, to tell).
+
+**`management` is an optional permission, on purpose.** Adding it to `permissions` would
+make Chrome disable the store-installed extension for every existing user until they accept
+the new warning. It is in `optional_permissions` instead, and is requested only from a click
+on **Share installed AI extensions with your security team** in Options. Until someone
+grants it, nothing is listed or sent. Users can withdraw it from the same page.
+
+**No policy can grant it.** Chrome has no enterprise policy that grants an extension an
+optional permission: `ExtensionSettings` can block permissions (`blocked_permissions`) and
+`allowed_permissions` only lifts such a block, and `chrome.permissions.request` needs a
+user gesture. So even on a managed fleet each user has to click once. What policy can do,
+through managed storage:
+
+```json
+{ "reportInstalledExtensions": { "Value": true } }
+```
+
+`true` makes the popup and Options page tell the user their organization asks for the list
+(still their click). `false` hides the option and stops reporting even where it was granted.
+Unset, the option is there for anyone who wants it.
+
+If an org needs the inventory with no clicks at all, the alternative is a separate,
+self-hosted build with `management` in `permissions`, force-installed by policy (Chrome
+grants a force-installed extension its permissions without a prompt). That build is not
+produced here, because the store listing is shared with self-serve users, for whom that
+change would disable the extension.
+
 ## Scope & limits (honest)
 
 - Covers **managed browsers/devices** where the extension is installed; personal

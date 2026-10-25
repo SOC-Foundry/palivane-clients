@@ -42,7 +42,12 @@ function renderConn(s) {
   if (s && s.configured) {
     el.className = "conn";
     el.innerHTML = `<div>Connected${s.user ? ' as <span class="who">' + esc(s.user) + "</span>" : ""}` +
-      `${s.managed ? " (managed by your organization)" : ""}.</div>`;
+      `${s.managed ? " (managed by your organization)" : ""}.</div>` +
+      // The org asked by policy for the installed-extension list; only a click can grant it.
+      (s.inventoryAsked ? `<div style="margin-top:6px;">Your organization asks you to share your installed ` +
+                          `AI extensions. <a id="share">Review in options</a></div>` : "");
+    const share = $("share");
+    if (share) share.addEventListener("click", () => chrome.runtime.openOptionsPage());
   } else {
     el.className = "conn muted";
     el.innerHTML = `<div>Not connected to Palivane.</div>` +

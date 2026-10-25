@@ -20,6 +20,10 @@
     "enforce": {
       "title": "Block risky prompts (vs warn only)",
       "type": "boolean"
+    },
+    "reportInstalledExtensions": {
+      "title": "Installed-extension inventory: true asks users to share it (Chrome still needs each user's click), false turns it off",
+      "type": "boolean"
     }
   }
 }

@@ -148,6 +148,86 @@ function skipped(label, reason) {
   return { action: "allow", reason, skipped: label };
 }
 
+// Installed-extension inventory. Chrome isolates extensions from each other, so Palivane can't
+// see what an AI extension sends, only that it is installed (chrome.management). `management`
+// is an OPTIONAL permission: made required, Chrome would disable the store install for every
+// existing user until they accepted the new warning. Someone grants it from the Options page
+// (no policy can grant it); until then none of this runs, and an org can turn it off with the
+// managed `reportInstalledExtensions: false`. What leaves the browser: id, name, version,
+// enabled, install type and a coarse host-access count, never URLs or page content. Which
+// ones are AI is decided by the backend, so the list grows without a store release.
+const INVENTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+async function hasManagement() {
+  try { return await chrome.permissions.contains({ permissions: ["management"] }); }
+  catch (_) { return false; }
+}
+
+// "all sites" for a match-everything pattern, else how many hosts; never the hosts themselves.
+function hostAccess(info) {
+  const hosts = info.hostPermissions || [];
+  if (hosts.some((h) => h === "<all_urls>" || /^(\*|https?):\/\/\*\//.test(h))) return "all sites";
+  return hosts.length ? `${hosts.length} host${hosts.length === 1 ? "" : "s"}` : "none";
+}
+
+async function installedExtensions() {
+  return (await chrome.management.getAll())
+    .filter((e) => e.type === "extension" && e.id !== chrome.runtime.id)
+    .map((e) => ({ id: e.id, name: e.name, version: e.version, enabled: e.enabled,
+                   install_type: e.installType, host_access: hostAccess(e) }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+// Sent when the list (or the backend) changed since the last good report, otherwise at most
+// once a day. Checked on every service-worker start, so a browser left open for days still
+// re-reports without needing the alarms permission. One run at a time: an extension update
+// fires several management events back to back.
+let inventoryRun = null;
+function reportInventory(force = false) {
+  inventoryRun = inventoryRun || (async () => {
+    try {
+      if (!(await hasManagement())) return;
+      const c = await config();
+      if (c.reportInstalledExtensions === false) return;   // the org opted out
+      let key = await getIngestKey(c);
+      if (!key) return;
+      const extensions = await installedExtensions();
+      const hash = await sha256Hex(c.backendUrl + "\n" + JSON.stringify(extensions));
+      const { inventory } = await chrome.storage.local.get({ inventory: {} });
+      if (!force && inventory.hash === hash && Date.now() - (inventory.at || 0) < INVENTORY_MAX_AGE_MS) return;
+      const body = JSON.stringify({ extensions, device: await deviceId(), user: c.user, record: true });
+      const call = (k) => fetch(c.backendUrl.replace(/\/$/, "") + "/api/scan/browser-extensions", {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Palivane-Token": k },
+        body,
+      });
+      let res = await call(key);
+      if ((res.status === 401 || res.status === 403) && !c.token && c.enrollToken) {
+        key = await getIngestKey(c, true);
+        if (key) res = await call(key);
+      }
+      if (res.ok) await chrome.storage.local.set({ inventory: { hash, at: Date.now() } });
+    } catch (_) { /* best-effort: the next start or change retries */ }
+    finally { inventoryRun = null; }
+  })();
+  return inventoryRun;
+}
+
+chrome.permissions.onAdded.addListener((p) => {
+  if ((p.permissions || []).includes("management")) reportInventory(true);
+});
+chrome.permissions.onRemoved.addListener((p) => {
+  // Forget the last report, so granting it again sends the list straight away.
+  if ((p.permissions || []).includes("management")) chrome.storage.local.remove("inventory");
+});
+// chrome.management only exists in a worker started after the permission was granted.
+if (chrome.management && chrome.management.onInstalled) {
+  for (const ev of ["onInstalled", "onUninstalled", "onEnabled", "onDisabled"]) {
+    chrome.management[ev].addListener(() => reportInventory());
+  }
+}
+reportInventory();
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "ui") {
     // A block/warn/notice raised inside an iframe: show it in the tab's top frame, where it
@@ -162,7 +242,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       const c = await config();
       sendResponse({ configured: !!(c.token || c.enrollToken), user: c.user || "",
-                     backendUrl: c.backendUrl, managed: await isManaged() });
+                     backendUrl: c.backendUrl, managed: await isManaged(),
+                     // The org asked (by policy) for the extension list and nobody granted it yet.
+                     inventoryAsked: c.reportInstalledExtensions === true && !(await hasManagement()) });
     })();
     return true;
   }

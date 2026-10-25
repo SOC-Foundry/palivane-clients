@@ -1,6 +1,6 @@
 # Palivane. Shadow-AI Guard · Privacy Policy
 
-_Last updated: 2026-09-05_
+_Last updated: 2026-10-24_
 
 Palivane. Shadow-AI Guard ("the extension") is an organizational data-loss-prevention
 tool. It is deployed by an administrator and connected to a **Palivane backend that your
@@ -26,6 +26,13 @@ blocks** risky submissions.
   configures one, so findings can be attributed.
 - **Configuration** (backend URL, access token, enforce flag) stored locally via the
   browser's extension storage / enterprise managed policy.
+- **Installed extensions, only if you choose to share them.** The extension asks for the
+  browser's "manage your apps, extensions, and themes" permission only when you click
+  "Share installed AI extensions with your security team" in its Options page. It then sends
+  your organization's Palivane backend each installed extension's ID, name, version, whether
+  it is enabled, how it was installed, and how many sites it can access ("all sites" or a
+  count). Never which sites you visit or what is on them. It does not change, disable or
+  remove any extension, and you can stop sharing from the same page.
 
 ## Where data goes
 
