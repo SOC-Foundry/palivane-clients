@@ -37,6 +37,17 @@
   <button id="save">Save</button>
   <span id="saved" class="saved"></span>
 
+  <section id="inventory" hidden>
+    <h2 style="font-size:15px;margin-top:28px;">Installed AI extensions</h2>
+    <p><small>Palivane can't see what other extensions send, but it can list which ones are
+    installed so your security team knows about AI extensions. It shares each extension's
+    name, version, ID, whether it's on, and how many sites it can read. Never the sites you
+    visit or what's on them.</small></p>
+    <p id="invStatus"></p>
+    <button id="invShare" hidden>Share installed AI extensions with your security team</button>
+    <button id="invStop" hidden>Stop sharing</button>
+  </section>
+
   <script src="options.js"></script>
 </body>
 </html>
