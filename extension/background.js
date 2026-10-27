@@ -346,7 +346,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         headers: { "content-type": "application/json", "X-Palivane-Token": k },
         body: JSON.stringify({ content: msg.content, destination: msg.destination, user: c.user,
                                ...(msg.endpoint ? { endpoint: String(msg.endpoint).slice(0, 200) } : {}),
-                               ...(grant ? { override_token: grant } : {}) }),
+                               ...(grant ? { override_token: grant } : {}),
+                               // the edited message from "send with these removed": links it
+                               // to the block it fixes (the backend marks that finding)
+                               ...(Number.isInteger(msg.redactedFrom) ? { redacted_from: msg.redactedFrom } : {}) }),
       });
       let res = await call(key);
       // A cached device key can be revoked/rotated server-side. With an enrollToken we can

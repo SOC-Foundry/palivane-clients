@@ -281,6 +281,15 @@
     return verdicts.find(stop) || verdicts.find((v) => v.action === "warn") || { action: "allow" };
   }
 
+  // The block notice for content.js. It carries the scanned text when one scan covered all of it,
+  // because a verdict's `redactions` are offsets into exactly that string: content.js needs it to
+  // offer "send with these removed". A windowed (very long) message has offsets per window, so it
+  // gets no offer and keeps the plain block.
+  function blockedMsg(verdict, prompt) {
+    const whole = typeof prompt === "string" && prompt.length <= WINDOW;
+    return { kind: "blocked", verdict, ...(whole ? { prompt } : {}) };
+  }
+
   // A send we could see but not read (a stream, or something too big to be a prompt). Reported
   // so the console can show the blind spot; the message itself still goes out.
   function reportBlind() {
@@ -323,7 +332,7 @@
                 if (DEBUG) console.log("[Palivane] ws verdict", verdict.action, verdict.severity, verdict.risk_score);
                 if (stop(verdict)) {
                   // Drop the frame, the prompt never leaves, and show the block UI.
-                  post({ kind: "blocked", verdict });
+                  post(blockedMsg(verdict, prompt));
                   return;
                 }
                 if (verdict.action === "warn") {
@@ -444,7 +453,7 @@
             if (recentBlocks.size > 50) {
               for (const [k, v] of recentBlocks) if (v.until <= Date.now()) recentBlocks.delete(k);
             }
-            if (!repeat) post({ kind: "blocked", verdict });   // one popup per stopped send, not per retry
+            if (!repeat) post(blockedMsg(verdict, prompt));   // one popup per stopped send, not per retry
             return blockedResponse(url);
           }
           recentBlocks.delete(key);
@@ -483,7 +492,7 @@
           const verdict = await scanAll(prompt, location.origin, endpointOf(info.url));
           if (DEBUG) console.log("[Palivane] xhr verdict", verdict.action, verdict.severity, verdict.risk_score);
           if (stop(verdict)) {
-            post({ kind: "blocked", verdict });
+            post(blockedMsg(verdict, prompt));
             // Don't send. Signal a network failure so the app's error path runs;
             // the sensitive body never left the browser.
             try {
