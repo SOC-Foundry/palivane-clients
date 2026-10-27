@@ -41,8 +41,9 @@ document.addEventListener(CHANNEL + ":up", async (e) => {
     try {
       verdict = await chrome.runtime.sendMessage({
         type: "scan", content: d.content, destination: d.destination, endpoint: d.endpoint,
-        partial: !!d.partial,
+        partial: !!d.partial, ...(resendOf(d.content) ? { redactedFrom: resendOf(d.content) } : {}),
       });
+      if (verdict && verdict.redacted_resend) pendingResend = null;   // recorded: one use
     } catch (_) {
       // The extension was updated or reloaded under this tab: its old content script can no
       // longer reach it, so every message from here on goes out unchecked until the tab reloads.
@@ -50,7 +51,9 @@ document.addEventListener(CHANNEL + ":up", async (e) => {
     }
     if (verdict && verdict.skipped) noteSkipped(verdict.skipped);
     reply({ kind: "verdict", id: d.id, verdict: verdict || { action: "allow" } });
-  } else if (d.kind === "blocked" || d.kind === "warn" || d.kind === "late") {
+  } else if (d.kind === "blocked") {
+    showUi(d.kind, d.verdict, typeof d.prompt === "string" ? d.prompt : null);
+  } else if (d.kind === "warn" || d.kind === "late") {
     showUi(d.kind, d.verdict);
   } else if (d.kind === "skipped") {
     noteSkipped(d.reason);
@@ -64,14 +67,21 @@ document.addEventListener(CHANNEL + ":up", async (e) => {
 // modal inside a small embedded frame can be clipped or invisible. A subframe asks the
 // background worker to show it in the tab's top frame, and draws it itself only when that
 // fails (the top frame is a site this extension does not run on, say).
-function renderUi(kind, data) {
-  if (kind === "blocked") showBlockModal(data);
+function renderUi(kind, data, prompt = null) {
+  if (kind === "blocked") showBlockModal(data, prompt);
   else if (kind === "warn") showWarnBanner(data);
   else if (kind === "late") showLateNotice(data);
   else if (kind === "skipped") showSkippedNotice(data);
 }
 
-async function showUi(kind, data) {
+async function showUi(kind, data, prompt = null) {
+  // "Send with these removed" edits the message box the person typed in, which lives in THIS
+  // frame. When it can be offered here, draw the modal here; otherwise relay it as before (the
+  // top frame then shows the plain block, with no redaction offer).
+  if (kind === "blocked" && prompt !== null && redactOffer(data) && findComposer()) {
+    renderUi(kind, data, prompt);
+    return;
+  }
   if (window !== window.top) {
     try {
       const r = await chrome.runtime.sendMessage({ type: "ui", kind, data });
@@ -123,8 +133,26 @@ function reasonText(verdict) {
 }
 
 // --- Block: a prominent, explanatory modal (so claude.ai's own fetch error reads as expected) ---
-function showBlockModal(verdict) {
+function showBlockModal(verdict, prompt = null) {
   document.getElementById("palivane-modal")?.remove();
+  // Redact-on-block: the org allows it and the backend proved that removing these values clears
+  // the block. Offered only with the scanned text in hand (the offsets point into it) and a
+  // message box in this frame to put the edited text in.
+  const redact = prompt !== null && redactOffer(verdict) && findComposer();
+  const redactLabels = redact ? [...new Set(verdict.redactions.map((s) => String(s.label)))] : [];
+  const redactBox = redact ? `
+    <div id="palivane-redact" style="margin-top:14px;padding:11px 13px;background:rgba(63,185,80,.08);
+        border:1px solid rgba(63,185,80,.35);border-radius:10px">
+      <div style="font-weight:700;color:#4ade80;font-size:13px">Send it without the sensitive parts</div>
+      <div style="color:#c4ccdb;font-size:12.5px;margin-top:3px">Removes
+        ${redactLabels.map((l) => `<strong>${escapeHtml(l)}</strong>`).join(", ")} from your message,
+        shows you the edited text in the message box, and sends that.</div>
+      <button id="palivane-redact-go" style="margin-top:8px;padding:8px 12px;border:none;
+          border-radius:8px;background:#4ade80;color:#04140b;font-weight:700;font-size:12.5px;cursor:pointer">
+        Send with these removed
+      </button>
+      <div id="palivane-redact-msg" style="color:#ff9d9d;font-size:12px;margin-top:6px" hidden></div>
+    </div>` : "";
   const rows = dataSignals(verdict).map((s) => {
     const label = CATEGORY_LABELS[s.category] || s.category;
     const ev = s.evidence ? `, <span style="opacity:.7">${escapeHtml(s.evidence)}</span>` : "";
@@ -194,6 +222,7 @@ function showBlockModal(verdict) {
         It was <strong>not sent</strong> to the AI tool because it contained ${reasonText(verdict)}.
       </p>
       <ul style="margin:8px 0 4px;padding-left:18px;color:#e6e9f0">${rows}</ul>
+      ${redactBox}
       ${clean}
       ${fix}
       ${alt}
@@ -234,6 +263,17 @@ function showBlockModal(verdict) {
   const btn = document.getElementById("palivane-modal-x");
   btn.addEventListener("click", close);
   btn.focus();
+
+  document.getElementById("palivane-redact-go")?.addEventListener("click", async (e) => {
+    const b = e.currentTarget;
+    const msg = document.getElementById("palivane-redact-msg");
+    b.disabled = true; b.textContent = "Removing…";
+    const r = await redactAndSend(verdict, prompt);
+    if (r.ok) { close(); return; }
+    b.disabled = !!r.final;
+    b.textContent = r.final ? "Edit your message instead" : "Send with these removed";
+    msg.hidden = false; msg.textContent = r.why;
+  });
 
   document.getElementById("palivane-copy-clean")?.addEventListener("click", async (e) => {
     const b = e.currentTarget;
@@ -297,6 +337,203 @@ function showBlockModal(verdict) {
   document.addEventListener("keydown", function esc(e) {
     if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); }
   });
+}
+
+// --- Redact-on-block: send the message with the flagged values removed ------------------------
+// The verdict's `redactions` are {start, end, start16, end16, label} offsets into the exact text
+// that was scanned; this script uses the UTF-16 pair (JavaScript string indexing). The values
+// never come from the backend: they are cut out of the text this page already has.
+//
+// The edit goes into the page's own message box and the page's own send button sends it, so what
+// the person sees is what is sent, on every site, and the outgoing request (JSON, form-encoded,
+// claude.ai's protobuf RPC, a WebSocket frame) is built by the site as usual and scanned again by
+// injected.js like any other send. Nothing rewrites a request body behind the person's back.
+
+const MARK = (label) => `«redacted:${label}»`;          // the same marker stored findings use
+let lastComposer = null;                                  // the box the person last typed in
+let pendingResend = null;                                 // { findingId, marks, until }
+
+// What counts as a message box: a textarea, a text input, or a rich editor (ProseMirror on
+// chatgpt.com and claude.ai, Quill on Gemini), all of which are contenteditable.
+function isComposer(el) {
+  if (!el || el.nodeType !== 1 || el.closest?.("#palivane-modal")) return false;
+  if (el instanceof HTMLTextAreaElement) return !el.disabled && !el.readOnly;
+  if (el instanceof HTMLInputElement) return /^(text|search)$/i.test(el.type) && !el.disabled && !el.readOnly;
+  return !!el.isContentEditable;
+}
+function editableRoot(el) {
+  if (!el || el.nodeType !== 1) return null;
+  if (el.isContentEditable) {                // the outermost editable, not a <p> inside it
+    while (el.parentElement && el.parentElement.isContentEditable) el = el.parentElement;
+  }
+  return isComposer(el) ? el : null;
+}
+for (const ev of ["focusin", "input", "keydown"]) {
+  document.addEventListener(ev, (e) => {
+    const el = editableRoot(e.target);
+    if (el) lastComposer = el;
+  }, true);
+}
+const visible = (el) => !!el && el.isConnected && el.getClientRects().length > 0;
+function findComposer() {
+  if (visible(lastComposer)) return lastComposer;
+  for (const sel of ["#prompt-textarea", "div.ProseMirror[contenteditable=true]",
+                     "rich-textarea [contenteditable=true]", ".ql-editor[contenteditable=true]",
+                     "[contenteditable=true][role=textbox]", "textarea"]) {
+    const el = editableRoot(document.querySelector(sel));
+    if (visible(el)) return el;
+  }
+  return null;
+}
+
+function redactOffer(v) {
+  return !!v && v.redactable === true && Array.isArray(v.redactions) && v.redactions.length > 0
+    && (v.redaction_mode === "offer" || v.redaction_mode === "auto")   // auto: this client can ask, so it asks
+    && v.redactions.every((s) => Number.isInteger(s.start16) && Number.isInteger(s.end16)
+                                 && s.end16 > s.start16 && typeof s.label === "string");
+}
+
+function readComposer(el) {
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value;
+  return el.innerText;
+}
+const sameText = (a, b) => a.replace(/\s+$/, "") === b.replace(/\s+$/, "");
+
+// Right to left, so the offsets still ahead of us stay valid as earlier text changes length.
+function cut(text, spans, shift = 0) {
+  let out = text;
+  for (const s of [...spans].sort((a, b) => b.start16 - a.start16)) {
+    out = out.slice(0, s.start16 + shift) + MARK(s.label) + out.slice(s.end16 + shift);
+  }
+  return out;
+}
+
+// Put `text` in the box the way typing would, so the page's framework (React, ProseMirror, Quill)
+// sees the change. A textarea takes the native value setter plus an input event; a rich editor
+// takes an insertText over a select-all, then a paste, then plain text as a last resort.
+function writeComposer(el, text) {
+  el.focus();
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, text);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return;
+  }
+  const selectAll = () => {
+    const r = document.createRange(); r.selectNodeContents(el);
+    const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+  };
+  selectAll();
+  try { document.execCommand("insertText", false, text); } catch (_) { /* try the next way */ }
+  if (sameText(readComposer(el), text)) return;
+  try {
+    selectAll();
+    const dt = new DataTransfer(); dt.setData("text/plain", text);
+    el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+  } catch (_) { /* try the next way */ }
+  if (sameText(readComposer(el), text)) return;
+  el.innerText = text;
+  el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+}
+
+// The page's own send control nearest the box: a button whose label, test id, id or title says
+// send/submit. Failing that, Enter in the box, which every chat site treats as send.
+function findSend(el) {
+  const re = /\bsend\b|submit/i;
+  for (let n = el.parentElement, depth = 0; n && depth < 8; n = n.parentElement, depth++) {
+    for (const b of n.querySelectorAll("button, [role=button], input[type=submit]")) {
+      if (b.closest("#palivane-modal") || !visible(b)) continue;
+      const words = [b.getAttribute("aria-label"), b.getAttribute("data-testid"), b.id, b.title,
+                     b.type === "submit" ? "submit" : "", (b.textContent || "").trim().slice(0, 24)].join(" ");
+      if (re.test(words)) return b;
+    }
+  }
+  return null;
+}
+async function pressSend(el) {
+  const t0 = Date.now();
+  let b = findSend(el);
+  // A framework enables its send button a tick after it sees the new text.
+  while (b && (b.disabled || b.getAttribute("aria-disabled") === "true") && Date.now() - t0 < 2000) {
+    await new Promise((r) => setTimeout(r, 100));
+    b = findSend(el);
+  }
+  if (b && !b.disabled) { b.click(); return; }
+  el.focus();
+  for (const type of ["keydown", "keypress", "keyup"]) {
+    el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+  }
+}
+
+// The scan of the edited message is linked to the block it fixes (the backend marks that finding,
+// no content), recognised by carrying every marker this click put in. One use, two minutes.
+function resendOf(content) {
+  const p = pendingResend;
+  if (!p || p.until < Date.now() || typeof content !== "string") return null;
+  return p.marks.every((m) => content.includes(m)) ? p.findingId : null;
+}
+
+// Returns { ok } or { ok: false, why, final }.
+async function redactAndSend(verdict, prompt) {
+  const el = findComposer();
+  if (!el) return { ok: false, final: true, why: "Couldn't find the message box on this page." };
+  const now = readComposer(el);
+  let base, spans = verdict.redactions, shift = 0, findingId = verdict.finding_id || null;
+  if (!now.trim()) {
+    base = prompt;                          // the site cleared the box when it tried to send
+  } else if (sameText(now, prompt)) {
+    base = now;
+  } else if (now.indexOf(prompt) >= 0) {
+    base = now; shift = now.indexOf(prompt);   // the same text, inside some wrapping
+  } else {
+    // The text changed after it was checked: old offsets would cut the wrong characters, so
+    // check what is in the box now and use that answer instead.
+    let v;
+    try {
+      v = await chrome.runtime.sendMessage({ type: "scan", content: now, destination: location.origin,
+                                             endpoint: location.host + location.pathname });
+    } catch (_) { return { ok: false, why: "Couldn't reach Palivane to re-check the edited message." }; }
+    if (!v || v.skipped) return { ok: false, why: "Couldn't re-check the edited message." };
+    if (v.action !== "block" && !v.coached && !v.force_block) {
+      el.focus();
+      toast("Your edited message passes the check. Press send.");
+      return { ok: true };
+    }
+    if (!redactOffer(v)) return { ok: false, final: true, why: "Removing values won't clear this one. Edit your message." };
+    base = now; spans = v.redactions; findingId = v.finding_id || findingId;
+  }
+  const text = cut(base, spans, shift);
+  writeComposer(el, text);
+  const marks = [...new Set(spans.map((s) => MARK(s.label)))];
+  const got = readComposer(el);
+  const removed = spans.map((s) => base.slice(s.start16 + shift, s.end16 + shift));
+  if (!marks.every((m) => got.includes(m)) || removed.some((v) => v && got.includes(v))) {
+    return { ok: false, final: true, why: "Couldn't edit the message box on this page. Edit your message." };
+  }
+  pendingResend = { findingId, marks, until: Date.now() + 120000 };
+  document.getElementById("palivane-modal")?.remove();     // uncover the edited message box
+  const labels = [...new Set(spans.map((s) => s.label))];
+  toast(`Removed ${labels.join(", ")}. Sending the edited message…`);
+  // A beat so the person sees the edited text in the box before it goes.
+  await new Promise((r) => setTimeout(r, 700));
+  await pressSend(el);
+  return { ok: true };
+}
+
+function toast(text) {
+  document.getElementById("palivane-toast")?.remove();
+  const el = document.createElement("div");
+  el.id = "palivane-toast";
+  el.setAttribute("role", "status");
+  el.style.cssText = [
+    "position:fixed", "bottom:22px", "left:50%", "transform:translateX(-50%)", "z-index:2147483647",
+    "padding:10px 16px", "border-radius:10px", "font:13.5px/1.4 system-ui,sans-serif", "color:#04140b",
+    "background:#4ade80", "box-shadow:0 6px 24px rgba(0,0,0,.35)", "max-width:90vw",
+  ].join(";");
+  el.textContent = "🛡 " + text;
+  document.documentElement.appendChild(el);
+  setTimeout(() => el.remove(), 6000);
 }
 
 // --- Warn: a lightweight top banner (content was sent, just flagged) ---

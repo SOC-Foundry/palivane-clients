@@ -41,6 +41,16 @@ worker for a verdict (which calls Palivane), and:
   (sensitive values replaced) with a **Copy cleaned message** button, plus the approved
   tools. In monitor mode (Enforce off in Options) it is the plain amber warning instead,
   unless the leak is confirmed (`force_block`): that is held with the cleaned copy either way.
+- **send with these removed** (0.8.0; the org's *Redact on block* is Offer or Auto, the
+  default) → when a block rests only on values that can be cut out (a key, an SSN, a card
+  number) and the backend has re-scanned the message without them and found it would pass,
+  the modal names them and offers **Send with these removed**. Clicking it replaces each value
+  in the page's own message box with a marker (`«redacted:AWS access key»`), shows the edited
+  text and a confirmation, and presses the page's own send button (or Enter), so what the
+  person sees is what is sent and the site builds its request as usual, which is scanned
+  again. If the box no longer holds the text that was checked, it is re-checked first instead
+  of applying stale offsets. Not offered for a message over 150,000 characters (scanned in
+  windows), or when the page has no message box in the frame that sent it.
 
 It reads the body of a send however the page builds it: a string, `URLSearchParams`,
 `FormData` text fields, a `Blob`, an `ArrayBuffer` or typed array, or a `Request` object
