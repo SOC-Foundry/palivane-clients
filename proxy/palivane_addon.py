@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -231,7 +231,10 @@ STRUCTURED_API_SUFFIXES = (
 # Endpoint paths that carry a user prompt, for the structured hosts. Used only to decide
 # whether an unparseable body deserves a warning — a telemetry or sync POST parsing to
 # nothing is normal and must stay quiet, or the log becomes noise nobody reads.
-_PROMPT_PATHS = ("/completion", "/messages", "/chat/completions", "/generateContent")
+# Gemini's methods are custom verbs on the model resource (`models/gemini-x:generateContent`,
+# `:streamGenerateContent`), so they follow a colon, not a slash.
+_PROMPT_PATHS = ("/completion", "/messages", "/chat/completions", "/responses",
+                 ":generateContent", ":streamGenerateContent", "/generateContent")
 
 
 def _carries_a_prompt(path: str) -> bool:
@@ -324,6 +327,54 @@ def _harvest_strings(obj, out: list[str]) -> None:
             _harvest_strings(v, out)
 
 
+# --- OpenAI Responses API ------------------------------------------------------------------
+# A copy of backend/app/gateway.py's _responses_text / _responses_item_text /
+# _responses_user_text (PR #325): keep them in step. Item types other than a user message or
+# a bare input part (function_call, function_call_output, reasoning — whose encrypted_content
+# is opaque model state, never user text) are not read.
+_RESPONSES_USER_PARTS = {None, "message", "input_text", "input_image", "input_file"}
+
+
+def _responses_text(c) -> str:
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(b.get("text", "") for b in c
+                         if isinstance(b, dict) and isinstance(b.get("text"), str))
+    return ""
+
+
+def _responses_item_text(item: dict) -> str:
+    if isinstance(item.get("text"), str):                 # bare input_text part
+        return item["text"]
+    return _responses_text(item.get("content"))
+
+
+def _responses_user_text(inp, instructions=None) -> str:
+    """The current outbound turn of a Responses request: `instructions` plus any system/developer
+    items, and only the LATEST user turn (resent history was scanned when it was new). A role-less
+    item is user input, and a run of role-less parts (text, then an image) is one turn."""
+    parts = [instructions.strip()] if isinstance(instructions, str) and instructions.strip() else []
+    if isinstance(inp, str):
+        parts.append(inp.strip())
+    elif isinstance(inp, list):
+        turn, turn_open = [], True
+        for item in reversed(inp):
+            if not isinstance(item, dict):
+                continue
+            role = (item.get("author") or {}).get("role") if isinstance(item.get("author"), dict) else item.get("role")
+            bare = role is None and item.get("type") in _RESPONSES_USER_PARTS
+            if role in ("system", "developer"):
+                parts.append(_responses_item_text(item).strip())
+            elif turn_open and (bare or (role == "user" and not turn)):
+                turn.append(_responses_item_text(item).strip())
+                turn_open = bare                          # only role-less parts run backwards
+            elif turn:
+                turn_open = False                         # the latest turn has ended
+        parts.extend(reversed(turn))
+    return "\n".join(p for p in parts if p)
+
+
 def extract_prompt(body: bytes | str) -> str:
     """Pull the user-authored text from a request body.
 
@@ -388,6 +439,17 @@ def extract_prompt(body: bytes | str) -> str:
                 last_user = text
         if last_user:
             parts.append(last_user)
+
+    # OpenAI Responses API (Codex CLI, newer OpenAI SDKs): `input` is a string or a list of
+    # typed items, plus top-level `instructions`. Same scoping as the gateway's
+    # _responses_user_text so both planes scan the same text.
+    if isinstance(j, dict) and isinstance(j.get("input"), list):
+        text = _responses_user_text(j["input"], j.get("instructions"))
+        if text:
+            parts.append(text)
+    elif isinstance(j, dict) and isinstance(j.get("input"), str) \
+            and isinstance(j.get("instructions"), str) and j["instructions"].strip():
+        parts.append(j["instructions"].strip())
 
     # Legacy single-field shapes.
     if isinstance(j, dict):
@@ -601,16 +663,92 @@ def _pb_strings(buf: bytes, depth: int = 0) -> list[str] | None:
     return out
 
 
-def claude_rpc_text(raw: bytes | str) -> str | None:
+# A compressed Connect envelope (flag byte 1) is decompressed per the `connect-content-encoding`
+# request header, bounded: past this many decompressed bytes it is not a typed message but an
+# upload (or a bomb), and is reported unreadable instead of being inflated into memory.
+_CONNECT_DECOMPRESSED_CAP = 2 << 20
+
+
+def is_compressed_connect(raw: bytes | str) -> bool:
+    """A single Connect envelope whose flag byte says the message is compressed."""
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "surrogatepass")
+    return len(raw) > 5 and raw[0] == 1 and int.from_bytes(raw[1:5], "big") == len(raw) - 5
+
+
+def _decompress_gzip(data: bytes, cap: int) -> bytes | None:
+    import zlib
+    d = zlib.decompressobj(wbits=31)
+    out = d.decompress(data, cap + 1)
+    return out if len(out) <= cap and d.eof else None
+
+
+def _decompress_zstd(data: bytes, cap: int) -> bytes | None:
+    try:                                                  # Python 3.14 stdlib
+        from compression import zstd as _zstd
+    except ImportError:
+        _zstd = None
+    if _zstd is not None:
+        d = _zstd.ZstdDecompressor()
+        out = d.decompress(data, max_length=cap + 1)
+        return out if len(out) <= cap and d.eof else None
+    import io
+    import zstandard                                      # what mitmproxy's own encoding uses
+    out = zstandard.ZstdDecompressor().stream_reader(
+        io.BytesIO(data), read_across_frames=True).read(cap + 1)
+    return out if len(out) <= cap else None
+
+
+def _decompress_brotli(data: bytes, cap: int) -> bytes | None:
+    import brotli                                         # bundled with mitmproxy (its br support)
+    d = brotli.Decompressor()
+    try:
+        out = d.process(data, output_buffer_limit=cap + 1)    # Brotli >= 1.2: bounded output
+    except TypeError:
+        # Older Brotli has no output bound: feed the input a little at a time and stop as soon
+        # as the output passes the cap (one small chunk is the most it can overshoot by).
+        out = b""
+        for i in range(0, len(data), 256):
+            out += d.process(data[i:i + 256])
+            if len(out) > cap:
+                return None
+    return out if len(out) <= cap and d.is_finished() else None
+
+
+_CONNECT_DECODERS = {"gzip": _decompress_gzip, "zstd": _decompress_zstd, "br": _decompress_brotli}
+
+
+def connect_decompress(data: bytes, encoding: str, cap: int = _CONNECT_DECOMPRESSED_CAP) -> bytes | None:
+    """The message inside a compressed Connect envelope, or None when it cannot be read: an
+    unsupported (or unimportable) codec, corrupt data, or more than `cap` bytes once inflated."""
+    enc = (encoding or "").strip().lower()
+    if not enc:
+        # The header is required with flag 1; if a client leaves it off, go by the magic bytes.
+        enc = "gzip" if data[:2] == b"\x1f\x8b" else "zstd" if data[:4] == b"\x28\xb5\x2f\xfd" else ""
+    fn = _CONNECT_DECODERS.get(enc)
+    if fn is None:
+        return None
+    try:
+        return fn(data, cap)
+    except Exception:                                     # ImportError, zlib.error, brotli.error, …
+        return None
+
+
+def claude_rpc_text(raw: bytes | str, encoding: str = "") -> str | None:
     """The typed text of a claude.ai PerformAction body: "" when it carries none, None when the
-    body is not protobuf (or is a compressed envelope) so the caller can say so and not skip it."""
+    body is not protobuf, or is a compressed envelope that cannot be decompressed (see
+    connect_decompress), so the caller can say so and not skip it. `encoding` is the request's
+    `connect-content-encoding` header."""
     if isinstance(raw, str):
         raw = raw.encode("utf-8", "surrogatepass")
     buf = raw
     if len(raw) > 5 and raw[0] in (0, 1) and int.from_bytes(raw[1:5], "big") == len(raw) - 5:
         if raw[0] == 1:
-            return None                                   # compressed Connect envelope
-        buf = raw[5:]
+            buf = connect_decompress(raw[5:], encoding)
+            if buf is None:
+                return None                               # compressed and unreadable
+        else:
+            buf = raw[5:]
     leaves = _pb_strings(buf)
     if leaves is None:
         return None
@@ -1875,14 +2013,34 @@ class PalivaneGuard:
             if rpc:
                 prompt = ""
                 if not defer_prompt:
-                    decoded = claude_rpc_text(raw)
-                    if decoded is None:
+                    encoding = req.headers.get("connect-content-encoding", "")
+                    decoded = claude_rpc_text(raw, encoding)
+                    if decoded is None and is_compressed_connect(raw):
+                        # A compressed send we could not open (unsupported codec, corrupt, or
+                        # past the decompressed cap). Scanning the compressed bytes as text
+                        # finds nothing real, so do not pretend to: count it in the fail-open
+                        # ledger (as "error": the vocabulary is shared with every hook and the
+                        # backend), which the console shows per device, and let it through like
+                        # every other scan that could not run. Not blocked under enforce: a
+                        # codec change by the vendor would otherwise turn into a fleet-wide
+                        # claude.ai outage behind an error the person cannot act on, and the
+                        # browser extension fails open with a visible notice on the same case.
+                        import logging
+                        logging.warning(
+                            "palivane: %s%s is a compressed Connect message we could not read "
+                            "(encoding %r, %d bytes) — NOT scanned, counted as unreadable",
+                            req.pretty_host, req.path[:80], encoding[:20], len(raw))
+                        record_scan_failure("error")
+                        decoded = ""
+                    elif decoded is None:
                         import logging
                         logging.warning(
                             "palivane: %s%s was not a readable protobuf (%d bytes) — scanning it as "
-                            "text; shape drift or a compressed envelope?",
+                            "text; shape drift?",
                             req.pretty_host, req.path[:80], len(raw))
                         decoded = extract_prompt(raw)
+                        if not decoded.strip() and raw.strip():
+                            record_scan_failure("error")
                     prompt = decoded
             elif is_code_session_events(req.pretty_host, req.path):
                 prompt = ""
