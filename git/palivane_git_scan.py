@@ -6,7 +6,9 @@ One script, two uses:
   • CI (GitHub Action) — scans a PR's changed files, fails the check.
 
 It calls the Palivane backend's `POST /api/scan/code` (the detection engine; no secrets
-logic lives here). Stdlib only — no pip install.
+logic lives here), and — when a dependency manifest changed (package.json,
+requirements*.txt) — `POST /api/scan/deps` for supply-chain risk: install-script abuse,
+non-registry sources, known-bad packages. `--no-deps` skips that. Stdlib only.
 
 Config (env):
   PALIVANE_URL    Palivane backend base URL          (or --url)
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -35,6 +38,9 @@ import urllib.request
 
 MAX_BYTES = 1_000_000   # scan at most this much of a file; larger files are truncated (with a warning)
 _BINARY_SNIFF = 8192    # a NUL byte in this prefix marks a file as binary (images, archives, ...)
+# The manifests /api/scan/deps understands (dep_guard): npm's package.json and pip's
+# requirements files. Matched on the file name, in any directory.
+_MANIFEST = re.compile(r"(?:^|/)(?:package\.json|requirements[\w.-]*\.txt)$", re.I)
 
 
 def _git(*args: str) -> str:
@@ -77,6 +83,24 @@ def _content(path: str, mode: str) -> tuple[str | None, str | None]:
     return raw.decode("utf-8", errors="replace"), problem
 
 
+def _post(url: str, endpoint: str, token: str, body: dict, fail_closed: bool):
+    """(result, None) on success, or (None, exit_code) after printing why it failed."""
+    req = urllib.request.Request(
+        url.rstrip("/") + endpoint, data=json.dumps(body).encode(), method="POST",
+        headers={"content-type": "application/json", "X-Palivane-Token": token},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read()), None
+    except urllib.error.HTTPError as e:
+        print(f"palivane: backend returned HTTP {e.code} — {e.read().decode('utf-8', 'replace')[:200]}",
+              file=sys.stderr)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"palivane: could not reach backend ({e}). {'Failing closed.' if fail_closed else 'Failing open.'}",
+              file=sys.stderr)
+    return None, (1 if fail_closed else 0)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Scan changed files for secrets & PII via Palivane.")
     g = ap.add_mutually_exclusive_group()
@@ -88,6 +112,8 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true", help="fail on warn findings too")
     ap.add_argument("--fail-closed", action="store_true", help="fail if the backend is unreachable")
     ap.add_argument("--record", action="store_true", help="persist findings in Palivane")
+    ap.add_argument("--no-deps", action="store_true",
+                    help="don't vet changed dependency manifests (package.json, requirements*.txt)")
     args = ap.parse_args()
 
     token = os.getenv("PALIVANE_TOKEN", "")
@@ -113,30 +139,28 @@ def main() -> int:
     if not files:
         return gap
 
-    payload = json.dumps({"files": files, "record": args.record}).encode()
-    req = urllib.request.Request(
-        args.url.rstrip("/") + "/api/scan/code", data=payload, method="POST",
-        headers={"content-type": "application/json", "X-Palivane-Token": token},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            result = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        print(f"palivane: backend returned HTTP {e.code} — {e.read().decode('utf-8', 'replace')[:200]}",
-              file=sys.stderr)
-        return 1 if args.fail_closed else 0
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        print(f"palivane: could not reach backend ({e}). {'Failing closed.' if args.fail_closed else 'Failing open.'}",
-              file=sys.stderr)
-        return 1 if args.fail_closed else 0
+    result, rc = _post(args.url, "/api/scan/code", token,
+                       {"files": files, "record": args.record}, args.fail_closed)
+    if result is None:
+        return rc
+    flagged = list(result.get("files", []))
 
-    flagged = result.get("files", [])
+    # Dependency manifests among the changed files also get the supply-chain check.
+    manifests = [] if args.no_deps else [f for f in files if _MANIFEST.search(f["path"])]
+    if manifests:
+        deps, rc = _post(args.url, "/api/scan/deps", token,
+                         {"files": manifests, "record": args.record}, args.fail_closed)
+        if deps is None:
+            return rc
+        flagged += deps.get("files", [])
+
     if not flagged:
-        print(f"palivane: scanned {result.get('scanned', len(files))} file(s) — clean ✓")
+        extra = f", {len(manifests)} dependency manifest(s) vetted" if manifests else ""
+        print(f"palivane: scanned {result.get('scanned', len(files))} file(s){extra} — clean ✓")
         return gap
 
     blocking = False
-    print(f"\n  ⚠ Palivane found sensitive data in {len(flagged)} file(s):\n")
+    print(f"\n  ⚠ Palivane flagged {len(flagged)} file(s):\n")
     for f in flagged:
         mark = "🔴 BLOCK" if f["action"] == "block" else "🟠 WARN "
         cats = ", ".join(dict.fromkeys(s["category"] for s in f.get("signals", [])))
@@ -147,8 +171,9 @@ def main() -> int:
     print()
 
     if blocking:
-        print("  Commit blocked. Remove the secret/PII (and rotate any exposed key), or override\n"
-              "  with `git commit --no-verify` if this is a false positive.\n", file=sys.stderr)
+        print("  Commit blocked. Remove the secret/PII (and rotate any exposed key) or the risky\n"
+              "  dependency, or override with `git commit --no-verify` if this is a false positive.\n",
+              file=sys.stderr)
         return 1
     return gap
 
