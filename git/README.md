@@ -11,6 +11,12 @@ Both call the backend's `POST /api/scan/code`, which reuses Palivane's detection
 **ignores `source_code_leak`** (a repo is meant to hold code) and keeps **secrets + PII**.
 Findings can optionally be recorded to the console (`--record`).
 
+When a change touches a **dependency manifest** (`package.json`, `requirements*.txt`, in any
+directory), those files also go to `POST /api/scan/deps`, which flags supply-chain risk:
+install scripts that fetch and run code, packages from outside the registry, and known-bad
+or denylisted packages (plus known CVEs when the server sets `DEP_OSV_ENABLED`). A risky
+dependency blocks the commit like a secret does. `--no-deps` skips this check.
+
 > This **complements** GitHub's native Secret Scanning push protection — use that as the
 > primary secrets gate; Palivane adds your custom patterns, PII coverage, and one policy/
 > console across AI egress *and* commits.
