@@ -107,10 +107,12 @@ class _Api:
                     "deactivated — or it is an ingest-scoped key, which the console API "
                     "does not accept. Mint one under Connections -> Console API key.")
             if r.status_code == 403:
-                raise RuntimeError(
-                    f"{method} {path} -> 403: {r.text[:200]} (a read-only key cannot write; "
-                    "mint one with 'Read + triage/sync' if you need set_finding_status or "
-                    "sync_connector)")
+                # The read-only hint only when the server said that is why: it used to ride on
+                # every 403 (an analyst calling an admin tool, a feature off for the org) and
+                # sent people to re-mint keys that were fine.
+                hint = (" (mint a key with 'Read + triage/sync' if you need set_finding_status "
+                        "or sync_connector)" if "read-only" in r.text else "")
+                raise RuntimeError(f"{method} {path} -> 403: {r.text[:200]}{hint}")
             if r.status_code >= 400:
                 raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
             return r.json() if r.content else {}
