@@ -219,6 +219,9 @@ def build_activity(tool_name: str, tool_input: dict) -> dict | None:
         cmd = tool_input.get("command", "")
         desc = tool_input.get("description", "")
         activity["args_text"] = "\n".join(p for p in (cmd, desc) if isinstance(p, str) and p)[:_MAX_ARGS_TEXT]
+        # The exact command too: args_text joins the description, so the server can't tell
+        # a newline that separates two commands from the one before the description.
+        activity["shell_command"] = cmd[:_MAX_ARGS_TEXT] if isinstance(cmd, str) else ""
     elif tool_name == "Read":
         activity["method"] = "resources/read"
         fp = tool_input.get("file_path", "")

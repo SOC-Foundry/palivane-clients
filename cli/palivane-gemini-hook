@@ -163,6 +163,7 @@ def build_activity(event: dict) -> dict | None:
         desc = tool_input.get("description", "")
         activity["args_text"] = _cap("\n".join(
             p for p in (cmd, desc) if isinstance(p, str) and p))
+        activity["shell_command"] = _cap(cmd) if isinstance(cmd, str) else ""   # exact, for authz
     elif tool_name == "read_file":
         activity["method"] = "resources/read"
         fp = tool_input.get("absolute_path") or tool_input.get("file_path") or ""
