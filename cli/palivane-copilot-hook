@@ -188,6 +188,7 @@ def build_activity(event: dict) -> dict | None:
         cwd = args.get("cwd", "")
         activity["args_text"] = _cap("\n".join(
             p for p in (cmd, cwd) if isinstance(p, str) and p))
+        activity["shell_command"] = _cap(cmd)              # exact, for least-privilege authz
     else:
         # Unknown built-in — harvest all string values (paths land in args_text for the
         # sensitive-path check; content is scanned for secrets/PII).
