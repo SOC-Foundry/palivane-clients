@@ -16,6 +16,11 @@ finding shortly after it happens:
 - agent instruction/rules files → POST /api/scan/agent-rules, to catch hidden-instruction
   injection (the "rules-file backdoor"): CLAUDE.md / .cursorrules / .cursor/rules/*.mdc /
   AGENTS.md / .github/copilot-instructions.md / GEMINI.md / skill SKILL.md files.
+- an AI-asset inventory → POST /api/scan/device-inventory: installed coding agents (Claude
+  Code, Codex, Gemini CLI, Copilot CLI, Cursor) with versions and whether Palivane's hooks
+  are wired in, agent skills and Claude Code / Codex plugins — names and versions only.
+  With the extension and MCP reports (which carry a device id) it answers "which devices
+  have X" in the console's Fleet view. Re-sent daily even when unchanged.
 
 Credentials are stripped before anything is posted. This runs on every developer machine
 at session start, and an MCP config's `env` block is exactly where a live token sits — it
@@ -55,7 +60,7 @@ CACHE_PATH = "~/.palivane/posture-cache.json"
 
 # Reported in the User-Agent so the console's Fleet view can show which client build each
 # device runs (and flag the stale ones). Bump when the client contract changes.
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 # MCP config files posted raw (path label → filesystem path).
 _RAW_MCP_CONFIGS = (
@@ -591,6 +596,297 @@ def collect_device_health() -> dict:
     }
 
 
+# --- AI-asset inventory -----------------------------------------------------------------
+# What is installed, so the console can answer "which devices have X" the day X turns out
+# to be compromised: coding agents (and whether Palivane's hooks are wired into them),
+# agent skills and plugins. METADATA ONLY — names and versions read from manifests and
+# frontmatter; no file contents, no paths beyond a label, no settings values. Every
+# reader is bounded and treats a missing or unreadable directory as "nothing there".
+
+_INVENTORY_REFRESH_S = 86400   # re-sent at least daily even when unchanged: keeps the
+                               # device's rows fresh server-side (they age out otherwise)
+_WALK_CAP = 200                # files examined per tree — a huge tree can't stall a hook
+_VERSION_LIKE = re.compile(r"^v?\d+(?:\.\d+){1,3}(?:[-+][\w.]+)?$")
+
+# (inventory name, binaries on PATH, config dir, package.json names, hooks file, our hook)
+_AGENTS = (
+    ("claude-code", ("claude",), "~/.claude", ("@anthropic-ai/claude-code",),
+     "~/.claude/settings.json", "palivane-hook"),
+    ("codex", ("codex",), "~/.codex", ("@openai/codex",),
+     "~/.codex/hooks.json", "palivane-codex-hook"),
+    ("gemini-cli", ("gemini",), "~/.gemini", ("@google/gemini-cli",),
+     "~/.gemini/settings.json", "palivane-gemini-hook"),
+    ("copilot-cli", ("copilot",), "~/.copilot", ("@github/copilot",),
+     "~/.copilot/hooks/palivane.json", "palivane-copilot-hook"),
+    ("cursor", ("cursor", "cursor-agent"), "~/.cursor", ("cursor",),
+     "~/.cursor/hooks.json", "palivane-cursor-hook"),
+)
+# Where an app-bundled agent keeps its package.json when the binary on PATH doesn't lead there.
+_APP_PACKAGE_JSON = {
+    "cursor": ("/Applications/Cursor.app/Contents/Resources/app/package.json",
+               "/usr/share/cursor/resources/app/package.json",
+               "/opt/Cursor/resources/app/package.json",
+               "~/AppData/Local/Programs/cursor/resources/app/package.json"),
+}
+
+
+def _inventory_disabled() -> bool:
+    """PALIVANE_NO_INVENTORY=1 skips the inventory report (the scans still run)."""
+    return (os.getenv("PALIVANE_NO_INVENTORY", "") or "").lower() in ("1", "true", "yes")
+
+
+def _device_id() -> str:
+    """This machine as the inventory knows it: user@host, the same identity palivane-reenroll
+    enrolls with (PALIVANE_DEVICE overrides, e.g. for an MDM-assigned asset tag)."""
+    import socket
+    explicit = (os.getenv("PALIVANE_DEVICE") or "").strip()
+    if explicit:
+        return explicit[:128]
+    try:
+        host = socket.gethostname().split(".")[0] or "device"
+    except Exception:
+        host = "device"
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or _user() or "user"
+    return f"{user}@{host}"[:128]
+
+
+def _read_json(path: str, limit: int = 1_000_000):
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8", errors="replace") as f:
+            return json.loads(f.read(limit))
+    except Exception:
+        return None
+
+
+def _package_version(path: str, names: tuple) -> str:
+    data = _read_json(path, 256_000)
+    if isinstance(data, dict) and str(data.get("name", "")).lower() in names:
+        return str(data.get("version") or "")[:64]
+    return ""
+
+
+def _agent_version(binary: str | None, names: tuple, app_paths: tuple = ()) -> str:
+    """Read a version without running the agent (a node CLI costs ~0.5s to start): the
+    native-installer layout (…/versions/<ver>), or the package.json beside the resolved
+    binary, or the app bundle's. "" when none is cheap to find."""
+    names = tuple(n.lower() for n in names)
+    if binary:
+        try:
+            real = os.path.realpath(binary)
+        except OSError:
+            real = binary
+        if _VERSION_LIKE.match(os.path.basename(real)):
+            return os.path.basename(real).lstrip("v")[:64]
+        d = os.path.dirname(real)
+        for _ in range(5):
+            for cand in (os.path.join(d, "package.json"),
+                         os.path.join(d, "resources", "app", "package.json")):
+                v = _package_version(cand, names)
+                if v:
+                    return v
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    for p in app_paths:
+        v = _package_version(p, names)
+        if v:
+            return v
+    return ""
+
+
+def _strings(obj, out: list, depth: int = 0) -> list:
+    if depth > 8 or len(out) > 500:
+        return out
+    if isinstance(obj, str):
+        out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _strings(v, out, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _strings(v, out, depth + 1)
+    return out
+
+
+def _hook_state(hooks_file: str, marker: str) -> dict:
+    """Is Palivane's hook wired into this agent? installed | broken (the command points at
+    a script that is gone) | absent; and hooks_enabled where the agent has a switch we can
+    read (Claude Code's disableAllHooks), else None = not determinable from config."""
+    data = _read_json(hooks_file)
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    cmds = [s for s in _strings(hooks, []) if marker in s] if hooks else []
+    if not cmds:
+        return {"palivane_hooks": "absent", "hooks_enabled": None}
+    state = "installed"
+    try:
+        import shlex
+        exe = shlex.split(cmds[0], posix=os.name != "nt")[0]
+    except (ValueError, IndexError):
+        exe = cmds[0].split()[0] if cmds[0].split() else ""
+    exe = os.path.expanduser(exe.strip('"'))
+    if os.path.isabs(exe) and not os.path.exists(exe):
+        state = "broken"
+    enabled = None
+    if marker == "palivane-hook":                       # Claude Code
+        enabled = not bool(data.get("disableAllHooks"))
+    return {"palivane_hooks": state, "hooks_enabled": enabled}
+
+
+def collect_agents() -> list[dict]:
+    """Installed AI coding agents: present when the binary is on PATH or its config dir
+    exists. Version where cheap; Palivane hook state from the agent's hooks file."""
+    out = []
+    for name, bins, cdir, pkgs, hooks_file, marker in _AGENTS:
+        binary = next((b for b in (shutil.which(x) for x in bins) if b), None)
+        has_dir = os.path.isdir(os.path.expanduser(cdir))
+        if not binary and not has_dir:
+            continue
+        version = _agent_version(binary, pkgs, tuple(
+            os.path.expanduser(p) for p in _APP_PACKAGE_JSON.get(name, ())))
+        out.append({"kind": "agent", "name": name, "version": version,
+                    "source": "path" if binary else "config",
+                    "extra": _hook_state(hooks_file, marker)})
+    return out
+
+
+def _frontmatter(path: str) -> dict:
+    """name/version from a SKILL.md's YAML frontmatter (first 4 KB, flat keys only)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = f.read(4096)
+    except OSError:
+        return {}
+    lines = head.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out = {}
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            break
+        m = re.match(r"^(name|version)\s*:\s*(.+?)\s*$", ln)
+        if m:
+            out[m.group(1)] = m.group(2).strip("'\"")[:128]
+    return out
+
+
+def _walk_files(root: str, filename: str, max_depth: int):
+    """Paths of `filename` under `root`, depth- and count-bounded, symlinks not followed."""
+    root = os.path.expanduser(root)
+    if not os.path.isdir(root):
+        return
+    base = root.rstrip(os.sep).count(os.sep)
+    seen = 0
+    for dirpath, dirs, files in os.walk(root):
+        if dirpath.count(os.sep) - base >= max_depth:
+            dirs[:] = []
+        dirs.sort()
+        if filename in files:
+            yield os.path.join(dirpath, filename)
+            seen += 1
+            if seen >= _WALK_CAP:
+                return
+
+
+def collect_skills(cwd: str = ".") -> list[dict]:
+    """Agent skills: SKILL.md under ~/.claude/skills, ~/.codex/skills and the project's
+    .claude/skills. Name (frontmatter, else the folder) and version only."""
+    project = os.path.basename(os.path.realpath(cwd))
+    roots = (("~/.claude/skills", "user", "claude-code"),
+             ("~/.codex/skills", "user", "codex"),
+             (os.path.join(cwd, ".claude", "skills"), f"project:{project}", "claude-code"))
+    out, seen = [], set()
+    for root, source, agent in roots:
+        for path in _walk_files(root, "SKILL.md", 4):
+            fm = _frontmatter(path)
+            name = fm.get("name") or os.path.basename(os.path.dirname(path))
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append({"kind": "skill", "name": name[:255], "version": fm.get("version", "")[:64],
+                        "source": source, "extra": {"agent": agent}})
+    return out
+
+
+def _manifest_name_version(path: str) -> tuple[str, str]:
+    data = _read_json(path, 256_000)
+    if not isinstance(data, dict):
+        return "", ""
+    return str(data.get("name") or "")[:255], str(data.get("version") or "")[:64]
+
+
+def collect_plugins() -> list[dict]:
+    """Claude Code plugins (installed_plugins.json, falling back to the cached
+    .claude-plugin/plugin.json manifests) and Codex plugins (.codex-plugin/plugin.json).
+    Name, version, marketplace and whether it's enabled — nothing else from the manifest."""
+    out, seen = [], set()
+    settings = _read_json("~/.claude/settings.json")
+    enabled_map = settings.get("enabledPlugins") if isinstance(settings, dict) else None
+    enabled_map = enabled_map if isinstance(enabled_map, dict) else {}
+    reg = _read_json("~/.claude/plugins/installed_plugins.json")
+    plugins = reg.get("plugins") if isinstance(reg, dict) else None
+    if isinstance(plugins, dict):
+        for key, entries in list(plugins.items())[:_WALK_CAP]:
+            entry = entries[0] if isinstance(entries, list) and entries else entries
+            entry = entry if isinstance(entry, dict) else {}
+            version = str(entry.get("version") or "")
+            if not version and entry.get("installPath"):
+                _, version = _manifest_name_version(os.path.join(
+                    str(entry["installPath"]), ".claude-plugin", "plugin.json"))
+            market = key.split("@", 1)[1] if "@" in key else ""
+            seen.add(key)
+            out.append({"kind": "plugin", "name": str(key)[:255], "version": version[:64],
+                        "source": market[:255],
+                        "extra": {"agent": "claude-code",
+                                  "scope": str(entry.get("scope") or "")[:32],
+                                  "enabled": enabled_map.get(key) if isinstance(
+                                      enabled_map.get(key), bool) else None}})
+    else:
+        for path in _walk_files("~/.claude/plugins/cache", "plugin.json", 6):
+            if os.path.basename(os.path.dirname(path)) != ".claude-plugin":
+                continue
+            name, version = _manifest_name_version(path)
+            if name and name not in seen:
+                seen.add(name)
+                out.append({"kind": "plugin", "name": name, "version": version,
+                            "source": "", "extra": {"agent": "claude-code"}})
+    for path in _walk_files("~/.codex/plugins", "plugin.json", 6):
+        if os.path.basename(os.path.dirname(path)) != ".codex-plugin":
+            continue
+        name, version = _manifest_name_version(path)
+        if name and name not in seen:
+            seen.add(name)
+            out.append({"kind": "plugin", "name": name, "version": version,
+                        "source": "", "extra": {"agent": "codex"}})
+    return out
+
+
+def collect_ide_extension_versions() -> dict[str, str]:
+    """id → version from VS Code's own registry file (no subprocess), so a known-bad
+    release can be matched; {} when the file isn't there."""
+    data = _read_json("~/.vscode/extensions/extensions.json", 4_000_000)
+    out = {}
+    if isinstance(data, list):
+        for e in data[:10000]:
+            try:
+                out[str(e["identifier"]["id"]).lower()] = str(e.get("version") or "")[:64]
+            except (KeyError, TypeError):
+                continue
+    return out
+
+
+def collect_inventory(cwd: str = ".") -> dict:
+    """The /api/scan/device-inventory body (device/user are added by the caller)."""
+    items: list[dict] = []
+    for collect in (collect_agents, lambda: collect_skills(cwd), collect_plugins):
+        try:
+            items.extend(collect())
+        except Exception:
+            continue    # one unreadable source never costs the rest
+    return {"kinds": ["agent", "skill", "plugin"],
+            "project": os.path.basename(os.path.realpath(cwd))[:128], "items": items}
+
+
 # --- change-dedup cache -----------------------------------------------------------------
 
 def digest(content: str) -> str:
@@ -627,6 +923,16 @@ def should_post(cache: dict, backend: str, key: str, dig: str) -> bool:
         return True
     entry = cache["entries"].get(key)
     return not (isinstance(entry, dict) and entry.get("sha256") == dig)
+
+
+def _older_than(cache: dict, key: str, seconds: int) -> bool:
+    """Whether `key` was last posted more than `seconds` ago (or never / unreadably)."""
+    entry = cache["entries"].get(key)
+    try:
+        at = datetime.fromisoformat(entry["at"])
+    except (TypeError, KeyError, ValueError):
+        return True
+    return (datetime.now(timezone.utc) - at).total_seconds() > seconds
 
 
 def _mark_posted(cache: dict, backend: str, key: str, dig: str) -> None:
@@ -816,19 +1122,28 @@ def run(cfg: dict, cache_path: str = CACHE_PATH, cwd: str = ".",
     reported = skipped = 0
 
     items: list[tuple[str, str, dict, str]] = []  # (key, api_path, body, canonical)
+    user = _user()
+    # Extension and MCP reports also feed the console's per-device inventory, keyed by
+    # this. It is part of their change-cache text, so a device that renames (or upgrades
+    # from a build that didn't send it) re-reports once.
+    device = _device_id()
     exts = collect_ide_extensions()
     if exts is not None:
-        canonical = "\n".join(exts)
+        vmap = collect_ide_extension_versions()
+        versions = {e: vmap[e.lower()] for e in exts if vmap.get(e.lower())}
+        canonical = "\n".join(exts) + f"\n#device={device}\n" + json.dumps(versions, sort_keys=True)
         items.append(("ide-extensions", "/api/scan/ide-extensions",
-                      {"extensions": exts, "record": True}, canonical))
+                      {"extensions": exts, "record": True, "device": device, "user": user,
+                       "versions": versions}, canonical))
     # The three file-backed payloads. Each is scanned here and posted REDACTED — the
     # canonical text kept for the change cache stays the real file, so rotating a token
     # still reads as drift and re-reports.
     for label, content in find_mcp_configs(cwd):
         items.append((f"mcp:{label}", "/api/scan/mcp-config",
                       {"content": detect.redact(content), "path": label,
-                       "findings": mcp_findings(content), "record": True}, content))
-    user = _user()
+                       "findings": mcp_findings(content), "record": True,
+                       "device": device, "user": user},
+                      f"{content}\n#device={device}"))
     for label, content, tool in collect_agent_configs():
         items.append((f"agent:{label}", "/api/scan/agent-config",
                       {"content": detect.redact(content), "tool": tool, "user": user,
@@ -841,10 +1156,15 @@ def run(cfg: dict, cache_path: str = CACHE_PATH, cwd: str = ".",
     health = json.dumps(collect_device_health(), sort_keys=True)
     items.append(("device-posture", "/api/scan/device-posture",
                   {"content": health, "user": user, "record": True}, health))
+    if not _inventory_disabled():
+        inventory = {"device": device, "user": user, **collect_inventory(cwd)}
+        items.append(("inventory", "/api/scan/device-inventory", inventory,
+                      json.dumps(inventory, sort_keys=True)))
 
     for key, api_path, body, canonical in items:
         dig = digest(canonical)
-        if not force and not should_post(cache, cfg["url"], key, dig):
+        if not force and not should_post(cache, cfg["url"], key, dig) \
+                and not (key == "inventory" and _older_than(cache, key, _INVENTORY_REFRESH_S)):
             skipped += 1
             continue
         if dry_run:
