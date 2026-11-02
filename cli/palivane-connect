@@ -98,7 +98,9 @@ def _capture_token(console: str) -> dict:
                f"?redirect_uri={urllib.parse.quote(redirect, safe='')}&state={state}"
                f"&device={urllib.parse.quote(device, safe='')}")
         print("Opening your browser to sign in…")
-        print(f"  If it doesn't open, visit:\n  {url}\n")
+        # flush: piped or backgrounded, stdout is block-buffered and the link would only
+        # appear after the sign-in it is needed for.
+        print(f"  If it doesn't open, visit:\n  {url}\n", flush=True)
         try:
             webbrowser.open(url)
         except Exception:
