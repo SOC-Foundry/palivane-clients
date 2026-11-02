@@ -561,13 +561,22 @@ p11kit_anchor_dir() {
   printf '/etc/ca-certificates/trust-source/anchors'   # Arch default (created below if absent)
 }
 
+# The installed copy is byte-identical to the CA: already trusted, nothing to do. A re-run
+# (key rotation, a reinstall) then needs no sudo, which also lets it run without a terminal.
+ca_already_trusted() {
+  [ -f "$1" ] && cmp -s "$CA" "$1" && { log "CA already trusted ($1)"; return 0; }
+  return 1
+}
+
 trust_ca_system() {
   if command -v update-ca-certificates >/dev/null 2>&1 && [ -d /usr/local/share/ca-certificates ]; then
+    ca_already_trusted /usr/local/share/ca-certificates/palivane-mitmproxy.crt && return
     log "trusting the CA (sudo; Debian trust store)…"
     sudo cp "$CA" /usr/local/share/ca-certificates/palivane-mitmproxy.crt
     sudo update-ca-certificates >/dev/null
   elif command -v update-ca-trust >/dev/null 2>&1; then
     local dir; dir="$(p11kit_anchor_dir)"
+    ca_already_trusted "$dir/palivane-mitmproxy.crt" && return
     log "trusting the CA (sudo; $dir)…"
     sudo mkdir -p "$dir"
     sudo cp "$CA" "$dir/palivane-mitmproxy.crt"
