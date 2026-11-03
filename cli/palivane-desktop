@@ -358,21 +358,51 @@ swap_into_place() {                                   # swap_into_place <src> <d
 # mkdir is atomic everywhere this runs (flock is not on macOS). A lock whose owner is gone,
 # or that is older than any update can take, is stale and taken over.
 UPDATE_LOCK_STALE_S=600
+
+# PALIVANE_LOCK_DEBUG=<file>: append every lock decision (time, pid, what it saw) to <file>.
+# Off by default. The concurrency test turns it on so a rare failure explains itself.
+lock_debug() {
+  [ -n "${PALIVANE_LOCK_DEBUG:-}" ] || return 0
+  printf '%s pid=%s %s\n' "$(date +%s.%N 2>/dev/null || date +%s)" "$$" "$*" \
+    >> "$PALIVANE_LOCK_DEBUG" 2>/dev/null || true
+}
+
+# The lock's mtime in epoch seconds, or empty. Chosen by OS, not by falling through: GNU stat
+# reads `-f` as "filesystem status", so the old `stat -c %Y || stat -f %m` printed a
+# multi-line `File: ...` block on Linux whenever the first call failed (the lock vanishing
+# mid-check), and that text in the age arithmetic killed the run under `set -u`.
+lock_mtime() {
+  local m
+  case "$OS" in
+    Darwin) m="$(stat -f %m "$1" 2>/dev/null || true)" ;;
+    *)      m="$(stat -c %Y "$1" 2>/dev/null || true)" ;;
+  esac
+  case "$m" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$m"
+}
+
 take_update_lock() {
-  local lock pid mtime
+  local lock pid mtime age
   lock="$(state_dir)/update-addon.lock"
   mkdir -p "$(state_dir)"
-  if mkdir "$lock" 2>/dev/null; then echo "$$" > "$lock/pid"; return 0; fi
+  if mkdir "$lock" 2>/dev/null; then
+    echo "$$" > "$lock/pid"; lock_debug "took lock"; return 0
+  fi
   pid="$(cat "$lock/pid" 2>/dev/null || true)"
-  mtime="$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || date +%s)"
-  if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } \
-     || [ $(( $(date +%s) - mtime )) -gt "$UPDATE_LOCK_STALE_S" ]; then
+  mtime="$(lock_mtime "$lock")"
+  age=$(( $(date +%s) - ${mtime:-$(date +%s)} ))
+  lock_debug "lock busy: owner='${pid}' alive=$( [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo y || echo n) age=${age}s mtime='${mtime}'"
+  if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } || [ "$age" -gt "$UPDATE_LOCK_STALE_S" ]; then
+    lock_debug "taking over stale lock (owner='${pid}', age=${age}s)"
     rm -rf "$lock"
-    if mkdir "$lock" 2>/dev/null; then echo "$$" > "$lock/pid"; return 0; fi
+    if mkdir "$lock" 2>/dev/null; then
+      echo "$$" > "$lock/pid"; lock_debug "took lock after takeover"; return 0
+    fi
+    lock_debug "takeover lost the race"
   fi
   return 1
 }
-release_update_lock() { rm -rf "$(state_dir)/update-addon.lock"; }
+release_update_lock() { lock_debug "released lock"; rm -rf "$(state_dir)/update-addon.lock"; }
 
 # Count one "update-failed" in the proxy's ledger, merged the way the addon's own
 # record_scan_failure merges (vocabulary + positive counts + first/last), atomic replace.
@@ -421,12 +451,14 @@ update_addon_locked() {
     return 1
   fi
   new_sha="$(sha256_of "$t/palivane_addon.py")"; old_sha="$(sha256_of "$ADDON")"
+  lock_debug "fetched ${new_sha:0:12}, installed ${old_sha:0:12}"
   if [ "$new_sha" = "$old_sha" ]; then
     rm -rf "$t"; log "addon is current — nothing to do."
     refresh_self; return 0
   fi
   cp -p "$ADDON" "$prev"
   rm -f "$(state_dir)/proxy-loaded.json"       # so only the build we swap in can confirm
+  lock_debug "swapping in ${new_sha:0:12}"
   if ! swap_into_place "$t/palivane_addon.py" "$ADDON"; then
     rm -rf "$t"; log "could not write $ADDON — kept the installed copy."; return 1
   fi
