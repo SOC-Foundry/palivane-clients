@@ -572,7 +572,7 @@ bootstrap_ca() {
   [ -f "$CA" ] && return
   log "generating mitmproxy CA (first run)…"
   local bpid
-  mitmdump -q --listen-port "$PORT" >/dev/null 2>&1 &
+  mitmdump -q --listen-host 127.0.0.1 --listen-port "$PORT" >/dev/null 2>&1 &
   bpid=$!
   for _ in $(seq 1 20); do [ -f "$CA" ] && break; sleep 0.5; done
   kill "$bpid" 2>/dev/null || true
@@ -1052,6 +1052,7 @@ start_service() {
   <key>ProgramArguments</key><array>
     <string>$(command -v mitmdump)</string>
     <string>-q</string><string>-s</string><string>${ADDON}</string>
+    <string>--listen-host</string><string>127.0.0.1</string>
     <string>--listen-port</string><string>${PORT}</string>
 ${up_plist}  </array>
   <key>EnvironmentVariables</key><dict>
@@ -1088,7 +1089,7 @@ Environment=HTTP_PROXY=
 Environment=HTTPS_PROXY=
 Environment=no_proxy=${NO_PROXY_ALL}
 Environment=NO_PROXY=${NO_PROXY_ALL}
-ExecStart=$(command -v mitmdump) -q -s ${ADDON} --listen-port ${PORT}${up_flags}
+ExecStart=$(command -v mitmdump) -q -s ${ADDON} --listen-host 127.0.0.1 --listen-port ${PORT}${up_flags}
 Restart=always
 [Install]
 WantedBy=default.target

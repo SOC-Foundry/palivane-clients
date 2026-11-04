@@ -21,7 +21,7 @@ Run (mitmproxy >= 8 on Python >= 3.9 — the hooks are async and use asyncio.to_
     pip install mitmproxy
     PALIVANE_URL=http://localhost:8090 PALIVANE_TOKEN=ext-demo-token-123 \
     PALIVANE_PROXY_ENFORCE=true \
-    mitmdump -s proxy/palivane_addon.py --listen-port 8081
+    mitmdump -s proxy/palivane_addon.py --listen-host 127.0.0.1 --listen-port 8081
 
 The parsing/decision logic is plain functions (no mitmproxy import) so it's unit-tested
 standalone; the mitmproxy hook is a thin wrapper.

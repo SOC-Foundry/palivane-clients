@@ -582,7 +582,7 @@ function Remove-UpdateTask {
 function Bootstrap-CA([string]$mitmdump) {
     if (Test-Path -LiteralPath $CA -PathType Leaf) { return }
     Log "generating mitmproxy CA (first run)..."
-    $p = Start-Process -FilePath $mitmdump -ArgumentList @("-q", "--listen-port", "$Port") `
+    $p = Start-Process -FilePath $mitmdump -ArgumentList @("-q", "--listen-host", "127.0.0.1", "--listen-port", "$Port") `
         -WindowStyle Hidden -PassThru
     try {
         for ($i = 0; $i -lt 20; $i++) {
@@ -703,7 +703,7 @@ function Write-Launcher([string]$mitmdump, [string]$palivaneUrl, [string]$token,
         "set ""PALIVANE_TOKEN=$token""",
         "set ""PALIVANE_PROXY_ENFORCE=$enforce""",
         "set ""PALIVANE_PROXY_USER=$user""",
-        """$mitmdump"" -q -s ""$Addon"" --listen-port $Port$(Get-UpstreamArgs)"
+        """$mitmdump"" -q -s ""$Addon"" --listen-host 127.0.0.1 --listen-port $Port$(Get-UpstreamArgs)"
     ) -join "`r`n"
     Set-Content -LiteralPath $LauncherCmd -Value $cmd -Encoding ascii
     # wscript launcher: runs the .cmd with window style 0, so no console window flashes
