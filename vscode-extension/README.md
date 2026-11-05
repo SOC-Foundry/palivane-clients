@@ -35,9 +35,9 @@ SaaS, or whatever `~/.claude/settings.json` points at).
 No build step (plain JS). Package with:
 
     cd vscode-extension
-    npx @vscode/vsce package        # -> palivane-vscode-0.2.0.vsix
+    npx @vscode/vsce package        # -> palivane-vscode-0.2.1.vsix
 
-Install: `code --install-extension palivane-vscode-0.2.0.vsix`, or Extensions view →
+Install: `code --install-extension palivane-vscode-0.2.1.vsix`, or Extensions view →
 `...` -> *Install from VSIX*. Marketplace publishing (when ready) follows the same
 publisher flow as the browser extension's `extension/STORE.md`.
 
