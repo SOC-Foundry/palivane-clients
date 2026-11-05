@@ -714,7 +714,9 @@ SSN_NODASH_RE = re.compile(r"\b\d{9}\b")
 SSN_CONTEXT_RE = re.compile(r"\b(ssn|social\s+security)\b", re.I)
 PHONE_RE = re.compile(r"\b(?:\+?1[ .\-]?)?\(?\d{3}\)?[ .\-]\d{3}[ .\-]\d{4}\b")
 CC_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]?){13,16}\b")
-EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[a-z]{2,}\b", re.IGNORECASE)
+# Bounded to RFC 5321's limits: unbounded, a long run with no '@' backtracked quadratically
+# and ran a hook past its timeout (fail-open). Same pattern as the server's shadow_ai.
+EMAIL_RE = re.compile(r"\b[\w.+-]{1,64}@[\w-]{1,63}\.[a-z]{2,63}\b", re.IGNORECASE)
 
 # Published sandbox PANs. They pass Luhn and appear in every payments tutorial, so they are
 # suppressed only when the surrounding text is clearly illustrative; the same number in a
