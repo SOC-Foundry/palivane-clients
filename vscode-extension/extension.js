@@ -23,7 +23,7 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 
-const UA = "palivane-vscode/0.2.0";   // Cloudflare's front door 403s default/bare UAs
+const UA = "palivane-vscode/0.2.1";   // Cloudflare's front door 403s default/bare UAs
 const DEFAULT_URL = "https://app.palivane.io";
 
 let status;          // status bar item
@@ -178,6 +178,63 @@ function collectAgentConfigs() {
   return out;
 }
 
+// --- redaction --------------------------------------------------------------------------
+// Configs are posted for their SHAPE (which servers, which commands, which autonomy
+// settings), never their credentials. Values under env/headers, values whose key names a
+// credential, and credential-looking flag arguments are blanked before anything leaves the
+// machine. Secret detection in these files is palivane-posture's job, done locally; the
+// backend no longer expects env values (see its MCP-config scan).
+const SECRET_KEY = /(token|secret|passw|api[_-]?key|apikey|auth|credential|cookie|private[_-]?key|session)/i;
+const BLANK = "<redacted>";
+
+function blankAll(node) {
+  if (typeof node === "string") return node ? BLANK : node;
+  if (Array.isArray(node)) return node.map(blankAll);
+  if (node && typeof node === "object") {
+    const o = {};
+    for (const [k, v] of Object.entries(node)) o[k] = blankAll(v);
+    return o;
+  }
+  return node;
+}
+
+function redactArgs(args) {
+  let blankNext = false;
+  return args.map((a) => {
+    if (typeof a !== "string") return a;
+    if (blankNext) { blankNext = false; return BLANK; }
+    const eq = a.indexOf("=");
+    if (a.startsWith("-") && SECRET_KEY.test(eq > 0 ? a.slice(0, eq) : a)) {
+      if (eq > 0) return a.slice(0, eq + 1) + BLANK;
+      blankNext = true;                    // "--api-key", "<value>"
+    }
+    return a;
+  });
+}
+
+function redactTree(node) {
+  if (Array.isArray(node)) return node.map(redactTree);
+  if (!node || typeof node !== "object") return node;
+  const o = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (k === "env" || k === "headers") o[k] = blankAll(v);
+    else if (k === "args" && Array.isArray(v)) o[k] = redactArgs(v);
+    else if (typeof v === "string" && SECRET_KEY.test(k)) o[k] = v ? BLANK : v;
+    else o[k] = redactTree(v);
+  }
+  return o;
+}
+
+function redactConfig(text) {
+  try {
+    return JSON.stringify(redactTree(JSON.parse(text)), null, 2);
+  } catch {
+    // JSONC (comments, trailing commas): blank string values of credential-named keys.
+    return text.replace(/("[^"\n]*"\s*:\s*)"((?:[^"\\\n]|\\.)*)"/g,
+      (m, head, val) => (SECRET_KEY.test(head) && val ? `${head}"${BLANK}"` : m));
+  }
+}
+
 // --- reporting --------------------------------------------------------------------------
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
@@ -202,12 +259,14 @@ async function report(force = false) {
   const exts = collectExtensions();
   items.push(["ide-extensions", "/api/scan/ide-extensions",
               { extensions: exts, record: true }, exts.join("\n")]);
-  for (const [label, content] of collectMcpConfigs()) {
+  for (const [label, raw] of collectMcpConfigs()) {
+    const content = redactConfig(raw);
     items.push([`mcp:${label}`, "/api/scan/mcp-config",
                 { content, path: label, record: true }, content]);
   }
   const user = process.env.PALIVANE_USER || os.userInfo().username || "";
-  for (const [label, content, tool] of collectAgentConfigs()) {
+  for (const [label, raw, tool] of collectAgentConfigs()) {
+    const content = redactConfig(raw);
     items.push([`agent:${label}`, "/api/scan/agent-config",
                 { content, tool, user, record: true }, content]);
   }
@@ -286,4 +345,4 @@ async function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+module.exports = { activate, deactivate, _redactConfig: redactConfig };   // _redactConfig: tests
