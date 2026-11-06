@@ -301,6 +301,35 @@ function Get-VerifiedManifest([string]$palivaneUrl) {
         $parts += ('"' + $n + '":"' + $h + '"')
     }
     $message = [Text.Encoding]::UTF8.GetBytes("{" + ($parts -join ",") + "}")
+    # v2 (manifest.sig2) signs {"files":{...},"issued":N}: once a v2 release was accepted, an
+    # older one or a manifest without sig2 is a rollback and is refused.
+    $issuedFile = Join-Path $WDir "release-issued"
+    $seen = $null
+    if (Test-Path -LiteralPath $issuedFile -PathType Leaf) {
+        $n = 0L
+        if ([long]::TryParse("$(Get-Content -LiteralPath $issuedFile -Raw)".Trim(), [ref]$n)) { $seen = $n }
+    }
+    $issued = $null
+    $sig2 = $null
+    try { $sig2 = (Invoke-WebRequest -Uri "$palivaneUrl/cli/manifest.sig2" -TimeoutSec 60 -UseBasicParsing).Content } catch {}
+    if ($sig2 -is [byte[]]) { $sig2 = [Text.Encoding]::ASCII.GetString($sig2) }
+    if ($sig2) {
+        $iv = $m.issued
+        if (-not ($iv -is [int] -or $iv -is [long])) { Log "the manifest carries no release time for its v2 signature — refusing the download."; return $null }
+        $message2 = [Text.Encoding]::UTF8.GetBytes('{"files":{' + ($parts -join ",") + '},"issued":' + [string][long]$iv + '}')
+        if (-not (Test-ReleaseSignature $message2 "$sig2" (Get-ReleasePubkey))) {
+            Log "release v2 signature INVALID — refusing the download (possible tampering)."
+            return $null
+        }
+        if ($null -ne $seen -and [long]$iv -lt $seen) {
+            Log "the deployment served an OLDER release than this machine has — refusing the download (rollback)."
+            return $null
+        }
+        $issued = [long]$iv
+    } elseif ($null -ne $seen) {
+        Log "the deployment served no v2 release signature after one was seen — refusing the download (downgrade)."
+        return $null
+    }
     $sig = $null
     try { $sig = (Invoke-WebRequest -Uri "$palivaneUrl/cli/manifest.sig" -TimeoutSec 60 -UseBasicParsing).Content } catch {}
     if ($sig -is [byte[]]) { $sig = [Text.Encoding]::ASCII.GetString($sig) }
@@ -310,6 +339,9 @@ function Get-VerifiedManifest([string]$palivaneUrl) {
             return $null
         }
         Set-RequireSignatures
+        if ($null -ne $issued -and ($null -eq $seen -or $issued -gt $seen)) {
+            try { Set-Content -LiteralPath $issuedFile -Value ([string]$issued) } catch {}
+        }
     } elseif (-not (Test-UnsignedReleaseAllowed)) {
         Log "the deployment served no release signature — refusing the download."
         return $null
