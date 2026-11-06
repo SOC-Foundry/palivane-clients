@@ -80,6 +80,10 @@ AI_HOST_SUFFIXES = (
     # model vendors above (read from each extension's shipped code, 2026-10-23). Only
     # their chat endpoints are scanned: see SIDEBAR_PROMPT_PATHS.
     "api.monica.im", "sider.ai", "www.getmerlin.in", "api.harpa.ai", "api.maxai.me",
+    # Other assistants people paste into: web chat and API hosts. Browser and API traffic
+    # only (the local CA is trusted there); none of these pins certificates in a desktop app.
+    "chat.deepseek.com", "api.deepseek.com", "grok.com", "api.x.ai", "api.groq.com",
+    "openrouter.ai", "chat.mistral.ai", "poe.com",
 )
 
 # For the AI sidebar extension hosts: the request paths that carry a prompt. Their bodies
@@ -1069,6 +1073,23 @@ async def hooked_tools_async() -> frozenset:
     return await asyncio.to_thread(hooked_tools)
 
 
+# Where each hooked tool sends its model calls. The proxy only defers its prompt scan to a
+# tool's local hook for a request that goes there: the User-Agent is the client's own claim,
+# so a browser or script naming "cursor" in it while posting to chatgpt.com is still scanned.
+TOOL_API_HOSTS = {
+    "claude-code": ("api.anthropic.com",),
+    "cursor": ("cursor.sh", "cursor.com"),
+    "copilot": ("githubcopilot.com", "copilot-proxy.githubusercontent.com"),
+    "gemini-cli": ("generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com",
+                   "aiplatform.googleapis.com"),
+}
+
+
+def tool_owns_host(tool: str, host: str) -> bool:
+    host = (host or "").lower()
+    return any(host == h or host.endswith("." + h) for h in TOOL_API_HOSTS.get(tool, ()))
+
+
 def detect_tool(user_agent: str) -> str:
     """Identify a coding assistant from its User-Agent so per-tool policy can apply."""
     ua = (user_agent or "").lower()
@@ -1958,7 +1979,9 @@ class PalivaneGuard:
         from mitmproxy import http  # imported lazily so unit tests need no mitmproxy
 
         req = flow.request
-        if req.method != "POST":
+        # Prompts travel in request bodies; PUT/PATCH carry them too (edit-and-resend,
+        # some chat APIs). GET/HEAD/OPTIONS have none worth scanning.
+        if req.method not in ("POST", "PUT", "PATCH"):
             return
         # `.content`, not `.raw_content`: raw_content is the body EXACTLY as it arrived,
         # still compressed when the client sets content-encoding. Claude Desktop gzips every
@@ -2008,7 +2031,8 @@ class PalivaneGuard:
             if rpc and not is_claude_rpc_send(req.path):
                 return              # claude.ai state calls (timeline, viewing, defaults): no typed text
             ua_tool = detect_tool(req.headers.get("user-agent", ""))
-            defer_prompt = bool(ua_tool) and ua_tool in await hooked_tools_async()
+            defer_prompt = (bool(ua_tool) and tool_owns_host(ua_tool, req.pretty_host)
+                            and ua_tool in await hooked_tools_async())
 
             if rpc:
                 prompt = ""

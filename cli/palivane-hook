@@ -168,6 +168,9 @@ def _is_excluded(cwd: str, exclude: list) -> bool:
     return any(rp == d or rp.startswith(d + os.sep) for d in exclude)
 
 
+_PATH_FIELDS = ("file_path", "path", "notebook_path", "filePath")
+
+
 def _touches_excluded(tool_input: dict, exclude: list) -> bool:
     """True if a tool call TARGETS a path inside an excluded directory.
 
@@ -176,11 +179,27 @@ def _touches_excluded(tool_input: dict, exclude: list) -> bool:
     deliberately realistic fixtures (AKIA keys, .aws/credentials, `rm -rf /` in detector
     corpora) still produced findings — which is exactly what setting the exclusion was meant
     to prevent. Match on the paths in the call as well as on where the session started.
+
+    Only the fields that NAME a file count (Read/Edit/Write/Glob/Grep/NotebookEdit). Every
+    string in the call used to: a Bash command, or its free-text `description`, that merely
+    mentioned an excluded path got the whole call skipped, which let an agent exempt any
+    command by adding that path to it.
     """
     if not exclude or not isinstance(tool_input, dict):
         return False
     paths: list[str] = []
-    _harvest_strings(tool_input, paths)
+
+    def walk(node):                       # nested too: a multi-file edit lists its paths
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in _PATH_FIELDS and isinstance(v, str):
+                    paths.append(v)
+                elif isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(tool_input)
     for raw in paths:
         if not raw or os.sep not in raw:
             continue
@@ -889,7 +908,12 @@ def cmd_justify(reason: str) -> int:
         print("palivane: justify failed (backend unreachable).", file=sys.stderr)
         return 1
     try:
-        with open(_state_path("override-token.json"), "w") as f:
+        # 0600 from creation: the state dir can sit under a 0755 home, and this token lets
+        # its holder send one otherwise-blocked prompt as this user.
+        fd = os.open(_state_path("override-token.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        if hasattr(os, "fchmod"):             # an existing file keeps its old mode otherwise
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump({"token": out.get("override_token", ""),
                        "expires": time.time() + int(out.get("expires_in", 600)) - 30}, f)
     except OSError:

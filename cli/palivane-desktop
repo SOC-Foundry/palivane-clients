@@ -583,7 +583,7 @@ ensure_update_timer() {
 Description=Palivane proxy addon update (verified; reloads the running proxy only on change)
 [Service]
 Type=oneshot
-Environment=PALIVANE_URL=${PALIVANE_URL}
+Environment=PALIVANE_URL=${PALIVANE_URL//%/%%}
 ExecStart=${self} update-addon"
       tmr="[Unit]
 Description=Palivane proxy addon update timer
@@ -1098,11 +1098,32 @@ mitm_upstream_plist() {
   return 0
 }
 
+# Values that go into the launchd plist and the systemd unit, written as plain text. A newline
+# would start a new unit directive or plist line, and <, >, & are XML; none appear in a real
+# URL, token, port, host list or path, so such a value is refused rather than escaped.
+# systemd also reads % as a specifier: those are doubled where the unit is written.
+unit_value_ok() {
+  case "$1" in *[$'\n\r\t']*|*'<'*|*'>'*|*'&'*) return 1 ;; esac
+  return 0
+}
+
+check_unit_values() {
+  local name
+  for name in PALIVANE_URL PORT ADDON UPSTREAM_PROXY UPSTREAM_CA PALIVANE_PROXY_ENFORCE \
+              PALIVANE_PROXY_INTERCEPT_EXTRA PALIVANE_PROXY_INTERCEPT_ALL NO_PROXY_ALL; do
+    unit_value_ok "${!name:-}" \
+      || die "$name contains a character that can't go into the service definition (a newline, <, > or &)."
+  done
+  unit_value_ok "$1" || die "the Palivane token contains a character that can't go into the service definition."
+  case "$PORT" in ''|*[!0-9]*) die "PALIVANE_PROXY_PORT must be a number." ;; esac
+}
+
 start_service() {
   local tok; tok="$1"
   local up_flags up_plist
   resolve_upstream_ca
   split_upstream_userinfo
+  check_unit_values "$tok"
   write_mitm_conf
   up_flags="$(mitm_upstream_flags)"
   up_plist="$(mitm_upstream_plist)"
@@ -1144,11 +1165,11 @@ PLIST
 [Unit]
 Description=Palivane desktop egress proxy
 [Service]
-Environment=PALIVANE_URL=${PALIVANE_URL}
-Environment=PALIVANE_TOKEN=${tok}
+Environment=PALIVANE_URL=${PALIVANE_URL//%/%%}
+Environment=PALIVANE_TOKEN=${tok//%/%%}
 Environment=PALIVANE_PROXY_ENFORCE=${PALIVANE_PROXY_ENFORCE:-false}
-Environment=PALIVANE_PROXY_INTERCEPT_EXTRA=${PALIVANE_PROXY_INTERCEPT_EXTRA:-}
-Environment=PALIVANE_PROXY_INTERCEPT_ALL=${PALIVANE_PROXY_INTERCEPT_ALL:-}
+Environment=PALIVANE_PROXY_INTERCEPT_EXTRA=${PALIVANE_PROXY_INTERCEPT_EXTRA//%/%%}
+Environment=PALIVANE_PROXY_INTERCEPT_ALL=${PALIVANE_PROXY_INTERCEPT_ALL//%/%%}
 # The proxy must NOT route its own backend scan calls through itself. The graphical session
 # exports http(s)_proxy=127.0.0.1:PORT (environment.d) which the service would otherwise
 # inherit and loop on; clear it here and pin NO_PROXY so /api/ingest goes direct.
