@@ -214,6 +214,8 @@ def redact(text: str) -> str:
 
 _OOXML_PARTS = {
     "docx": ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml"),
+    # every Office file also carries these: headers/footers (docx), comments, and the
+    # document properties (title, subject, keywords, custom fields) people paste into.
     "pptx": None,      # every ppt/slides/slideN.xml, plus notes
     "xlsx": None,      # xl/sharedStrings.xml carries the strings; sheets carry the numbers
 }
@@ -239,6 +241,13 @@ def _xml_ref(m: re.Match) -> str:
     return chr(cp) if 0 < cp <= 0x10FFFF and not 0xD800 <= cp <= 0xDFFF else "\ufffd"
 
 
+# Word and PowerPoint keep a paragraph's text in runs (<w:r><w:t>..</w:t></w:r>), split
+# wherever formatting, spell-check or an edit changed. Text spacing lives inside <w:t>/<a:t>
+# itself, so run markup is dropped WITHOUT a space: a key typed in one go but stored as three
+# runs comes back whole. Paragraph ends, breaks and tabs are the only whitespace it adds.
+_RUN_XML_RE = re.compile(r"<(?:w|a):(?:body|document|sld|txBody|hdr|ftr|comments|footnotes|endnotes)\b")
+
+
 def _xml_text(blob: bytes) -> str:
     """Strip XML tags to their text. Paragraph and row ends become newlines first, so a
     spreadsheet column does not run into the next one and defeat the line-based scanners."""
@@ -247,7 +256,12 @@ def _xml_text(blob: bytes) -> str:
     except Exception:                                             # noqa: BLE001
         return ""
     x = re.sub(r"</(w:p|a:p|w:tr|row|si|c|text:p|text:h|table:table-row)>", "\n", x)
-    x = _TAG_RE.sub(" ", x)
+    if _RUN_XML_RE.search(x[:4096]):
+        x = re.sub(r"<(?:w:tab|w:br|w:cr|a:br)\b[^>]*/?>", lambda m: "\t" if "tab" in m.group(0) else "\n", x)
+        x = re.sub(r"</(?:w:tc)>", "\t", x)          # table cells stay apart
+        x = _TAG_RE.sub("", x)
+    else:
+        x = _TAG_RE.sub(" ", x)
     x = _XML_REF_RE.sub(_xml_ref, x)      # after the tags go, so a decoded `<` is text
     return _WS_RE.sub(" ", x)
 
@@ -311,14 +325,21 @@ def _extract_ooxml(data: bytes, kind: str) -> tuple[str, bool]:
     names = zf.namelist()
     if kind == "docx":
         want = [n for n in _OOXML_PARTS["docx"] if n in names]
+        want += sorted(n for n in names if n.startswith(("word/header", "word/footer"))
+                       and n.endswith(".xml"))
     elif kind == "pptx":
         want = sorted(n for n in names
-                      if n.startswith(("ppt/slides/slide", "ppt/notesSlides/notesSlide"))
+                      if n.startswith(("ppt/slides/slide", "ppt/notesSlides/notesSlide",
+                                       "ppt/comments/"))
                       and n.endswith(".xml"))
     else:
         want = [n for n in names
-                if n == "xl/sharedStrings.xml" or n.startswith("xl/worksheets/sheet")]
-    return _zip_members_text(zf, want)
+                if n == "xl/sharedStrings.xml" or n.startswith(("xl/worksheets/sheet", "xl/comments"))]
+    want += [n for n in ("docProps/core.xml", "docProps/app.xml", "docProps/custom.xml") if n in names]
+    text, partial = _zip_members_text(zf, want)
+    # An embedded file (another document, a workbook in a slide) is not read here: say so.
+    embedded = any("/embeddings/" in n for n in names)
+    return text, partial or embedded
 
 
 def _extract_odf(data: bytes) -> tuple[str, bool]:
