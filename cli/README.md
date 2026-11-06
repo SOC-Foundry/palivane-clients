@@ -435,11 +435,13 @@ What *does* live on disk is the plumbing: these hook scripts, the proxy addon, a
   post-install download: this self-update, `palivane-connect`'s plane refresh,
   `palivane-desktop`'s addon fetch, and the scanners' fallback fetch of `palivane_detect.py`
   (loaded from memory, never from a shared temp dir). The pinned key is the one `install.sh`
-  wrote to `~/.palivane/release-pubkey.pem` (else the vendor key baked into each script;
-  `PALIVANE_RELEASE_PUBKEY` overrides). An unsigned manifest is refused unless the install
-  recorded an unsigned deployment (`~/.palivane/release-require-sig` = `0`) or
-  `PALIVANE_RELEASE_REQUIRE_SIG=0` is set. Verification uses Python's `cryptography` when
-  present, else the `openssl` CLI.
+  wrote to `~/.palivane/release-pubkey.pem`, else the vendor key baked into each script. The
+  clients never take the key from the environment: a self-host pins its own key by
+  installing from its own deployment. An unsigned manifest is refused unless the install
+  recorded an unsigned deployment (`~/.palivane/release-require-sig` = `0` or `skip`), and
+  the first signed manifest that verifies turns that record into `1` for good.
+  `PALIVANE_RELEASE_REQUIRE_SIG=1` can force signatures; no variable can allow unsigned.
+  Verification uses Python's `cryptography` when present, else the `openssl` CLI.
 
 **Without Claude Code.** posture is wired as a Claude Code `SessionStart` hook, so the
 Cursor, Codex, Gemini and Copilot hooks start it themselves: detached, at most every 6

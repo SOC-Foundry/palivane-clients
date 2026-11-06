@@ -119,12 +119,11 @@ _RELEASE_REQUIRE_SIG_PATH = "~/.palivane/release-require-sig"  # "0" = deploymen
 
 
 def _release_pubkey() -> str:
-    """The pinned key: PALIVANE_RELEASE_PUBKEY, else the key install.sh persisted from the
-    deployment it installed from (a self-host's own key), else the vendor key above."""
+    """The pinned key: the one install.sh persisted from the deployment it installed from
+    (a self-host's own key), else the vendor key above. Never the environment: a trust
+    anchor anything that can set a variable (a repo's agent settings, a wrapper) could
+    swap is no anchor. A self-host pins its key by installing from its own deployment."""
     import os
-    pem = (os.environ.get("PALIVANE_RELEASE_PUBKEY") or "").strip()
-    if pem:
-        return pem
     try:
         with open(os.path.expanduser(_RELEASE_PUBKEY_PATH)) as f:
             pem = f.read().strip()
@@ -137,17 +136,35 @@ def _release_pubkey() -> str:
 
 def _unsigned_release_allowed() -> bool:
     """An unsigned manifest is accepted only when the install recorded that its deployment
-    does not sign (install.sh REQUIRE_SIG=0/skip), or PALIVANE_RELEASE_REQUIRE_SIG=0 says so.
-    No record means a signature is required: fail closed."""
+    does not sign (install.sh REQUIRE_SIG=0/skip), and nothing has since proved it does.
+    No record means a signature is required: fail closed. PALIVANE_RELEASE_REQUIRE_SIG can
+    only tighten this (=1); it can never allow unsigned."""
     import os
-    v = (os.environ.get("PALIVANE_RELEASE_REQUIRE_SIG") or "").strip()
-    if not v:
-        try:
-            with open(os.path.expanduser(_RELEASE_REQUIRE_SIG_PATH)) as f:
-                v = f.read().strip()
-        except OSError:
-            v = ""
+    if (os.environ.get("PALIVANE_RELEASE_REQUIRE_SIG") or "").strip() == "1":
+        return False
+    try:
+        with open(os.path.expanduser(_RELEASE_REQUIRE_SIG_PATH)) as f:
+            v = f.read().strip()
+    except OSError:
+        v = ""
     return v in ("0", "skip")
+
+
+def _require_signatures_from_now_on() -> None:
+    """A signed manifest verified: this deployment signs, so an unsigned one from here on
+    is a downgrade, not the old normal. Ratchet an install-time "0"/"skip" record to "1"."""
+    import os
+    path = os.path.expanduser(_RELEASE_REQUIRE_SIG_PATH)
+    try:
+        with open(path) as f:
+            if f.read().strip() not in ("0", "skip"):
+                return
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("1\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def _verify_release_sig(message: bytes, sig_b64: bytes, pubkey_pem: str):
@@ -217,6 +234,8 @@ def _verified_manifest(fetch):
         return None
     if ok is None and not _unsigned_release_allowed():
         return None
+    if ok:
+        _require_signatures_from_now_on()
     return manifest
 
 
