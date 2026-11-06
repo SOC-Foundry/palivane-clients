@@ -23,7 +23,7 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 
-const UA = "palivane-vscode/0.2.1";   // Cloudflare's front door 403s default/bare UAs
+const UA = "palivane-vscode/0.2.2";   // Cloudflare's front door 403s default/bare UAs
 const DEFAULT_URL = "https://app.palivane.io";
 
 let status;          // status bar item

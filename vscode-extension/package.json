@@ -2,7 +2,7 @@
   "name": "palivane-vscode",
   "displayName": "Palivane, AI Security Posture",
   "description": "Continuous in-IDE posture for Palivane: extension inventory drift, MCP config changes, and AI-assistant autonomy settings, reported live to your org's Palivane console.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "palivane",
   "license": "MIT",
   "icon": "icon.png",
