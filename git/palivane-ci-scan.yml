@@ -28,10 +28,28 @@ jobs:
       # Only needed without OIDC: a per-tenant API key (ak_…) stored as a secret.
       # PALIVANE_TOKEN: ${{ secrets.PALIVANE_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Fetch the scanner
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch and verify the scanner
+        # Checked the way install.sh checks a release: the manifest's signature must verify
+        # under Palivane's release key (below; a self-hosted deployment with its own key: put
+        # its public key here), and the scanner's sha256 must match the signed manifest.
+        # Anything else fails the job before the downloaded file runs.
         run: |
+          set -euo pipefail
+          cat > release-pubkey.pem <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtwIOdXmgRU12/7oDPzpkLqrud1DN
+          s2ngn344uoGU+MF5HUF7gFG2emj+UG3aPvm5Jbh+ggQdxs9R7ZZ1PwoP9Q==
+          -----END PUBLIC KEY-----
+          PEM
+          curl -fsSL "$PALIVANE_URL/cli/manifest.json" -o manifest.json
+          curl -fsSL "$PALIVANE_URL/cli/manifest.sig" -o manifest.sig
           curl -fsSL "$PALIVANE_URL/cli/palivane-ci-scan" -o palivane-ci-scan
+          python3 -c 'import json,sys; f=json.load(open("manifest.json"))["files"]; sys.stdout.write(json.dumps({k: v["sha256"] for k, v in f.items()}, separators=(",",":"), sort_keys=True))' > manifest.digest
+          openssl base64 -d -A -in manifest.sig -out manifest.sig.der
+          openssl dgst -sha256 -verify release-pubkey.pem -signature manifest.sig.der manifest.digest
+          want="$(python3 -c 'import json; print(json.load(open("manifest.json"))["files"]["palivane-ci-scan"]["sha256"])')"
+          echo "$want  palivane-ci-scan" | sha256sum -c -
           chmod +x palivane-ci-scan
       - name: Scan this repo's workflows
         # --github-oidc: authenticate as this workflow's identity (register the issuer

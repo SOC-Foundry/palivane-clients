@@ -737,6 +737,16 @@ function Unset-UserProxy {
 function Write-Launcher([string]$mitmdump, [string]$palivaneUrl, [string]$token, [string]$user) {
     # Honor an existing enforce stance, default to monitor — same as the bash units.
     $enforce = if ($env:PALIVANE_PROXY_ENFORCE) { $env:PALIVANE_PROXY_ENFORCE } else { "false" }
+    # These go into `set "NAME=value"` lines of a .cmd file. A quote, &, |, <, >, ^, % or !
+    # would end the value or run a command at logon; none belong in a URL, token, email or
+    # flag, so such a value is refused rather than escaped.
+    foreach ($pair in @(@("PALIVANE_URL", $palivaneUrl), @("PALIVANE_TOKEN", $token),
+                        @("PALIVANE_PROXY_ENFORCE", $enforce), @("PALIVANE_PROXY_USER", $user),
+                        @("mitmdump path", $mitmdump), @("addon path", $Addon))) {
+        if ("$($pair[1])" -match '[\x00-\x1f"&|<>^%!]') {
+            throw "$($pair[0]) contains a character that can't go into the launcher (quote, &, |, <, >, ^, %, ! or a control character)."
+        }
+    }
     # Scheduled tasks can't carry env vars, so a .cmd wrapper sets them. Contains the
     # per-user token — kept under the user profile, same posture as the systemd unit.
     $cmd = @(
