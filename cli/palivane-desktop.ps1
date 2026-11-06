@@ -202,8 +202,8 @@ function Get-MitmExpectedSha256 {
 # The addon runs inside the proxy that sees every AI request, and palivane-secrets runs as a
 # daily task, so both are fetched the way the installer fetches the CLI: manifest.sig (ECDSA
 # P-256 / SHA-256 over the canonical {name: sha256} map) must verify under the PINNED release
-# key — $env:PALIVANE_RELEASE_PUBKEY, ~/.palivane/release-pubkey.pem, else the vendor key
-# below — and each file's sha256 must match the manifest. Fail closed.
+# key — ~/.palivane/release-pubkey.pem, else the vendor key below, never the environment —
+# and each file's sha256 must match the manifest. Fail closed.
 $VendorReleasePubkey = @"
 -----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtwIOdXmgRU12/7oDPzpkLqrud1DN
@@ -212,7 +212,6 @@ s2ngn344uoGU+MF5HUF7gFG2emj+UG3aPvm5Jbh+ggQdxs9R7ZZ1PwoP9Q==
 "@
 
 function Get-ReleasePubkey {
-    if ($env:PALIVANE_RELEASE_PUBKEY) { return $env:PALIVANE_RELEASE_PUBKEY }
     $f = Join-Path $WDir "release-pubkey.pem"
     if (Test-Path -LiteralPath $f -PathType Leaf) {
         $pem = Get-Content -LiteralPath $f -Raw
@@ -221,15 +220,27 @@ function Get-ReleasePubkey {
     return $VendorReleasePubkey
 }
 
-# Unsigned is accepted only when PALIVANE_RELEASE_REQUIRE_SIG=0 (or the install recorded an
-# unsigned deployment in ~/.palivane/release-require-sig).
+# Unsigned is accepted only when the install recorded an unsigned deployment in
+# ~/.palivane/release-require-sig (0/skip) and no signed manifest has verified since.
+# $env:PALIVANE_RELEASE_REQUIRE_SIG=1 tightens; nothing in the environment loosens.
+function Get-RequireSigRecord {
+    $f = Join-Path $WDir "release-require-sig"
+    if (Test-Path -LiteralPath $f -PathType Leaf) { return "$(Get-Content -LiteralPath $f -Raw)".Trim() }
+    return ""
+}
+
 function Test-UnsignedReleaseAllowed {
-    $v = "$env:PALIVANE_RELEASE_REQUIRE_SIG"
-    if (-not $v) {
-        $f = Join-Path $WDir "release-require-sig"
-        if (Test-Path -LiteralPath $f -PathType Leaf) { $v = "$(Get-Content -LiteralPath $f -Raw)".Trim() }
-    }
+    if ("$env:PALIVANE_RELEASE_REQUIRE_SIG" -eq "1") { return $false }
+    $v = Get-RequireSigRecord
     return ($v -eq "0" -or $v -eq "skip")
+}
+
+# A signed manifest verified: ratchet an install-time 0/skip record to 1.
+function Set-RequireSignatures {
+    $v = Get-RequireSigRecord
+    if ($v -eq "0" -or $v -eq "skip") {
+        try { Set-Content -LiteralPath (Join-Path $WDir "release-require-sig") -Value "1" } catch {}
+    }
 }
 
 # DER ECDSA-Sig-Value (SEQUENCE { INTEGER r, INTEGER s }), which openssl and the server
@@ -298,6 +309,7 @@ function Get-VerifiedManifest([string]$palivaneUrl) {
             Log "release signature INVALID — refusing the download (possible tampering)."
             return $null
         }
+        Set-RequireSignatures
     } elseif (-not (Test-UnsignedReleaseAllowed)) {
         Log "the deployment served no release signature — refusing the download."
         return $null

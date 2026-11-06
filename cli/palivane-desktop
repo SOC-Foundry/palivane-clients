@@ -208,26 +208,35 @@ ensure_mitm() {
 # --- Release integrity: the same check install.sh makes, for what this script downloads ---
 # The addon runs inside the proxy that sees every AI request, so it is fetched like the
 # installer fetches the CLI: manifest.sig (ECDSA P-256 / SHA-256 over the canonical
-# {name: sha256} map) must verify under the PINNED release key — PALIVANE_RELEASE_PUBKEY, the
-# key install.sh persisted in ~/.palivane/release-pubkey.pem, else the vendor key below —
-# and the file's sha256 must match the manifest. Fail closed; the existing copy is kept.
+# {name: sha256} map) must verify under the PINNED release key — the key install.sh persisted
+# in ~/.palivane/release-pubkey.pem, else the vendor key below, never the environment — and
+# the file's sha256 must match the manifest. Fail closed; the existing copy is kept.
 PALIVANE_VENDOR_RELEASE_PUBKEY="-----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtwIOdXmgRU12/7oDPzpkLqrud1DN
 s2ngn344uoGU+MF5HUF7gFG2emj+UG3aPvm5Jbh+ggQdxs9R7ZZ1PwoP9Q==
 -----END PUBLIC KEY-----"
 
 release_pubkey() {
-  if [ -n "${PALIVANE_RELEASE_PUBKEY:-}" ]; then printf '%s\n' "$PALIVANE_RELEASE_PUBKEY"
-  elif grep -qs "BEGIN PUBLIC KEY" "${WDIR}/release-pubkey.pem"; then cat "${WDIR}/release-pubkey.pem"
+  if grep -qs "BEGIN PUBLIC KEY" "${WDIR}/release-pubkey.pem"; then cat "${WDIR}/release-pubkey.pem"
   else printf '%s\n' "$PALIVANE_VENDOR_RELEASE_PUBKEY"; fi
 }
 
 # Unsigned is accepted only when the install recorded an unsigned deployment
-# (install.sh REQUIRE_SIG=0) or PALIVANE_RELEASE_REQUIRE_SIG=0 says so.
+# (install.sh REQUIRE_SIG=0/skip) and no signed manifest has verified since.
+# PALIVANE_RELEASE_REQUIRE_SIG=1 tightens; nothing in the environment loosens.
 unsigned_release_allowed() {
-  local v="${PALIVANE_RELEASE_REQUIRE_SIG:-}"
-  [ -n "$v" ] || v="$(cat "${WDIR}/release-require-sig" 2>/dev/null || true)"
-  case "$v" in 0|skip) return 0 ;; *) return 1 ;; esac
+  [ "${PALIVANE_RELEASE_REQUIRE_SIG:-}" = 1 ] && return 1
+  case "$(cat "${WDIR}/release-require-sig" 2>/dev/null || true)" in 0|skip) return 0 ;; *) return 1 ;; esac
+}
+
+# A signed manifest verified: ratchet an install-time 0/skip record to 1, so an unsigned
+# manifest from here on is refused as the downgrade it is.
+require_signatures_from_now_on() {
+  case "$(cat "${WDIR}/release-require-sig" 2>/dev/null || true)" in
+    0|skip) printf '1\n' > "${WDIR}/release-require-sig.tmp" \
+              && mv -f "${WDIR}/release-require-sig.tmp" "${WDIR}/release-require-sig" ;;
+  esac
+  return 0
 }
 
 # fetch_verified <name> <dest>: download <name> from the deployment, verify it, then move it
@@ -256,7 +265,7 @@ PY
       release_pubkey > "$t/pub.pem"
       if openssl base64 -d -A -in "$t/manifest.sig" -out "$t/sig.der" 2>/dev/null \
          && openssl dgst -sha256 -verify "$t/pub.pem" -signature "$t/sig.der" "$t/digest" >/dev/null 2>&1; then
-        sig_ok=0
+        sig_ok=0; require_signatures_from_now_on
       else
         log "release signature INVALID for $name — refusing it (possible tampering)."
       fi
