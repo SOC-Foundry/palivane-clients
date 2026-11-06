@@ -155,6 +155,7 @@ s2ngn344uoGU+MF5HUF7gFG2emj+UG3aPvm5Jbh+ggQdxs9R7ZZ1PwoP9Q==
 """
 _RELEASE_PUBKEY_PATH = "~/.palivane/release-pubkey.pem"      # written by install.sh
 _RELEASE_REQUIRE_SIG_PATH = "~/.palivane/release-require-sig"  # "0" = deployment unsigned
+_RELEASE_ISSUED_PATH = "~/.palivane/release-issued"          # newest v2 release accepted
 
 
 def _release_pubkey() -> str:
@@ -253,6 +254,31 @@ def _verify_release_sig(message: bytes, sig_b64: bytes, pubkey_pem: str):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _seen_issued():
+    """The `issued` of the newest v2-signed release this machine accepted, or None."""
+    import os
+    try:
+        with open(os.path.expanduser(_RELEASE_ISSUED_PATH)) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _record_issued(issued: int) -> None:
+    import os
+    path = os.path.expanduser(_RELEASE_ISSUED_PATH)
+    seen = _seen_issued()
+    if seen is not None and issued <= seen:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            f.write(f"{issued}\n")
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
 def _verified_manifest(fetch):
     """The release manifest, or None unless it is authentic. `fetch(name)` returns the bytes
     of <base>/cli/<name>, or None on any failure (a 404 for manifest.sig included)."""
@@ -265,6 +291,26 @@ def _verified_manifest(fetch):
         hashes = {str(k): str(v["sha256"]) for k, v in manifest["files"].items()}
     except Exception:                                           # noqa: BLE001
         return None
+    # v2 (manifest.sig2) also signs the release's `issued`: once this machine has accepted a
+    # v2 release, an older one (a replayed signed release) and a v1-only manifest (sig2
+    # stripped) are rollbacks and are refused. Must match
+    # release_signing.canonical_release_digest byte for byte.
+    sig2 = fetch("manifest.sig2")
+    seen = _seen_issued()
+    issued = None
+    if sig2:
+        issued = manifest.get("issued")
+        if not isinstance(issued, int) or isinstance(issued, bool):
+            return None
+        message2 = json.dumps({"files": hashes, "issued": issued},
+                              separators=(",", ":"), sort_keys=True).encode()
+        ok2 = _verify_release_sig(message2, sig2, _release_pubkey())
+        if ok2 is False or (ok2 and seen is not None and issued < seen):
+            return None
+        if not ok2:
+            issued = None                  # nothing here can verify; v1's rules decide below
+    elif seen is not None:
+        return None
     # Must match release_signing.canonical_files_digest byte for byte.
     message = json.dumps(hashes, separators=(",", ":"), sort_keys=True).encode()
     sig = fetch("manifest.sig")
@@ -275,6 +321,8 @@ def _verified_manifest(fetch):
         return None
     if ok:
         _require_signatures_from_now_on()
+        if issued is not None:
+            _record_issued(issued)
     return manifest
 
 

@@ -242,7 +242,7 @@ require_signatures_from_now_on() {
 # fetch_verified <name> <dest>: download <name> from the deployment, verify it, then move it
 # into place atomically. Non-zero, with <dest> untouched, on any failure.
 fetch_verified() {
-  local name="$1" dest="$2" base="${PALIVANE_URL%/}" t want got sig_ok=1
+  local name="$1" dest="$2" base="${PALIVANE_URL%/}" t want got sig_ok=1 seen issued="" new_issued=""
   t="$(mktemp -d)" || return 1
   if ! curl -fsSL "$base/cli/manifest.json" -o "$t/manifest.json" \
      || ! curl -fsSL "$base/cli/$name" -o "$t/file"; then
@@ -252,14 +252,49 @@ fetch_verified() {
     log "python3 is needed to verify $name against the release manifest."; rm -rf "$t"; return 1
   fi
   # Canonical digest = compact sorted {name: sha256} JSON (release_signing.canonical_files_digest).
-  if ! python3 - "$t/manifest.json" "$name" "$t/want" > "$t/digest" <<'PY'
+  # v2 (release_signing.canonical_release_digest) adds the manifest's `issued` to the map.
+  if ! python3 - "$t/manifest.json" "$name" "$t/want" "$t/digest2" "$t/issued" > "$t/digest" <<'PY'
 import json, sys
-files = json.load(open(sys.argv[1]))["files"]
+m = json.load(open(sys.argv[1]))
+files = m["files"]
+hashes = {k: v["sha256"] for k, v in files.items()}
 open(sys.argv[3], "w").write(str((files.get(sys.argv[2]) or {}).get("sha256", "")))
-sys.stdout.write(json.dumps({k: v["sha256"] for k, v in files.items()},
-                            separators=(",", ":"), sort_keys=True))
+issued = m.get("issued")
+ok = isinstance(issued, int) and not isinstance(issued, bool)
+open(sys.argv[5], "w").write(str(issued) if ok else "")
+open(sys.argv[4], "w").write(json.dumps({"files": hashes, "issued": issued}, separators=(",", ":"),
+                                        sort_keys=True) if ok else "")
+sys.stdout.write(json.dumps(hashes, separators=(",", ":"), sort_keys=True))
 PY
   then rm -rf "$t"; return 1; fi
+  # Rollback guard: once a v2-signed release was accepted, an older one or a manifest
+  # without manifest.sig2 is refused.
+  seen="$(cat "${WDIR}/release-issued" 2>/dev/null || true)"
+  case "$seen" in ''|*[!0-9]*) seen="" ;; esac
+  if curl -fsSL "$base/cli/manifest.sig2" -o "$t/manifest.sig2" 2>/dev/null; then
+    issued="$(cat "$t/issued")"
+    if [ -z "$issued" ]; then
+      log "the manifest carries no release time for its v2 signature — refusing $name."
+      rm -rf "$t"; return 1
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+      release_pubkey > "$t/pub2.pem"
+      if openssl base64 -d -A -in "$t/manifest.sig2" -out "$t/sig2.der" 2>/dev/null \
+         && openssl dgst -sha256 -verify "$t/pub2.pem" -signature "$t/sig2.der" "$t/digest2" >/dev/null 2>&1; then
+        if [ -n "$seen" ] && [ "$issued" -lt "$seen" ]; then
+          log "the deployment served an OLDER release than this machine has — refusing $name (rollback)."
+          rm -rf "$t"; return 1
+        fi
+        new_issued="$issued"
+      else
+        log "release v2 signature INVALID for $name — refusing it (possible tampering)."
+        rm -rf "$t"; return 1
+      fi
+    fi
+  elif [ -n "$seen" ]; then
+    log "the deployment served no v2 release signature after one was seen — refusing $name (downgrade)."
+    rm -rf "$t"; return 1
+  fi
   if curl -fsSL "$base/cli/manifest.sig" -o "$t/manifest.sig" 2>/dev/null; then
     if command -v openssl >/dev/null 2>&1; then
       release_pubkey > "$t/pub.pem"
@@ -284,6 +319,10 @@ PY
   mkdir -p "$(dirname "$dest")"
   swap_into_place "$t/file" "$dest"
   local rc=$?
+  if [ "$rc" = 0 ] && [ -n "$new_issued" ] && { [ -z "$seen" ] || [ "$new_issued" -gt "$seen" ]; }; then
+    printf '%s\n' "$new_issued" > "${WDIR}/release-issued.tmp" \
+      && mv -f "${WDIR}/release-issued.tmp" "${WDIR}/release-issued"
+  fi
   rm -rf "$t"
   return $rc
 }
