@@ -258,6 +258,7 @@ def _xml_text(blob: bytes) -> str:
 # declared uncompressed size is already absurd — so a hostile Office/OpenDocument file
 # (Slack/Drive/SharePoint attachment) can't OOM the worker.
 _MAX_ZIP_MEMBER_BYTES = 4 * _MAX_EXTRACT_CHARS   # ~2 MB decompressed per entry, then truncated
+_MAX_ZIP_MEMBERS = 200      # slides / sheets read per file; past that the read is partial
 
 
 def _zip_read_capped(zf, name: str) -> tuple[bytes, bool]:
@@ -279,9 +280,12 @@ def _zip_read_capped(zf, name: str) -> tuple[bytes, bool]:
 
 
 def _zip_members_text(zf, names: list[str]) -> tuple[str, bool]:
-    """(text, partial) for the named XML members of an Office / OpenDocument ZIP."""
+    """(text, partial) for the named XML members of an Office / OpenDocument ZIP. At most
+    _MAX_ZIP_MEMBERS are read: a crafted deck of thousands of tiny slide entries would
+    otherwise be inflated entry by entry. Past the cap the read is reported partial."""
     out: list[str] = []
-    partial = False
+    partial = len(names) > _MAX_ZIP_MEMBERS
+    names = names[:_MAX_ZIP_MEMBERS]
     for i, n in enumerate(names):
         try:
             blob, whole = _zip_read_capped(zf, n)
