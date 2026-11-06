@@ -429,12 +429,33 @@ lock_mtime() {
   printf '%s' "$m"
 }
 
+# The lock directory's inode, for the debug trace: two runs that both report "took lock" with
+# the same inode shared one directory; different inodes mean it was removed and re-made between.
+lock_inode() {
+  case "$OS" in
+    Darwin) stat -f %i "$1" 2>/dev/null || true ;;
+    *)      stat -c %i "$1" 2>/dev/null || true ;;
+  esac
+}
+
+# Claim a lock directory this run just made: create its pid file exclusively (noclobber is
+# O_EXCL). The mkdir is the lock; this is the second check that only one run owns it. CI saw
+# two concurrent runs both log "took lock" from the mkdir alone (2026-11-06), so a run that
+# finds a pid file it did not write backs off instead of updating alongside the other.
+claim_lock() {
+  if ! ( set -C; printf '%s\n' "$$" > "$1/pid" ) 2>/dev/null; then
+    lock_debug "lock dir made, but its pid file was already there (owner '$(cat "$1/pid" 2>/dev/null || true)'): not ours"
+    return 1
+  fi
+  lock_debug "$2 (inode $(lock_inode "$1"))"
+}
+
 take_update_lock() {
   local lock pid mtime age
   lock="$(state_dir)/update-addon.lock"
   mkdir -p "$(state_dir)"
   if mkdir "$lock" 2>/dev/null; then
-    echo "$$" > "$lock/pid"; lock_debug "took lock"; return 0
+    claim_lock "$lock" "took lock"; return
   fi
   pid="$(cat "$lock/pid" 2>/dev/null || true)"
   mtime="$(lock_mtime "$lock")"
@@ -444,7 +465,7 @@ take_update_lock() {
     lock_debug "taking over stale lock (owner='${pid}', age=${age}s)"
     rm -rf "$lock"
     if mkdir "$lock" 2>/dev/null; then
-      echo "$$" > "$lock/pid"; lock_debug "took lock after takeover"; return 0
+      claim_lock "$lock" "took lock after takeover"; return
     fi
     lock_debug "takeover lost the race"
   fi
