@@ -2225,15 +2225,28 @@ class PalivaneGuard:
             f"wss://{flow.request.pretty_host}{COMET_AGENT_WS_PATH}", tool="comet")
 
     async def websocket_message(self, flow) -> None:
-        if not is_comet_agent_ws(flow.request.pretty_host, flow.request.path):
-            return
+        host, path = flow.request.pretty_host, flow.request.path
         msg = flow.websocket.messages[-1]
+        if is_comet_agent_ws(host, path):
+            text = extract_ws_text(msg.content)
+            if not text.strip():
+                return  # binary/empty frame — websocket_start already flagged the channel
+            await asyncio.to_thread(scan, text, f"wss://{host}{COMET_AGENT_WS_PATH}", tool="comet")
+            return
+        # Every other AI host: what the client SENDS over a socket (some web chats send the
+        # prompt this way) is scanned and recorded. Not blocked: dropping one frame mid-session
+        # breaks the app with no explanation, unlike an HTTP request, which gets a block page.
+        # Server frames (replies, keepalives) and tiny frames (acks, pings) are skipped.
+        if not getattr(msg, "from_client", False) or not is_ai_host(host):
+            return
         text = extract_ws_text(msg.content)
-        if not text.strip():
-            return  # binary/empty frame — websocket_start already flagged the channel
-        await asyncio.to_thread(
-            scan, text,
-            f"wss://{flow.request.pretty_host}{COMET_AGENT_WS_PATH}", tool="comet")
+        if len(text.strip()) < _WS_MIN_CHARS:
+            return
+        await asyncio.to_thread(scan, text, f"wss://{host}{path.split('?', 1)[0]}",
+                                tool=detect_tool(flow.request.headers.get("user-agent", "")))
+
+
+_WS_MIN_CHARS = 20    # shorter client frames are acks/pings, not prompts
 
 
 addons = [PalivaneGuard()]
