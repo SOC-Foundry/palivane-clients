@@ -166,6 +166,8 @@ def _line_secrets(line: str) -> list[tuple[str, str]]:
         # secret key's "secret_access_key" label) names the value group "v"; use that, so
         # neither the preview nor the redaction swallows the context along with it.
         val = m.groupdict().get("v") or m.group(0)
+        if "EXAMPLE" in val:
+            continue          # a vendor-doc sample (AWS's …EXAMPLE keys), as on the server
         matched.add(val)
         out.append((label, val))
     cm = _CONN_RE.search(line)
@@ -963,10 +965,16 @@ def _luhn_ok(digits: str) -> bool:
     return total % 10 == 0
 
 
+# Published sample SSNs the SSA voided (078-05-1120, 219-09-9999, 457-55-5462), as on the server.
+_SAMPLE_SSNS = frozenset({"078051120", "219099999", "457555462"})
+
+
 def _valid_ssn9(d: str) -> bool:
-    """SSA structural rules: area not 000/666 and not 900-999, group not 00, serial not 0000."""
+    """SSA structural rules: area not 000/666 and not 900-999, group not 00, serial not 0000;
+    and not a published sample."""
     area, group, serial = d[:3], d[3:5], d[5:9]
-    return area not in ("000", "666") and area[0] != "9" and group != "00" and serial != "0000"
+    return (area not in ("000", "666") and area[0] != "9" and group != "00" and serial != "0000"
+            and d not in _SAMPLE_SSNS)
 
 
 def _line_pii(line: str) -> list[tuple[str, str, str]]:
