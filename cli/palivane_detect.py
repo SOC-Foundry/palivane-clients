@@ -91,9 +91,11 @@ _PATTERNS = [
     ("npm token" + _STRIP, re.compile(r"npm[A-Za-z0-9]{36}")),
     ("PyPI token" + _STRIP, re.compile(r"pypi[A-Za-z0-9]{32,}")),
 ]
+# Alphanumeric lookarounds, not \b: "_" is a word character, so \bsecret\b never matched the
+# commonest spelling of all, SLACK_SIGNING_SECRET=… / DB_PASSWORD=… (the server's rule has it).
 _ASSIGN_RE = re.compile(
-    r"""(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|
-        private[_-]?key|client[_-]?secret)\b\s*[:=]\s*['"]?([^\s'"]{8,})""", re.VERBOSE)
+    r"""(?i)(?<![A-Za-z0-9])(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|
+        private[_-]?key|client[_-]?secret)(?![A-Za-z0-9])\s*[:=]\s*['"]?([^\s'"]{8,})""", re.VERBOSE)
 
 _CONN_RE = re.compile(
     r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?|mssql|"
@@ -102,7 +104,9 @@ _CONN_RE = re.compile(
 _PLACEHOLDER_RE = re.compile(
     r"(?i)^(?:x{3,}|\*{3,}|\.{3,}|changeme|change_me|placeholder|example|sample|dummy|fake|"
     r"redacted|your[_-]?\w+|my[_-]?\w+|test|password|passwd|pass|secret|token|<[^>]+>|"
-    r"\$?\{[^}]+\}|\$[a-z_][a-z0-9_]*|%[a-z_]+%)$")
+    r"\$?\{[^}]+\}|\$[a-z_][a-z0-9_]*|%[a-z_]+%|"
+    # Fill-in instructions (`PASTE_SECRET_HERE`, `your_token_here`, `REPLACE_ME`), as on the server.
+    r"(?:paste|insert|enter|replace|put)[_-].*|.*[_-]here|replace[_-]?me|fill[_-]?(?:in|me).*)$")
 
 _ENTROPY_LABEL = "Possible secret (high-entropy token)"
 _TOKEN_CANDIDATE_RE = re.compile(r"[A-Za-z0-9_]{24,80}")
