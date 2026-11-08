@@ -32,12 +32,16 @@ from __future__ import annotations
 import os
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 BASE_URL = os.environ.get("PALIVANE_BASE_URL", "https://app.palivane.io").rstrip("/")
 _TIMEOUT = float(os.environ.get("PALIVANE_TIMEOUT", "30"))
 
-mcp = FastMCP("palivane")
+mcp = MCPServer("palivane")
+
+# Errors meant for the person go out as ToolError: mcp 2 passes its message to the client, but
+# any other exception reaches it only as "Error executing tool <name>".
 
 
 class _Api:
@@ -64,14 +68,14 @@ class _Api:
         password = os.environ.get("PALIVANE_PASSWORD", "")
         if not email or not password:
             if self._token_from_env:
-                raise RuntimeError(
+                raise ToolError(
                     "PALIVANE_API_TOKEN is no longer accepted. It is a console session "
                     "token, so it expires (~12h by default) and is also invalidated by a "
                     "password change or sign-out-everywhere. Mint a fresh one via "
                     "POST /api/auth/login, or set PALIVANE_EMAIL + PALIVANE_PASSWORD so "
                     "this server can re-login by itself (not possible on MFA-enabled "
                     "accounts — those must re-mint the token).")
-            raise RuntimeError(
+            raise ToolError(
                 "not authenticated: set PALIVANE_API_TOKEN, or PALIVANE_EMAIL + PALIVANE_PASSWORD")
         payload = {"email": email, "password": password}
         org = os.environ.get("PALIVANE_ORG", "").strip()
@@ -81,16 +85,16 @@ class _Api:
         if r.status_code == 409:
             # The API refuses to auto-pick between orgs sharing an email (cross-tenant
             # hazard), so this is config we can ask for by name rather than a raw 409.
-            raise RuntimeError(
+            raise ToolError(
                 "this email belongs to more than one Palivane org — set PALIVANE_ORG to "
                 "your org slug (the same one you choose when signing in to the console).")
         if r.status_code != 200:
-            raise RuntimeError(f"login failed ({r.status_code}): {r.text[:200]}")
+            raise ToolError(f"login failed ({r.status_code}): {r.text[:200]}")
         body = r.json()
         token = body.get("access_token")
         if not token:
             # A challenge (e.g. MFA) came back instead of a token.
-            raise RuntimeError(
+            raise ToolError(
                 "login did not return a token (MFA-enabled accounts must use PALIVANE_API_TOKEN)")
         self._token = token
         self._token_from_env = False
@@ -101,7 +105,7 @@ class _Api:
                 method, path, params=params, json=json,
                 headers={"Authorization": f"Bearer {self._api_key}"})
             if r.status_code == 401:
-                raise RuntimeError(
+                raise ToolError(
                     "PALIVANE_API_KEY was rejected. A console key is long-lived, so this "
                     "means it was revoked, it expired, the user it acts as was "
                     "deactivated — or it is an ingest-scoped key, which the console API "
@@ -112,9 +116,9 @@ class _Api:
                 # sent people to re-mint keys that were fine.
                 hint = (" (mint a key with 'Read + triage/sync' if you need set_finding_status "
                         "or sync_connector)" if "read-only" in r.text else "")
-                raise RuntimeError(f"{method} {path} -> 403: {r.text[:200]}{hint}")
+                raise ToolError(f"{method} {path} -> 403: {r.text[:200]}{hint}")
             if r.status_code >= 400:
-                raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
+                raise ToolError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
             return r.json() if r.content else {}
         if not self._token:
             self._login()
@@ -126,9 +130,9 @@ class _Api:
                 self._login()          # token expired/revoked — refresh once and retry
                 continue
             if r.status_code >= 400:
-                raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
+                raise ToolError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
             return r.json() if r.content else {}
-        raise RuntimeError(f"{method} {path}: unauthorized after re-login")
+        raise ToolError(f"{method} {path}: unauthorized after re-login")
 
 
 _api = _Api()
@@ -208,7 +212,7 @@ def set_finding_status(finding_id: int, status: str) -> dict:
     """Triage a finding. status is one of: open, triaged, dismissed. Dismissing is
     admin-only server-side — a non-admin token gets a 403, surfaced as an error."""
     if status not in ("open", "triaged", "dismissed"):
-        raise ValueError("status must be one of: open, triaged, dismissed")
+        raise ToolError("status must be one of: open, triaged, dismissed")
     return _api.request("PATCH", f"/api/findings/{finding_id}", json={"status": status})
 
 
