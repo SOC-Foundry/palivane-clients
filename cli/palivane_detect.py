@@ -15,14 +15,24 @@ installed beside them; either scanner will fetch it if it is missing.
                so a client-side finding matches what the server would have said)
   scan_all  -> both, as (category, label, line, masked)
 
+Each line is also checked with look-alike characters folded and with encoded runs
+decoded (base64/hex, escapes, percent-encoding), as the server does: a key spelled in
+fullwidth letters, or base64'd into a config, is still that key.
+
 Nothing here returns a detected value. Anything that walks a filesystem or reads
 permissions stays in palivane-secrets; a bucket scanner has no use for it.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import html
 import math
 import re
 import secrets
+import unicodedata
+import urllib.parse
+import zlib
 from collections import Counter
 
 _STRIP = " (separator stripped — likely bypass)"
@@ -169,17 +179,169 @@ def _line_secrets(line: str) -> list[tuple[str, str]]:
     return out
 
 
+# --- obfuscation: look-alike folding and decode-and-rescan -------------------------------
+# Kept in step with the server (backend/app/detectors/normalize.py and decode.py), stdlib
+# only: a value hidden by Unicode look-alikes or by an encoding is checked like plain text.
+# What a non-plain view finds carries a label suffix, so the reader knows why it matched.
+
+_FOLDED = " (look-alike characters)"
+_ENCODED = " (encoded)"
+
+# Cyrillic/Greek letters that look Latin. NFKC handles fullwidth and other compatibility
+# forms; these are separate characters it leaves alone.
+_HOMOGLYPHS = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y", "ѕ": "s",
+    "і": "i", "ј": "j", "к": "k", "н": "h", "м": "m", "т": "t", "в": "b",
+    "α": "a", "ο": "o", "ρ": "p", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "τ": "t",
+})
+_DROP_CATEGORIES = ("Cf", "Mn", "Me")     # zero-width/bidi/tag characters, combining marks
+
+
+def fold(text: str) -> str:
+    """`text` with fullwidth and compatibility forms normalized (NFKC), invisible format
+    characters and combining marks removed, non-ASCII digits made ASCII, and look-alike
+    Cyrillic/Greek letters made Latin. The server's canonical_fold plus its homoglyph map."""
+    t = unicodedata.normalize("NFKC", text)
+    if t.isascii():
+        return t
+    t = "".join(c for c in unicodedata.normalize("NFKD", t)
+                if unicodedata.category(c) not in _DROP_CATEGORIES)
+    t = unicodedata.normalize("NFC", t)
+    t = "".join(str(unicodedata.decimal(c)) if c.isdecimal() and not c.isascii() else c
+                for c in t)
+    return t.translate(_HOMOGLYPHS)
+
+
+# Decode work per text, across every blob and level; one blob's share; how many levels deep
+# decoded text is decoded again; how far a gzip/zlib body may inflate. The server's numbers.
+_DECODE_BUDGET = 512 * 1024
+_MAX_BLOB = 128 * 1024
+_MAX_DEPTH = 3
+_MAX_INFLATE = 256 * 1024
+_B64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+_HEX_BLOB_RE = re.compile(r"(?:[0-9a-fA-F]{2}){12,}")
+_ESC_RE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2})")
+_ENTITY_RE = re.compile(r"&#(?:\d{1,7}|[xX][0-9a-fA-F]{1,6});")
+
+
+def _printable(raw: bytes) -> str:
+    text = raw.decode("utf-8", "replace")
+    ok = sum(c.isprintable() or c.isspace() for c in text)
+    return text if text and ok / len(text) > 0.85 else ""
+
+
+def _maybe_inflate(raw: bytes) -> bytes:
+    if raw[:2] == b"\x1f\x8b":
+        wbits = 16 + zlib.MAX_WBITS
+    elif len(raw) >= 2 and raw[0] == 0x78 and (raw[0] << 8 | raw[1]) % 31 == 0:
+        wbits = zlib.MAX_WBITS
+    else:
+        return raw
+    try:
+        return zlib.decompressobj(wbits).decompress(raw, _MAX_INFLATE)
+    except zlib.error:
+        return raw
+
+
+def _decode_blob(blob: str, hexrun: bool) -> str:
+    if hexrun:
+        try:
+            return _printable(_maybe_inflate(bytes.fromhex(blob[:len(blob) // 2 * 2])))
+        except ValueError:
+            return ""
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            raw = decoder(blob + "=" * (-len(blob) % 4))
+        except (binascii.Error, ValueError):
+            continue
+        if (t := _printable(_maybe_inflate(raw))):
+            return t
+    return ""
+
+
+class _Budget:
+    def __init__(self) -> None:
+        self.left = _DECODE_BUDGET
+        self.exhausted = False
+
+
+def _decodings(line: str, budget: _Budget) -> list[tuple[str, str]]:
+    """(decoded text, the substring of `line` it came from) for each encoded run in `line`,
+    nested runs decoded again under their outermost run. Escapes, numeric entities and
+    percent-encoding are decoded over the whole line."""
+    out: list[tuple[str, str]] = []
+    level = [(line, None)]
+    for depth in range(_MAX_DEPTH):
+        nxt: list[tuple[str, str]] = []
+        for src, origin in level:
+            for rx, hexrun in ((_B64_BLOB_RE, False), (_HEX_BLOB_RE, True)):
+                for m in rx.finditer(src):
+                    blob = m.group(0)
+                    if blob.isalpha() and (blob.islower() or blob.isupper()):
+                        continue                      # a long word, not encoded data
+                    if len(blob) > _MAX_BLOB or len(blob) > budget.left:
+                        budget.exhausted = True
+                        continue
+                    budget.left -= len(blob)
+                    if (d := _decode_blob(blob, hexrun)):
+                        nxt.append((d, origin or blob))
+        out.extend(nxt)
+        if not nxt:
+            break
+        level = nxt
+    else:
+        budget.exhausted = budget.exhausted or any(
+            _B64_BLOB_RE.search(t) or _HEX_BLOB_RE.search(t) for t, _ in level)
+    if _ESC_RE.search(line):
+        out.append((_ESC_RE.sub(lambda m: chr(int(m.group(0)[2:], 16)), line), line))
+    if _ENTITY_RE.search(line):
+        out.append((html.unescape(line), line))
+    if "%" in line:
+        dec = urllib.parse.unquote(line)
+        if dec != line:
+            out.append((dec, line))
+    return out
+
+
+def _views(text: str) -> tuple[list[tuple[int, str, str, str | None]], bool]:
+    """Every view of every line to check, as (line_no, view, label suffix, origin), and
+    whether the decode budget ran out. origin is None for the line as written; otherwise the
+    part of the original text that holds what this view shows (the line, or the encoded
+    run), which is what redact() must remove when this view finds a secret."""
+    out: list[tuple[int, str, str, str | None]] = []
+    budget = _Budget()
+    for lineno, line in enumerate(text.splitlines(), 1):
+        head = line[:4000]
+        out.append((lineno, head, "", None))
+        folded = fold(head)
+        if folded != head:
+            out.append((lineno, folded, _FOLDED, line))
+        for decoded, origin in _decodings(fold(line) if folded != head else line, budget):
+            if folded != head:
+                origin = line              # the run was found in the folded line
+            for piece in decoded.splitlines():
+                out.append((lineno, fold(piece[:4000]), _ENCODED, origin))
+    return out, budget.exhausted
+
+
+def _secrets_in(views) -> list[tuple[str, int, str, str | None]]:
+    """(label, line_no, raw value, origin) per credential across the views. A value the line
+    as written already shows is not reported again from its other views; a repeat of the
+    same value under the same label anywhere is reported once, at its first line."""
+    found: list[tuple[str, int, str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    for lineno, view, suffix, origin in views:
+        for label, val in _line_secrets(view):
+            if (label, val) not in seen:
+                seen.add((label, val))
+                found.append((label + suffix, lineno, val, origin))
+    return found
+
+
 def scan_text(text: str) -> list[tuple[str, int, str]]:
     """Return (secret_type, line_no, masked_preview) for each credential in `text`.
     A repeat of the same value under the same label is reported once, at its first line."""
-    found: list[tuple[str, int, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for lineno, line in enumerate(text.splitlines(), 1):
-        for label, val in _line_secrets(line[:4000]):
-            if (label, val) not in seen:
-                seen.add((label, val))
-                found.append((label, lineno, mask(val)))
-    return found
+    return [(label, lineno, mask(val)) for label, lineno, val, _ in _secrets_in(_views(text)[0])]
 
 
 def redact(text: str) -> str:
@@ -191,13 +353,20 @@ def redact(text: str) -> str:
     Every occurrence goes, not just the first: scan_text reports a repeated value once, but
     leaving the other copies in place would defeat the point. Longest values are replaced
     first so a short secret that happens to sit inside a longer one cannot leave a
-    fragment of the longer one behind."""
+    fragment of the longer one behind. A credential seen only once folded or decoded takes
+    what holds it with it, the encoded run or the whole line: removing just the decoded
+    value would leave the original, still decodable, in place."""
     values: dict[str, str] = {}
-    for line in text.splitlines():
-        for label, val in _line_secrets(line[:4000]):
-            values.setdefault(val, label)
+    plain: set[tuple[int, str]] = set()     # (line, value) the line as written shows
+    for lineno, view, suffix, origin in _views(text)[0]:
+        for label, val in _line_secrets(view):
+            if origin is None:
+                plain.add((lineno, val))
+            elif (lineno, val) in plain:
+                continue                    # a re-view of a value already redacted as is
+            values.setdefault(val if origin is None else origin, label + suffix)
     for val in sorted(values, key=len, reverse=True):
-        text = text.replace(val, f"\u00abredacted:{values[val]}\u00bb")
+        text = text.replace(val, f"«redacted:{values[val]}»")
     return text
 
 
@@ -837,12 +1006,21 @@ def _line_pii(line: str) -> list[tuple[str, str, str]]:
     return out
 
 
+def _pii_in(views) -> list[tuple[str, str, int, str]]:
+    found: list[tuple[str, str, int, str]] = []
+    seen: set[tuple[int, str, str]] = set()     # per line: a value the plain view found once
+    for lineno, view, suffix, _ in views:
+        for cat, label, val in _line_pii(view):
+            if (lineno, label, val) not in seen:
+                seen.add((lineno, label, val))
+                found.append((cat, label + suffix, lineno, mask(val)))
+    return found
+
+
 def scan_pii(text: str) -> list[tuple[str, str, int, str]]:
     """(category, label, line_no, masked) for personal data. Category is pii_exposure, or
     phi_exposure when health context sits on the same line."""
-    return [(cat, label, lineno, mask(val))
-            for lineno, line in enumerate(text.splitlines(), 1)
-            for cat, label, val in _line_pii(line)]
+    return _pii_in(_views(text)[0])
 
 
 # --- reversible tokenization ---------------------------------------------------------
@@ -935,10 +1113,17 @@ def unknown_tokens(text: str, mapping: dict[str, str]) -> list[str]:
                    if m.group(0).lower() not in known})
 
 
+def scan_all_detail(text: str) -> tuple[list[tuple[str, str, int, str]], bool]:
+    """(findings, partial): scan_all's findings, and whether `text` held more encoded content
+    than one pass decodes, so part of it went unchecked. Report that as a partial read."""
+    views, exhausted = _views(text)
+    found = [("secret_leak", label, lineno, mask(val))
+             for label, lineno, val, _ in _secrets_in(views)]
+    found.extend(_pii_in(views))
+    return found, exhausted
+
+
 def scan_all(text: str) -> list[tuple[str, str, int, str]]:
-    """Every finding in `text` as (category, label, line_no, masked). The only function the
-    scanners call; nothing in the return value contains the detected value."""
-    found = [("secret_leak", label, lineno, masked)
-             for label, lineno, masked in scan_text(text)]
-    found.extend(scan_pii(text))
-    return found
+    """Every finding in `text` as (category, label, line_no, masked). Nothing in the return
+    value contains the detected value."""
+    return scan_all_detail(text)[0]

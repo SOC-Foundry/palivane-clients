@@ -460,11 +460,15 @@ def main() -> int:
             skipped_binary += 1
             continue
         content, partial = got
-        partial_reads += partial
         # Detect HERE. Only what was found travels: category, label, line, masked
         # preview. The object's bytes stay in the account that owns them, which is the
         # same contract palivane-secrets keeps for endpoints.
-        found = detect.scan_all(content)
+        if hasattr(detect, "scan_all_detail"):
+            found, undecoded = detect.scan_all_detail(content)   # more encoded data than one pass decodes
+            partial = partial or undecoded
+        else:                 # an older palivane_detect.py installed beside this script
+            found = detect.scan_all(content)
+        partial_reads += partial
         if found:
             objects.append({"key": o["key"], "findings": [
                 {"category": c, "label": lbl, "line": ln, "masked": mk}

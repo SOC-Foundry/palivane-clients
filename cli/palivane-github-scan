@@ -426,7 +426,11 @@ def scan_blob_detail(item: dict, token: str, api: str) -> tuple[dict | None, boo
     if not text:
         return UNREADABLE, False
     partial = partial or len(text) > MAX_CONTENT
-    found = detect.scan_all(text[:MAX_CONTENT])
+    if hasattr(detect, "scan_all_detail"):
+        found, undecoded = detect.scan_all_detail(text[:MAX_CONTENT])
+        partial = partial or undecoded     # more encoded data than one pass decodes
+    else:                     # an older palivane_detect.py installed beside this script
+        found = detect.scan_all(text[:MAX_CONTENT])
     if not found:
         return None, partial
     label = f"{item['owner']}/{item['repo']}@{item['branch']}:{item['path']}"
