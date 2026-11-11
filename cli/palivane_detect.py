@@ -965,6 +965,61 @@ def _luhn_ok(digits: str) -> bool:
     return total % 10 == 0
 
 
+# Card network prefix + length, as on the server (app/detectors/shadow_ai.py).
+def _card_shape_ok(d: str) -> bool:
+    """Does `d` look like something a card network issued: that network's prefix AND its length?
+
+    Luhn is a typo check, not a card test: it passes about one in ten of ANY long number, so a
+    13-digit millisecond timestamp or a 16-digit order id was a "payment card" one time in ten
+    (five findings, scored high, on a developer's prompts). Real PANs also start with their
+    network's issuer range and have its length. Ranges are the public IIN allocations."""
+    n = len(d)
+    p2, p3, p4 = int(d[:2]), int(d[:3]), int(d[:4])
+    if d[0] == "4":
+        return n in (13, 16, 19)                                    # Visa
+    if 51 <= p2 <= 55 or 2221 <= p4 <= 2720:
+        return n == 16                                              # Mastercard
+    if p2 in (34, 37):
+        return n == 15                                              # American Express
+    if p4 == 6011 or p2 == 65 or 644 <= p3 <= 649:
+        return 16 <= n <= 19                                        # Discover
+    if 3528 <= p4 <= 3589:
+        return 16 <= n <= 19                                        # JCB
+    if p2 in (36, 38, 39) or 300 <= p3 <= 305:
+        return 14 <= n <= 19                                        # Diners Club
+    if p2 == 62:
+        return 16 <= n <= 19                                        # UnionPay
+    if p4 in (5018, 5020, 5038, 5893, 6304, 6759) or 6761 <= p4 <= 6763:
+        return 12 <= n <= 19                                        # Maestro
+    return False
+
+
+# How card numbers are actually written: contiguous, or in the network's groups with one kind of
+# separator (4-4-4-4; Amex 4-6-5; Diners 4-6-4; short Visa 4-4-4-1..3 or 4-3-3-3). The candidate
+# regex takes any single space or dash between digits, so a run of small numbers in a command or
+# a table ("4 0 0 1 2 ...") could add up to a "card" that passed both Luhn and the network prefix.
+_CARD_GROUPINGS = frozenset({(4, 4, 4, 4), (4, 6, 5), (4, 6, 4), (4, 4, 4, 3), (4, 4, 4, 2),
+                             (4, 4, 4, 1), (4, 3, 3, 3)})
+
+
+# How card numbers are actually written: contiguous, or in the network's groups with one kind of
+# separator (4-4-4-4; Amex 4-6-5; Diners 4-6-4; short Visa 4-4-4-1..3 or 4-3-3-3). The candidate
+# regex takes any single space or dash between digits, so a run of small numbers in a command or
+# a table ("4 0 0 1 2 ...") could add up to a "card" that passed both Luhn and the network prefix.
+_CARD_GROUPINGS = frozenset({(4, 4, 4, 4), (4, 6, 5), (4, 6, 4), (4, 4, 4, 3), (4, 4, 4, 2),
+                             (4, 4, 4, 1), (4, 3, 3, 3)})
+
+
+def _card_grouping_ok(raw: str) -> bool:
+    raw = raw.strip(" -")        # the candidate regex also takes the separator after the last digit
+    groups = re.split(r"[ -]", raw)
+    if len(groups) == 1:
+        return True
+    if len(set(re.findall(r"[ -]", raw))) > 1:
+        return False
+    return tuple(len(g) for g in groups) in _CARD_GROUPINGS
+
+
 # Published sample SSNs the SSA voided (078-05-1120, 219-09-9999, 457-55-5462), as on the server.
 _SAMPLE_SSNS = frozenset({"078051120", "219099999", "457555462"})
 
@@ -1003,6 +1058,8 @@ def _line_pii(line: str) -> list[tuple[str, str, str]]:
     for m in CC_CANDIDATE_RE.finditer(line):
         digits = re.sub(r"\D", "", m.group(0))
         if len(digits) < 13 or not _luhn_ok(digits):
+            continue
+        if not (_card_shape_ok(digits) and _card_grouping_ok(m.group(0))):
             continue
         if digits in _TEST_CARDS and illustrative:
             continue
