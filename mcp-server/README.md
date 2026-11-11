@@ -24,8 +24,8 @@ claude mcp add --transport http palivane https://app.palivane.io/api/mcp/
 Your client discovers the authorization server, opens a browser, and you approve the
 request in the Palivane console — signed in as yourself, seeing exactly which app is asking
 and what it gets. The token acts as **you**: it reads what your role can read and nothing
-more, it cannot change anything, and you can cut it off from **Connections → Authorized
-apps** at any time.
+more, it changes a finding's status only if you tick **Change a finding's status** on the
+consent screen, and you can cut it off from **Connections → Authorized apps** at any time.
 
 For a client that does not do OAuth yet, a console API key works as a bearer token:
 
@@ -34,12 +34,12 @@ claude mcp add --transport http palivane https://app.palivane.io/api/mcp/ \
   --header "Authorization: Bearer ak_…"
 ```
 
-Mint that under **Connections → Console API key**, scope *Read only*. It is long-lived and
-revocable from the same screen.
+Mint that under **Connections → Console API key**: *Read only*, or *Read + triage/sync* to
+allow status changes. It is long-lived and revocable from the same screen.
 
 ### What the hosted endpoint exposes
 
-Read-only, deliberately:
+Reads, plus two tools that need a connection allowed to triage:
 
 | Tool | Does |
 |------|------|
@@ -48,13 +48,13 @@ Read-only, deliberately:
 | `ai_tool_inventory` | Shadow-AI inventory: tools in use, sanctioned or not, and the exposure |
 | `list_connectors` | SaaS connectors and their sync status |
 | `gateway_usage` | LLM-gateway usage against the limit |
-| `investigate_finding` | Runs the read-only analyst on a finding and returns a written investigation with a recommended action (never applies one). Needs the analyst switched on **and** your org's own LLM key — it has no fallback to Palivane's provider, so without one it returns 400 |
+| `investigate_finding` | Runs the read-only analyst on a finding and returns a written investigation with a recommended action (never applies one). Needs the analyst switched on **and** your org's own LLM key — it has no fallback to Palivane's provider, so without one it returns 400. The report is saved on the finding, so it needs a connection allowed to triage |
+| `set_finding_status` | Triage a finding: open, triaged, or dismissed (with a reason). Only on a connection allowed to triage |
 
-Triage and sync tools (`set_finding_status`, `sync_connector`) are **not** here yet. The
-REST API gates writes with an explicit route allowlist, and MCP puts every call — reads
-included — through a single POST, so that allowlist has no equivalent on this transport.
-Rather than grow a second permission system, this ships reads only until there is a real
-answer. The stdio server below still has them.
+`set_finding_status` sets a finding to open, triaged or dismissed, recorded in the audit log
+under your name. It needs a connection that was allowed to triage; dismissing needs an
+admin, and a critical finding is dismissed in the console, not over MCP. `sync_connector`
+and `compliance_report` are only in the stdio server below.
 
 ---
 
