@@ -1384,6 +1384,70 @@ def scan_failures_delivered(claim: str) -> None:
         except OSError:
             pass
 
+# --- Containment: fail CLOSED while contained ------------------------------------------
+# An admin can contain this person, device or agent from the console. Every scan then answers
+# block, with `contained` saying until when and what to tell the person. That answer is
+# remembered here so containment holds when Palivane cannot be reached: a contained device
+# fails closed until the containment expires or a later answer no longer carries it, instead of
+# failing open like every other scan failure. Otherwise cutting the device off from Palivane
+# would be the way out. The file holds an expiry and the message, nothing else; deleting it
+# only re-opens the offline gap, which the console flags as a contained device gone quiet.
+# Copied in every hook and the proxy (each is a standalone file); keep the copies identical.
+_CONTAINED_FILE = "contained.json"
+_CONTAINED_MAX_SECS = 30 * 86400
+
+
+def _contained_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, _CONTAINED_FILE)
+
+
+def contained_note(verdict) -> None:
+    """Remember containment from an answer the backend gave, or forget it when the answer no
+    longer carries it. Called only with real answers, never with a fail-open stand-in."""
+    try:
+        c = verdict.get("contained") if isinstance(verdict, dict) else None
+        path = _contained_path()
+        if isinstance(c, dict) and isinstance(c.get("until"), (int, float)) \
+                and not isinstance(c.get("until"), bool):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"until": int(c["until"]),
+                           "message": str(c.get("message") or "")[:500]}, fh)
+            os.replace(tmp, path)
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def contained_offline() -> dict:
+    """The block to answer with while this device is contained and Palivane cannot be
+    reached, or {} when it is not contained (the scan then fails open as usual)."""
+    try:
+        with open(_contained_path()) as fh:
+            st = json.load(fh)
+        until, now = st.get("until"), time.time()
+        if isinstance(until, (int, float)) and not isinstance(until, bool) \
+                and now < until <= now + _CONTAINED_MAX_SECS:
+            msg = str(st.get("message") or "") or "Paused by your security team."
+            return {"action": "block", "force_block": True, "enforce": True,
+                    "risk_score": 100, "severity": "critical", "reason": "contained-offline",
+                    "signals": [{"category": "contained", "title": msg}],
+                    "contained": {"until": int(until), "message": msg}}
+    except Exception:
+        pass
+    return {}
+
+
+def contained_message(verdict) -> str:
+    """What to tell the person when the block is a containment, else ''."""
+    c = verdict.get("contained") if isinstance(verdict, dict) else None
+    if isinstance(c, dict):
+        return "Palivane: " + (str(c.get("message") or "") or "Paused by your security team.")
+    return ""
+
 
 def scan(content: str, destination: str, tool: str = "",
          url: str | None = None, token: str | None = None, timeout: float = 8.0) -> dict:
@@ -1394,7 +1458,7 @@ def scan(content: str, destination: str, tool: str = "",
     skip = _breaker_skip(tok)
     if skip:
         record_scan_failure("auth-rejected" if skip == "deauthorized" else "breaker-open")
-        return {"action": "allow", "reason": f"scan-skipped:{skip}"}
+        return contained_offline() or {"action": "allow", "reason": f"scan-skipped:{skip}"}
     body = {"content": content, "destination": destination, "tool": tool,
             "user": os.getenv("PALIVANE_PROXY_USER", "")}
     claim, report = claim_scan_failures()
@@ -1411,19 +1475,20 @@ def scan(content: str, destination: str, tool: str = "",
     except urllib.error.HTTPError as e:
         _breaker_record(tok, e.code)
         record_scan_failure(e, claim)
-        return {"action": "allow", "reason": f"scan-failed:{e.code}"}
+        return contained_offline() or {"action": "allow", "reason": f"scan-failed:{e.code}"}
     except Exception as e:
         _breaker_record(tok, None)
         record_scan_failure(e, claim)
-        return {"action": "allow", "reason": "scan-failed"}
+        return contained_offline() or {"action": "allow", "reason": "scan-failed"}
     scan_failures_delivered(claim)          # the backend took the request, and the tally
     try:
         out = json.loads(raw)
     except Exception as e:
         _breaker_record(tok, None)
         record_scan_failure(e)
-        return {"action": "allow", "reason": "scan-failed"}
+        return contained_offline() or {"action": "allow", "reason": "scan-failed"}
     _breaker_record(tok, 200)
+    contained_note(out)
     return out
 
 
@@ -1699,7 +1764,7 @@ def scan_mcp(activity: dict, server: str = "", transport: str = "http",
     skip = _breaker_skip(tok)
     if skip:
         record_scan_failure("auth-rejected" if skip == "deauthorized" else "breaker-open")
-        return {"action": "allow", "reason": f"scan-skipped:{skip}"}
+        return contained_offline() or {"action": "allow", "reason": f"scan-skipped:{skip}"}
     payload = {"server": server, "transport": transport,
                "user": os.getenv("PALIVANE_PROXY_USER", ""), **activity}
     if authorization:
@@ -1718,19 +1783,20 @@ def scan_mcp(activity: dict, server: str = "", transport: str = "http",
     except urllib.error.HTTPError as e:
         _breaker_record(tok, e.code)
         record_scan_failure(e, claim)
-        return {"action": "allow", "reason": f"scan-failed:{e.code}"}
+        return contained_offline() or {"action": "allow", "reason": f"scan-failed:{e.code}"}
     except Exception as e:
         _breaker_record(tok, None)
         record_scan_failure(e, claim)
-        return {"action": "allow", "reason": "scan-failed"}
+        return contained_offline() or {"action": "allow", "reason": "scan-failed"}
     scan_failures_delivered(claim)          # the backend took the request, and the tally
     try:
         out = json.loads(raw)
     except Exception as e:
         _breaker_record(tok, None)
         record_scan_failure(e)
-        return {"action": "allow", "reason": "scan-failed"}
+        return contained_offline() or {"action": "allow", "reason": "scan-failed"}
     _breaker_record(tok, 200)
+    contained_note(out)
     return out
 
 
@@ -1739,6 +1805,8 @@ def _sig_summary(verdict: dict) -> str:
 
 
 def block_message(verdict: dict) -> str:
+    if contained_message(verdict):
+        return contained_message(verdict)
     return (f"Blocked by Palivane: sensitive data ({_sig_summary(verdict)}) "
             f"— risk {verdict.get('risk_score')}/{verdict.get('severity')}. "
             f"Remove the secret/PII and start a new chat to continue.")
@@ -1799,7 +1867,8 @@ def mcp_block_body(verdict: dict) -> bytes:
     """JSON-RPC error envelope so the agent surfaces the block cleanly."""
     return json.dumps({"jsonrpc": "2.0", "id": None, "error": {
         "code": -32001,
-        "message": f"Blocked by Palivane: risky MCP activity ({_sig_summary(verdict)}) "
+        "message": contained_message(verdict) or
+                   f"Blocked by Palivane: risky MCP activity ({_sig_summary(verdict)}) "
                    f"— risk {verdict.get('risk_score')}/{verdict.get('severity')}.",
     }}).encode()
 
