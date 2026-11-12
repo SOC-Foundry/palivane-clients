@@ -110,6 +110,11 @@ _PLACEHOLDER_RE = re.compile(
 
 _ENTROPY_LABEL = "Possible secret (high-entropy token)"
 _TOKEN_CANDIDATE_RE = re.compile(r"[A-Za-z0-9_]{24,80}")
+# A password hash (modular-crypt format: `$2b$12$…`, `$argon2id$…`) is what is stored instead of
+# a secret, not one; masked whole, as on the server (app/detectors/patterns.py _HASH_FORMAT_RE).
+_HASH_FORMAT_RE = re.compile(
+    r"\$(?:2[abxy]?|argon2(?:i|d|id)|scrypt|pbkdf2(?:-sha\d+)?|sha\d+|md5|[156]|y|gy|7)\$"
+    r"[A-Za-z0-9./+=,$-]{20,}")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _MIN_ENTROPY = 3.6
 
@@ -132,9 +137,13 @@ def _entropy_tokens(line: str) -> list[str]:
     if sep < 0:
         return []
     out = []
-    for m in _TOKEN_CANDIDATE_RE.finditer(line[sep + 1:]):
+    value = line[sep + 1:]
+    masked = [(m.start(), m.end()) for m in _HASH_FORMAT_RE.finditer(value)]
+    for m in _TOKEN_CANDIDATE_RE.finditer(value):
         tok = m.group(0)
         if _HEX_RE.match(tok):
+            continue
+        if any(a <= m.start() < b for a, b in masked):
             continue
         classes = (any(c.islower() for c in tok) + any(c.isupper() for c in tok)
                    + any(c.isdigit() for c in tok))
