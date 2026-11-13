@@ -19,6 +19,7 @@ without an endpoint agent: each is an app-scoped hook/shim that rides the existi
 | `palivane-secrets` | **credentials at rest** (SSH/RSA keys, tokens, `.env`) | `POST /api/scan/secrets` |
 | `palivane-import` | pipe **TruffleHog / Gitleaks / GitGuardian** output into Palivane | `POST /api/scan/import` |
 | `palivane-otel` | bridge **claude-otel** telemetry (Claude Code OTEL) into Palivane | `POST /api/ingest/{ai-usage,mcp}` |
+| `palivane-findings` | **read** the org's findings from a terminal (console-read key; every read audited) | `GET /api/export/findings[/{id}]` |
 
 All of them are **monitor by default, fail-open always**: Palivane being down or slow
 never blocks a developer. Enforcement is opt-in per plane (env vars below). `palivane-otel`

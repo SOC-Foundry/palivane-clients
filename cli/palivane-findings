@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""palivane-findings — read an org's findings from a terminal. Read-only, audited.
+
+    palivane-findings                       # open findings from the last 7 days
+    palivane-findings --since 24h --severity critical
+    palivane-findings --status dismissed --surface session --json
+    palivane-findings show 1425             # one finding: signals, evidence, review
+    palivane-findings show 1425 --content   # ...and the captured content, if stored
+
+Auth is a CONSOLE-READ API key (Connections → API keys → scope "console_read" in the
+console; the key's user must be an admin), from PALIVANE_READ_TOKEN, else PALIVANE_TOKEN,
+else the `env` block of ~/.claude/settings.json. A device's ingest key is refused by the
+server: it is a capture credential, not a read credential, and anyone can mint one.
+
+Every `show` and every undated list is written to the org's audit log as the key's user.
+Stdlib only; no install beyond PATH.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+__version__ = "1.0.0"
+_UA = f"palivane-findings/{__version__}"
+
+
+def _settings_env(path: str = "~/.claude/settings.json") -> dict:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            env = json.load(f).get("env")
+        return env if isinstance(env, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_config() -> tuple[str, str]:
+    senv = _settings_env()
+    url = os.getenv("PALIVANE_URL") or senv.get("PALIVANE_URL", "") or "https://app.palivane.io"
+    token = (os.getenv("PALIVANE_READ_TOKEN") or os.getenv("PALIVANE_TOKEN")
+             or senv.get("PALIVANE_READ_TOKEN", "") or senv.get("PALIVANE_TOKEN", ""))
+    return url.rstrip("/"), token
+
+
+_SINCE_RE = re.compile(r"^(\d+)([hdw])$")
+
+
+def parse_since(text: str, now: datetime | None = None) -> str:
+    """`24h`, `7d`, `2w` or an ISO 8601 timestamp → the ISO watermark the API takes."""
+    now = now or datetime.now(timezone.utc)
+    m = _SINCE_RE.match(text.strip().lower())
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = {"h": timedelta(hours=n), "d": timedelta(days=n), "w": timedelta(weeks=n)}[unit]
+        return (now - delta).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise SystemExit(f"--since: use 24h, 7d, 2w or an ISO 8601 timestamp, not {text!r}")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _get(url: str, token: str, path: str, params: dict | None = None, timeout: float = 30.0):
+    q = {k: v for k, v in (params or {}).items() if v not in (None, "", False)}
+    full = url + path + ("?" + urllib.parse.urlencode(q) if q else "")
+    req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}",
+                                                "Accept": "application/json", "User-Agent": _UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+
+def _explain(status: int, body: str) -> str:
+    try:
+        detail = json.loads(body).get("detail") or body
+    except (ValueError, AttributeError):
+        detail = body
+    if status == 401:
+        return (f"{detail}. This needs a console-read key (console → Connections → API keys, "
+                "scope console_read); a device's ingest key cannot read findings. Put it in "
+                "PALIVANE_READ_TOKEN.")
+    if status == 403:
+        return f"{detail}. The key's user is no longer an admin."
+    if status == 404:
+        return "no such finding in this org"
+    return f"HTTP {status}: {detail}"
+
+
+def _when(ts: str | None) -> str:
+    if not ts:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ts
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%b %d %H:%M")
+
+
+def _clip(s: str, n: int) -> str:
+    s = (s or "").replace("\n", " ")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _top(f: dict) -> str:
+    sig = (f.get("top_signals") or [{}])[0]
+    title = sig.get("title") or ", ".join(f.get("categories") or []) or "-"
+    ev = sig.get("evidence") or ""
+    return f"{title} ({ev})" if ev else title
+
+
+def format_table(rows: list[dict]) -> str:
+    if not rows:
+        return "no findings"
+    cols = [("id", 6), ("when", 12), ("sev", 10), ("status", 9), ("surface", 12), ("who", 28), ("what", 60)]
+    out = ["  ".join(name.upper().ljust(w) for name, w in cols)]
+    for f in rows:
+        cells = {"id": str(f.get("id")), "when": _when(f.get("last_seen") or f.get("created_at")),
+                 "sev": str(f.get("severity") or "-"), "status": str(f.get("status") or "-"),
+                 "surface": str(f.get("surface") or "-"), "who": _clip(f.get("sender") or f.get("agent") or "-", 28),
+                 "what": _clip(f.get("subject") or _top(f), 60)}
+        out.append("  ".join(cells[name].ljust(w) for name, w in cols))
+    return "\n".join(out)
+
+
+def format_detail(f: dict, content: bool = False) -> str:
+    lines = [f"#{f.get('id')}  {f.get('severity')} (risk {f.get('risk_score')}), {f.get('recommended_action')}, {f.get('status')}",
+             f"when     {_when(f.get('created_at'))}  last {_when(f.get('last_seen'))}  seen ×{f.get('seen_count') or 1}",
+             f"who      {f.get('sender') or '-'}" + (f"  agent {f['agent']}" if f.get("agent") else ""),
+             f"where    {f.get('surface')}/{f.get('channel')}" + (f"  {f['subject']}" if f.get("subject") else "")]
+    if f.get("reviewed_by") or f.get("review_reason"):
+        lines.append(f"review   {f.get('reviewed_by') or '-'} via {f.get('review_via') or '-'}"
+                     + (f", {f['review_reason']}" if f.get("review_reason") else "")
+                     + (f", {_when(f.get('reviewed_at'))}" if f.get("reviewed_at") else ""))
+    if f.get("owner_response"):
+        o = f["owner_response"]
+        lines.append(f"owner    {o.get('action') or '-'}: {_clip(o.get('note') or '', 120)}")
+    lines.append("signals")
+    for s in f.get("signals") or []:
+        strength = ""
+        if s.get("weight") is not None and s.get("confidence") is not None:
+            strength = f" [{float(s['weight']) * float(s['confidence']):.2f}]"
+        lines.append(f"  - {s.get('category')}: {s.get('title')}{strength}")
+        if s.get("evidence"):
+            lines.append(f"      {_clip(str(s['evidence']), 160)}")
+    origin = f.get("origin")
+    if isinstance(origin, dict) and origin.get("contributing"):
+        lines.append(f"links    findings {', '.join(str(i) for i in origin['contributing'])}")
+    if content:
+        body = f.get("content") or ""
+        lines.append("content")
+        lines.append(body if body else "  (not stored for this org, or empty)")
+    return "\n".join(lines)
+
+
+def cmd_list(args, url: str, token: str) -> int:
+    params = {"limit": args.limit, "severity": args.severity, "surface": args.surface,
+              "status": args.status}
+    if args.since:
+        params["since"] = parse_since(args.since)
+    status, body = _get(url, token, "/api/export/findings", params)
+    if status != 200:
+        print(f"palivane-findings: {_explain(status, body)}", file=sys.stderr)
+        return 1
+    rows = [json.loads(line) for line in body.splitlines() if line.strip()]
+    if args.since:
+        rows.sort(key=lambda f: f.get("last_seen") or "", reverse=True)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        print(format_table(rows))
+    return 0
+
+
+def cmd_show(args, url: str, token: str) -> int:
+    status, body = _get(url, token, f"/api/export/findings/{args.id}",
+                        {"content": "1" if args.content else ""})
+    if status != 200:
+        print(f"palivane-findings: {_explain(status, body)}", file=sys.stderr)
+        return 1
+    f = json.loads(body)
+    print(json.dumps(f, indent=2) if args.json else format_detail(f, content=args.content))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="palivane-findings", description=__doc__.split("\n\n")[0])
+    p.add_argument("--version", action="version", version=__version__)
+    sub = p.add_subparsers(dest="cmd")
+    ls = sub.add_parser("list", help="findings, newest first (the default command)")
+    for sp in (ls, p):
+        sp.add_argument("--since", default=None, help="24h, 7d, 2w or an ISO 8601 timestamp (default: 7d)")
+        sp.add_argument("--severity", default=None, help="critical | high | suspicious | low | benign")
+        sp.add_argument("--surface", default=None, help="ai_usage | agent_tools | mcp | session | collab | ...")
+        sp.add_argument("--status", default="open", help="open | triaged | dismissed | all (default: open)")
+        sp.add_argument("--limit", type=int, default=200)
+        sp.add_argument("--json", action="store_true", help="print the rows as JSON")
+    sh = sub.add_parser("show", help="one finding in full")
+    sh.add_argument("id", type=int)
+    sh.add_argument("--content", action="store_true", help="include the captured content")
+    sh.add_argument("--json", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    url, token = read_config()
+    if not token:
+        print("palivane-findings: no key. Set PALIVANE_READ_TOKEN to a console-read API key "
+              "(console → Connections → API keys).", file=sys.stderr)
+        return 2
+    if args.cmd == "show":
+        return cmd_show(args, url, token)
+    if args.since is None:
+        args.since = "7d"
+    if args.status == "all":
+        args.status = None
+    return cmd_list(args, url, token)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
