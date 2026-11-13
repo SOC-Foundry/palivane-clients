@@ -37,7 +37,7 @@ from collections import Counter
 
 _STRIP = " (separator stripped — likely bypass)"
 _PATTERNS = [
-    ("Private key block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("Private key block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----")),
     ("AWS access key id", re.compile(r"AKIA[0-9A-Z]{16}")),
     # The SECRET half. No distinguishing prefix — 40 chars of base64 — so it is gated on an
     # adjacent "secret[ access][ key]" label; ungated it would match any 40-char base64 run
