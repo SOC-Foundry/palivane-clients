@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.4.8"
+VERSION = "1.5.0"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -883,6 +883,74 @@ def harvest_prompt(body: bytes | str) -> str:
 COMET_ASK_PATH = "/rest/sse/perplexity_ask"
 COMET_AGENT_WS_PATH = "/agent"
 _COMET_SSE_CAP = 1 << 20        # tee at most 1 MiB of a streamed SSE response
+_LLM_RESP_CAP = 512 * 1024      # tee at most 512 KiB of a provider's reply for the response scan
+
+# A provider API call whose reply carries the model's output: scanned on the way back.
+_LLM_REPLY_PATHS = ("/v1/messages", "/chat/completions", "/responses",
+                    ":generateContent", ":streamGenerateContent")
+
+
+def is_llm_reply(host: str, path: str) -> bool:
+    """A request to a provider API whose reply is the model's output (not a web chat's
+    page traffic): what gets teed and scanned as a response."""
+    p = (path or "").split("?", 1)[0]
+    return is_ai_host(host) and any(p.endswith(x) or x in p for x in _LLM_REPLY_PATHS)
+
+
+def scan_response(raw: bytes, destination: str, tool: str = "", fmt: str = "",
+                  url: str | None = None, token: str | None = None, timeout: float = 8.0) -> dict:
+    """Report what the provider sent back (JSON or SSE, raw, capped) to the backend as a
+    response capture. Observe-only: the bytes already reached the client. Fail open."""
+    base = (url or os.getenv("PALIVANE_URL", "http://localhost:8090")).rstrip("/")
+    tok = token if token is not None else os.getenv("PALIVANE_TOKEN", "")
+    if _breaker_skip(tok):
+        return {"action": "allow", "reason": "scan-skipped"}
+    body = {"content": raw[:_LLM_RESP_CAP].decode("utf-8", "replace"), "destination": destination,
+            "tool": tool, "user": os.getenv("PALIVANE_PROXY_USER", ""),
+            "direction": "response", "response_format": fmt}
+    try:
+        req = urllib.request.Request(
+            base + "/api/ingest/ai-usage", method="POST", data=json.dumps(body).encode(),
+            headers={"content-type": "application/json", "User-Agent": f"palivane-proxy/{VERSION}",
+                     "X-Palivane-Token": tok})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except Exception:
+        return {"action": "allow", "reason": "scan-failed"}
+
+
+def route_via_gateway(flow, route: dict, url: str | None = None, token: str | None = None) -> bool:
+    """Route instead of block: resend this provider call through the Palivane gateway, which
+    holds the org's private lane for the provider and forwards it there. The path is the
+    same (the gateway speaks every provider's shape under /v1 and /v1beta); only the host
+    and the credential change, to the device's own key. The proxy never sees the lane key.
+    Returns False, leaving the request untouched, when the gateway URL is unusable."""
+    from urllib.parse import urlparse
+    gw = (route.get("gateway") or url or os.getenv("PALIVANE_URL", "")).rstrip("/")
+    u = urlparse(gw)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    tok = token if token is not None else os.getenv("PALIVANE_TOKEN", "")
+    if not tok:
+        return False
+    req = flow.request
+    try:
+        req.scheme = u.scheme
+        req.host = u.hostname
+        req.port = u.port or (443 if u.scheme == "https" else 80)
+        req.headers["host"] = u.netloc
+        for h in ("x-api-key", "x-goog-api-key", "authorization"):
+            if h in req.headers:
+                del req.headers[h]
+        req.headers["x-api-key"] = tok
+        req.headers["authorization"] = f"Bearer {tok}"
+        req.headers["x-palivane-routed"] = route.get("provider", "")
+    except Exception:
+        return False
+    md = getattr(flow, "metadata", None)
+    if isinstance(md, dict):
+        md["palivane_routed"] = route.get("label") or route.get("provider") or "lane"
+    return True
 
 
 def _is_perplexity_host(host: str) -> bool:
@@ -1979,7 +2047,28 @@ class PalivaneGuard:
         that one endpoint we tee the stream: chunks pass through unbuffered (no stall),
         a capped copy accumulates on the flow, and response() scans it once the stream
         ends. Observe-only by construction — the bytes have already reached the client."""
+        md = getattr(flow, "metadata", None)
+        if isinstance(md, dict) and md.get("palivane_routed"):
+            flow.response.stream = True         # a gateway reply: live output, as from the provider
+            return
         if not is_ai_host(flow.request.pretty_host):
+            return
+        if is_llm_reply(flow.request.pretty_host, flow.request.path) and flow.request.method == "POST":
+            # The model's output, teed as it streams (no stall) and scanned once it ends:
+            # a reply that carries a secret, PII, or a chunk of an org document is a leak in
+            # the other direction, and nothing else looks at this side of the exchange.
+            buf: list[bytes] = []
+            if isinstance(md, dict):
+                md["palivane_llm_resp"] = buf
+                md["palivane_llm_fmt"] = ("sse" if "text/event-stream" in
+                                          (flow.response.headers.get("content-type", "") or "") else "json")
+            size = {"n": 0}
+            def tee_llm(chunk: bytes) -> bytes:
+                if chunk and size["n"] < _LLM_RESP_CAP:
+                    buf.append(chunk)
+                    size["n"] += len(chunk)
+                return chunk
+            flow.response.stream = tee_llm
             return
         if is_comet_ask(flow.request.pretty_host, flow.request.path):
             buf: list[bytes] = []
@@ -2176,7 +2265,14 @@ class PalivaneGuard:
                     return
                 tool = detect_tool(req.headers.get("user-agent", ""))
                 verdict = await asyncio.to_thread(
-                    scan, prompt, f"https://{req.pretty_host}", tool=tool)
+                    scan, prompt, f"https://{req.pretty_host}{req.path.split('?', 1)[0]}", tool=tool)
+                route = verdict.get("route_via_gateway")
+                if isinstance(route, dict) and route.get("provider"):
+                    # The org routes this data class down a private lane: resend through
+                    # the gateway instead of refusing (route_via_gateway). If the rewrite
+                    # cannot be made, the verdict's own action applies as usual.
+                    if route_via_gateway(flow, route):
+                        return
                 if should_block(verdict, self.enforce):
                     self._recent_blocks[key] = (now + _BLOCK_QUIET_SECS, verdict)
                     if len(self._recent_blocks) > 100:
@@ -2235,6 +2331,15 @@ class PalivaneGuard:
         # they arrived, so a block verdict here is recorded, not enforced. A parsed-JSON
         # body with no recognizable text is reported as a parse-miss so shape drift shows
         # up in the console instead of going silent.
+        llm = flow.metadata.pop("palivane_llm_resp", None)
+        if llm is not None:
+            fmt = flow.metadata.pop("palivane_llm_fmt", "json")
+            body = b"".join(llm)
+            if body.strip():
+                await asyncio.to_thread(
+                    scan_response, body, f"https://{flow.request.pretty_host}{flow.request.path.split('?', 1)[0]}",
+                    detect_tool(flow.request.headers.get("user-agent", "")), fmt)
+            return
         buf = flow.metadata.pop("palivane_comet_sse", None)
         if buf is not None:
             body = b"".join(buf)
