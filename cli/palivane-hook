@@ -1047,9 +1047,210 @@ def cmd_selftest(cfg: dict) -> int:
     return 0 if ok else 1
 
 
+# --- the session ledger and the commit trailer ----------------------------------------------
+# Every tool call the hook sees is one line in ~/.palivane/session-ledger.jsonl: when, in
+# which working directory, which tool, which file, and the verdict when the call was scanned
+# inline. `palivane-hook git-install` puts two git hooks in a repo; prepare-commit-msg asks
+# the ledger what the agent did there since the last commit and writes it into the message as
+# trailers, post-commit registers the commit with the console (POST /api/attest/commit), which
+# counts the findings in that window and keeps the record an auditor asks for: which commits
+# were AI-assisted, and were they checked.
+
+def _ledger_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, "session-ledger.jsonl")
+
+
+_LEDGER_MAX_BYTES = 4 * 1024 * 1024
+
+
+def ledger_append(cwd: str, tool: str, resource: str, verdict: dict | None = None) -> None:
+    """One line per tool call; trimmed when it grows past a few MB. Never raises."""
+    try:
+        path = _ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        row = {"ts": time.time(), "cwd": cwd or "", "tool": tool or "", "resource": (resource or "")[:300],
+               "agent": "claude-code"}
+        if verdict:
+            row["action"] = verdict.get("action") or ""
+            row["severity"] = verdict.get("severity") or ""
+            if verdict.get("finding_id"):
+                row["finding_id"] = verdict["finding_id"]
+        try:
+            if os.path.getsize(path) > _LEDGER_MAX_BYTES:
+                with open(path) as f:
+                    tail = f.readlines()[-5000:]
+                with open(path, "w") as f:
+                    f.writelines(tail)
+        except OSError:
+            pass
+        with open(path, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+
+def ledger_since(cwd: str, since_ts: float) -> list[dict]:
+    rows = []
+    try:
+        real = os.path.realpath(cwd)
+        with open(_ledger_path()) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("ts", 0) < since_ts:
+                    continue
+                rc = os.path.realpath(r.get("cwd") or "")
+                if rc == real or rc.startswith(real + os.sep):
+                    rows.append(r)
+    except OSError:
+        pass
+    return rows
+
+
+def _git(args: list, cwd: str) -> str:
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _last_commit_ts(cwd: str) -> float:
+    out = _git(["log", "-1", "--format=%ct"], cwd)
+    try:
+        return float(out)
+    except ValueError:
+        return 0.0
+
+
+TRAILER_ASSISTED = "Palivane-AI-Assisted"
+TRAILER_SCAN = "Palivane-Scan"
+
+
+def trailer_summary(cwd: str, rows: list[dict]) -> dict:
+    files = sorted({r["resource"] for r in rows if r.get("resource") and r.get("tool") in ("Write", "Edit", "MultiEdit", "NotebookEdit")})
+    blocked = sum(1 for r in rows if r.get("action") == "block")
+    agents = sorted({r.get("agent") or "claude-code" for r in rows})
+    ts = [r["ts"] for r in rows if r.get("ts")]
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    return {"agent": ",".join(agents), "tool_calls": len(rows), "files": len(files),
+            "blocked": blocked, "window_start": iso(min(ts)) if ts else "", "window_end": iso(max(ts)) if ts else "",
+            "file_list": files[:50]}
+
+
+def cmd_git_trailer(msg_file: str) -> int:
+    """prepare-commit-msg: append the trailers when the agent worked in this repo since the
+    last commit. A commit with no agent activity gets nothing added."""
+    cwd = os.getcwd()
+    rows = ledger_since(cwd, _last_commit_ts(cwd))
+    if not rows:
+        return 0
+    try:
+        with open(msg_file) as f:
+            msg = f.read()
+    except OSError:
+        return 0
+    if TRAILER_ASSISTED + ":" in msg:
+        return 0
+    s = trailer_summary(cwd, rows)
+    lines = [f"{TRAILER_ASSISTED}: yes",
+             f"{TRAILER_SCAN}: agent={s['agent']}; tool-calls={s['tool_calls']}; files={s['files']}; "
+             f"blocked={s['blocked']}; window={s['window_start']}..{s['window_end']}"]
+    body = msg.rstrip("\n")
+    # git's comment lines (from -v / the template) must stay below the trailers
+    comment = ""
+    if "\n#" in body or body.startswith("#"):
+        head, _, rest = body.partition("\n#")
+        body, comment = head.rstrip("\n"), ("\n#" + rest if rest or _ else "")
+    with open(msg_file, "w") as f:
+        f.write(body + "\n\n" + "\n".join(lines) + "\n" + comment + ("\n" if comment else ""))
+    return 0
+
+
+def cmd_git_report(cfg: dict) -> int:
+    """post-commit: register an AI-assisted commit with the console. Fail-open, quiet."""
+    cwd = os.getcwd()
+    body = _git(["log", "-1", "--format=%H%x00%an <%ae>%x00%s%x00%B"], cwd)
+    if not body:
+        return 0
+    sha, author, subject, full = (body.split("\x00") + ["", "", "", ""])[:4]
+    if TRAILER_ASSISTED + ": yes" not in full:
+        return 0
+    scan = ""
+    for line in full.splitlines():
+        if line.startswith(TRAILER_SCAN + ":"):
+            scan = line.split(":", 1)[1].strip()
+    fields = dict(kv.split("=", 1) for kv in scan.split("; ") if "=" in kv)
+    window = fields.get("window", "..").split("..")
+    repo = _git(["config", "--get", "remote.origin.url"], cwd) or os.path.basename(os.path.realpath(cwd))
+    payload = {"sha": sha, "repo": repo[:300], "branch": _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)[:120],
+               "author": author[:320], "subject": subject[:200], "agent": fields.get("agent", "")[:120],
+               "tool_calls": int(fields.get("tool-calls", "0") or 0), "files": int(fields.get("files", "0") or 0),
+               "blocked": int(fields.get("blocked", "0") or 0),
+               "window_start": window[0] if len(window) > 0 else "", "window_end": window[1] if len(window) > 1 else ""}
+    if not cfg["url"] or not cfg["token"]:
+        return 0
+    try:
+        req = urllib.request.Request(cfg["url"].rstrip("/") + "/api/attest/commit", method="POST",
+                                     data=json.dumps(payload).encode(),
+                                     headers={"content-type": "application/json", "User-Agent": agent_ua(),
+                                              "X-Palivane-Token": cfg["token"]})
+        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
+            out = json.loads(r.read())
+        if out.get("id"):
+            print(f"palivane: commit {sha[:10]} attested (#{out['id']}, {out.get('findings', 0)} finding(s) in the window)")
+    except Exception:
+        pass
+    return 0
+
+
+_HOOK_SCRIPT = """#!/bin/sh
+# installed by `palivane-hook git-install`: {what}
+PALIVANE_HOOK="{bin}"
+[ -x "$PALIVANE_HOOK" ] || PALIVANE_HOOK="$(command -v palivane-hook 2>/dev/null)"
+[ -n "$PALIVANE_HOOK" ] && "$PALIVANE_HOOK" {sub} "$@" || true
+"""
+
+
+def cmd_git_install() -> int:
+    cwd = os.getcwd()
+    top = _git(["rev-parse", "--show-toplevel"], cwd)
+    if not top:
+        print("git-install: not inside a git repository", file=sys.stderr)
+        return 1
+    hooks = _git(["rev-parse", "--git-path", "hooks"], cwd) or os.path.join(top, ".git", "hooks")
+    if not os.path.isabs(hooks):
+        hooks = os.path.join(cwd, hooks)
+    os.makedirs(hooks, exist_ok=True)
+    me = os.path.realpath(sys.argv[0])
+    for name, sub, what in (("prepare-commit-msg", "git-trailer", "writes the Palivane trailers"),
+                            ("post-commit", "git-report", "registers an AI-assisted commit")):
+        path = os.path.join(hooks, name)
+        body = _HOOK_SCRIPT.format(what=what, bin=me, sub=sub)
+        if os.path.exists(path):
+            with open(path) as f:
+                existing = f.read()
+            if "palivane-hook" in existing:
+                continue
+            body = existing.rstrip("\n") + "\n\n" + "\n".join(body.splitlines()[1:]) + "\n"
+        with open(path, "w") as f:
+            f.write(body)
+        os.chmod(path, 0o755)
+    print(f"palivane: git hooks installed in {hooks} (prepare-commit-msg, post-commit)")
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "selftest":
         return cmd_selftest(read_config())
+    if len(sys.argv) > 1 and sys.argv[1] == "git-install":
+        return cmd_git_install()
+    if len(sys.argv) > 2 and sys.argv[1] == "git-trailer":
+        return cmd_git_trailer(sys.argv[2])
+    if len(sys.argv) > 1 and sys.argv[1] == "git-report":
+        return cmd_git_report(read_config())
     if len(sys.argv) > 1 and sys.argv[1] == "justify":
         reason = " ".join(sys.argv[2:]).strip()
         if len(reason) < 10:
@@ -1128,6 +1329,8 @@ def main() -> int:
     activity = build_activity(event.get("tool_name", ""), tool_input)
     if activity is None:
         return 0
+    _resource = activity.get("resource") or activity.get("shell_command") or ""
+    ledger_append(event.get("cwd") or "", event.get("tool_name", ""), _resource)
 
     if not cfg["url"] or not cfg["token"]:
         return 0  # not connected to Palivane — nothing to report to
@@ -1138,6 +1341,8 @@ def main() -> int:
     if cfg["enforce"] or server_enforced(cfg) or contained_offline():
         verdict = scan_mcp(activity, cfg["url"], cfg["token"], cfg["user"], cfg["timeout"])
         remember_enforce(verdict, cfg, authoritative=False)
+        if verdict.get("action") == "block" or verdict.get("finding_id"):
+            ledger_append(event.get("cwd") or "", event.get("tool_name", ""), _resource, verdict)
         if should_block(verdict, cfg["enforce"]):
             print(json.dumps(deny_output(verdict)))
             return 0
