@@ -46,7 +46,7 @@ import urllib.request
 # Outbound destinations we inspect (suffix match on the request host).
 
 # Reported in the User-Agent so the console can inventory client builds per device.
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 AI_HOST_SUFFIXES = (
     # chatgpt.com also covers the ChatGPT *desktop app* (Atlas's successor, with the
     # built-in browser): its Chat/Work/Codex modes all talk to the chatgpt.com backend,
@@ -1481,7 +1481,8 @@ def contained_note(verdict) -> None:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = f"{path}.{os.getpid()}.tmp"
             with open(tmp, "w") as fh:
-                json.dump({"until": int(c["until"]),
+                json.dump({"until": int(c["until"]), "id": c.get("id"),
+                           "revert_since": c.get("revert_since"),
                            "message": str(c.get("message") or "")[:500]}, fh)
             os.replace(tmp, path)
         elif os.path.exists(path):
@@ -1503,7 +1504,8 @@ def contained_offline() -> dict:
             return {"action": "block", "force_block": True, "enforce": True,
                     "risk_score": 100, "severity": "critical", "reason": "contained-offline",
                     "signals": [{"category": "contained", "title": msg}],
-                    "contained": {"until": int(until), "message": msg}}
+                    "contained": {"until": int(until), "message": msg, "id": st.get("id"),
+                                  "revert_since": st.get("revert_since")}}
     except Exception:
         pass
     return {}

@@ -50,6 +50,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -576,7 +577,8 @@ def contained_note(verdict) -> None:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = f"{path}.{os.getpid()}.tmp"
             with open(tmp, "w") as fh:
-                json.dump({"until": int(c["until"]),
+                json.dump({"until": int(c["until"]), "id": c.get("id"),
+                           "revert_since": c.get("revert_since"),
                            "message": str(c.get("message") or "")[:500]}, fh)
             os.replace(tmp, path)
         elif os.path.exists(path):
@@ -598,7 +600,8 @@ def contained_offline() -> dict:
             return {"action": "block", "force_block": True, "enforce": True,
                     "risk_score": 100, "severity": "critical", "reason": "contained-offline",
                     "signals": [{"category": "contained", "title": msg}],
-                    "contained": {"until": int(until), "message": msg}}
+                    "contained": {"until": int(until), "message": msg, "id": st.get("id"),
+                                  "revert_since": st.get("revert_since")}}
     except Exception:
         pass
     return {}
@@ -1047,6 +1050,208 @@ def cmd_selftest(cfg: dict) -> int:
     return 0 if ok else 1
 
 
+# --- the journal and undo ---------------------------------------------------------------------
+# Before an agent's Write/Edit/MultiEdit/NotebookEdit, the file as it is now goes to
+# ~/.palivane/journal/<day>/<path digest>-<ts> (a missing file is journaled as "created"), and
+# the ledger row for that call carries the snapshot path. `palivane-hook undo --since T` puts
+# every file the agent touched in this directory since T back to its first pre-state in the
+# window and deletes the ones it created. When a containment answer carries `revert_since`,
+# the next hook invocation does the same by itself, once, and reports what it restored.
+# Everyone can stop an agent; this puts the files back.
+
+_JOURNAL_MAX_FILE = 2 * 1024 * 1024
+_JOURNAL_KEEP_DAYS = 7
+_WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def _journal_dir() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, "journal")
+
+
+def journal_snapshot(tool_name: str, tool_input: dict) -> dict | None:
+    """Copy the target file aside before the agent changes it. {"snapshot": path, "existed":
+    bool, "file": abs path} or None when this call writes nothing journalable."""
+    if tool_name not in _WRITE_TOOLS or not isinstance(tool_input, dict):
+        return None
+    fp = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+    if not isinstance(fp, str) or not fp:
+        return None
+    try:
+        fp = os.path.realpath(os.path.expanduser(fp))
+        day = time.strftime("%Y%m%d", time.gmtime())
+        d = os.path.join(_journal_dir(), day)
+        os.makedirs(d, exist_ok=True)
+        digest = hashlib.sha256(fp.encode()).hexdigest()[:16]
+        snap = os.path.join(d, f"{digest}-{time.time_ns()}")
+        n = 0
+        while os.path.exists(snap):          # two writes in one tick must not share a snapshot
+            n += 1
+            snap = os.path.join(d, f"{digest}-{time.time_ns()}-{n}")
+        if os.path.isfile(fp):
+            if os.path.getsize(fp) > _JOURNAL_MAX_FILE:
+                return {"snapshot": "", "existed": True, "file": fp, "skipped": "too large"}
+            with open(fp, "rb") as src, open(snap, "wb") as dst:
+                dst.write(src.read())
+            return {"snapshot": snap, "existed": True, "file": fp}
+        return {"snapshot": "", "existed": False, "file": fp}
+    except Exception:
+        return None
+
+
+def journal_prune(now: float | None = None) -> None:
+    """Drop day folders older than the keep window. Cheap; called on every undo."""
+    now = now or time.time()
+    try:
+        for day in os.listdir(_journal_dir()):
+            try:
+                t = time.mktime(time.strptime(day, "%Y%m%d"))
+            except ValueError:
+                continue
+            if now - t > _JOURNAL_KEEP_DAYS * 86400:
+                shutil.rmtree(os.path.join(_journal_dir(), day), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def undo_plan(cwd: str, since_ts: float) -> dict:
+    """{file: first pre-state in the window} for every journaled write under cwd since T:
+    {"restore": {file: snapshot}, "delete": [files the agent created], "skipped": [...]}."""
+    rows = [r for r in ledger_since(cwd, since_ts) if r.get("file")]
+    rows.sort(key=lambda r: r.get("ts", 0))
+    restore: dict[str, str] = {}
+    delete: list[str] = []
+    skipped: list[str] = []
+    for r in rows:
+        f = r["file"]
+        if f in restore or f in delete or f in skipped:
+            continue                      # the first row for a file is its pre-state
+        if r.get("skipped"):
+            skipped.append(f)
+        elif r.get("existed") and r.get("snapshot"):
+            restore[f] = r["snapshot"]
+        elif not r.get("existed"):
+            delete.append(f)
+    return {"restore": restore, "delete": delete, "skipped": skipped}
+
+
+def undo_apply(plan: dict, dry_run: bool = False) -> dict:
+    out = {"restored": 0, "deleted": 0, "failed": 0, "files": []}
+    for f, snap in plan["restore"].items():
+        try:
+            if not dry_run:
+                with open(snap, "rb") as src:
+                    data = src.read()
+                os.makedirs(os.path.dirname(f), exist_ok=True)
+                with open(f, "wb") as dst:
+                    dst.write(data)
+            out["restored"] += 1; out["files"].append(("restored", f))
+        except Exception:
+            out["failed"] += 1; out["files"].append(("failed", f))
+    for f in plan["delete"]:
+        try:
+            if os.path.exists(f) and not dry_run:
+                os.remove(f)
+            out["deleted"] += 1; out["files"].append(("deleted", f))
+        except Exception:
+            out["failed"] += 1; out["files"].append(("failed", f))
+    for f in plan["skipped"]:
+        out["files"].append(("skipped (too large to journal)", f))
+    return out
+
+
+def _parse_since(text: str, cwd: str) -> float:
+    if not text or text == "commit":
+        return _last_commit_ts(cwd)
+    if text.endswith(("m", "h", "d")) and text[:-1].replace(".", "", 1).isdigit():
+        mult = {"m": 60, "h": 3600, "d": 86400}[text[-1]]
+        return time.time() - float(text[:-1]) * mult
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    t = text.replace("Z", "")
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            import calendar
+            return float(calendar.timegm(time.strptime(t, fmt)))
+        except ValueError:
+            continue
+    raise ValueError(f"cannot read --since {text!r} (use 30m, 2h, an ISO time, or 'commit')")
+
+
+def cmd_undo(argv: list) -> int:
+    """palivane-hook undo [--since 30m|2h|ISO|commit] [--dry-run] [--list]"""
+    cwd = os.getcwd()
+    since = "commit"
+    dry = "--dry-run" in argv or "--list" in argv
+    if "--since" in argv:
+        since = argv[argv.index("--since") + 1]
+    try:
+        ts = _parse_since(since, cwd)
+    except (ValueError, IndexError) as e:
+        print(f"undo: {e}", file=sys.stderr)
+        return 2
+    plan = undo_plan(cwd, ts)
+    if not plan["restore"] and not plan["delete"] and not plan["skipped"]:
+        print(f"undo: nothing the agent changed under {cwd} since {time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(ts))}")
+        return 0
+    out = undo_apply(plan, dry_run=dry)
+    verb = "would restore" if dry else "restored"
+    for what, f in out["files"]:
+        print(f"  {what:<32} {f}")
+    print(f"undo: {verb} {out['restored']} file(s), {'would delete' if dry else 'deleted'} {out['deleted']} created file(s)"
+          + (f", {out['failed']} failed" if out["failed"] else ""))
+    journal_prune()
+    return 1 if out["failed"] else 0
+
+
+def _revert_marker_path() -> str:
+    d = os.path.expanduser(os.getenv("PALIVANE_STATE_DIR", "~/.palivane"))
+    return os.path.join(d, "revert-done.json")
+
+
+def auto_revert(verdict: dict, cfg: dict, cwd: str) -> None:
+    """A containment answer that carries `revert_since` asks this device to put the agent's
+    files back. Done once per (containment, revert_since), reported to the console."""
+    try:
+        c = verdict.get("contained") if isinstance(verdict, dict) else None
+        if not isinstance(c, dict) or not c.get("revert_since"):
+            return
+        key = f"{c.get('id') or c.get('until')}:{c['revert_since']}:{os.path.realpath(cwd)}"
+        done = {}
+        try:
+            with open(_revert_marker_path()) as fh:
+                done = json.load(fh)
+        except Exception:
+            done = {}
+        if key in done:
+            return
+        plan = undo_plan(cwd, float(c["revert_since"]))
+        out = undo_apply(plan)
+        done[key] = int(time.time())
+        os.makedirs(os.path.dirname(_revert_marker_path()), exist_ok=True)
+        with open(_revert_marker_path(), "w") as fh:
+            json.dump(done, fh)
+        if cfg.get("url") and cfg.get("token"):
+            payload = {"containment_id": c.get("id"), "revert_since": c["revert_since"], "cwd": cwd[:300],
+                       "host": socket.gethostname()[:120], "restored": out["restored"], "deleted": out["deleted"],
+                       "failed": out["failed"], "files": [f for _, f in out["files"]][:100]}
+            try:
+                req = urllib.request.Request(cfg["url"].rstrip("/") + "/api/containments/revert-report", method="POST",
+                                             data=json.dumps(payload).encode(),
+                                             headers={"content-type": "application/json", "User-Agent": agent_ua(),
+                                                      "X-Palivane-Token": cfg["token"]})
+                urllib.request.urlopen(req, timeout=cfg.get("timeout", 5)).read()
+            except Exception:
+                pass
+        if out["restored"] or out["deleted"]:
+            print(f"Palivane: your security team reverted {out['restored']} file(s) the agent changed and removed "
+                  f"{out['deleted']} it created, under {cwd}.", file=sys.stderr)
+    except Exception:
+        pass
+
+
 # --- the session ledger and the commit trailer ----------------------------------------------
 # Every tool call the hook sees is one line in ~/.palivane/session-ledger.jsonl: when, in
 # which working directory, which tool, which file, and the verdict when the call was scanned
@@ -1064,13 +1269,16 @@ def _ledger_path() -> str:
 _LEDGER_MAX_BYTES = 4 * 1024 * 1024
 
 
-def ledger_append(cwd: str, tool: str, resource: str, verdict: dict | None = None) -> None:
+def ledger_append(cwd: str, tool: str, resource: str, verdict: dict | None = None,
+                  journal: dict | None = None) -> None:
     """One line per tool call; trimmed when it grows past a few MB. Never raises."""
     try:
         path = _ledger_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         row = {"ts": time.time(), "cwd": cwd or "", "tool": tool or "", "resource": (resource or "")[:300],
                "agent": "claude-code"}
+        if journal:
+            row.update({k: journal[k] for k in ("snapshot", "existed", "file", "skipped") if k in journal})
         if verdict:
             row["action"] = verdict.get("action") or ""
             row["severity"] = verdict.get("severity") or ""
@@ -1245,6 +1453,8 @@ def cmd_git_install() -> int:
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "selftest":
         return cmd_selftest(read_config())
+    if len(sys.argv) > 1 and sys.argv[1] == "undo":
+        return cmd_undo(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "git-install":
         return cmd_git_install()
     if len(sys.argv) > 2 and sys.argv[1] == "git-trailer":
@@ -1330,7 +1540,8 @@ def main() -> int:
     if activity is None:
         return 0
     _resource = activity.get("resource") or activity.get("shell_command") or ""
-    ledger_append(event.get("cwd") or "", event.get("tool_name", ""), _resource)
+    _journal = journal_snapshot(event.get("tool_name", ""), tool_input)
+    ledger_append(event.get("cwd") or "", event.get("tool_name", ""), _resource, journal=_journal)
 
     if not cfg["url"] or not cfg["token"]:
         return 0  # not connected to Palivane — nothing to report to
@@ -1341,6 +1552,7 @@ def main() -> int:
     if cfg["enforce"] or server_enforced(cfg) or contained_offline():
         verdict = scan_mcp(activity, cfg["url"], cfg["token"], cfg["user"], cfg["timeout"])
         remember_enforce(verdict, cfg, authoritative=False)
+        auto_revert(verdict, cfg, event.get("cwd") or os.getcwd())
         if verdict.get("action") == "block" or verdict.get("finding_id"):
             ledger_append(event.get("cwd") or "", event.get("tool_name", ""), _resource, verdict)
         if should_block(verdict, cfg["enforce"]):

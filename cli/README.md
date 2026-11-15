@@ -9,7 +9,7 @@ without an endpoint agent: each is an app-scoped hook/shim that rides the existi
 | --- | --- | --- |
 | `palivane-connect` | onboarding — wires up everything below | — |
 | `palivane-reenroll` | Claude Code `apiKeyHelper` — self-enrolls/rotates a per-device key | `POST /api/enroll` |
-| `palivane-hook` | **Claude Code** prompts + tool calls, before execution; `palivane-hook selftest` sends the org's canary secret through the real path and prints the verdict; `palivane-hook git-install` (in a repo) adds `Palivane-AI-Assisted` / `Palivane-Scan` trailers to every commit made after an agent worked there and registers the commit with the console | `POST /api/ingest/{mcp,ai-usage}`, `POST /api/attest/commit` |
+| `palivane-hook` | **Claude Code** prompts + tool calls, before execution; `palivane-hook selftest` sends the org's canary secret through the real path and prints the verdict; `palivane-hook git-install` (in a repo) adds `Palivane-AI-Assisted` / `Palivane-Scan` trailers to every commit made after an agent worked there and registers the commit with the console; every Write/Edit is journaled first and `palivane-hook undo --since 30m` puts the files back (a containment with "Undo files" does it from the console) | `POST /api/ingest/{mcp,ai-usage}`, `POST /api/attest/commit`, `POST /api/containments/revert-report` |
 | `palivane-cursor-hook` | **Cursor** prompts + tool calls, before execution | `POST /api/ingest/{mcp,ai-usage}` |
 | `palivane-codex-hook` | **Codex CLI** prompts + tool calls, before execution | `POST /api/ingest/{mcp,ai-usage}` |
 | `palivane-gemini-hook` | **Gemini CLI** prompts + tool calls, before execution | `POST /api/ingest/{mcp,ai-usage}` |
