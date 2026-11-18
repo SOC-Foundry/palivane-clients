@@ -2,6 +2,12 @@
 // Config (backend URL, token or enrollToken, user, enforce) comes from chrome.storage, in
 // a managed rollout these are pushed via enterprise policy (managed storage).
 
+// Fail-open ledger (extension/failopen.js): the same counts-only tally the CLI writes to
+// ~/.palivane/scan-failed-*.json. A scan that cannot reach the backend is recorded here
+// and attached to the next request that does, which is what Fleet shows.
+importScripts("failopen.js");
+const failOpen = globalThis.palivaneFailOpen;
+
 const DEFAULTS = {
   backendUrl: "http://localhost:8090",
   // Palivane console URL for self-serve sign-in (set to your SaaS app URL before publishing;
@@ -146,6 +152,60 @@ async function recordSkip(label) {
 function skipped(label, reason) {
   recordSkip(label);
   return { action: "allow", reason, skipped: label };
+}
+
+// chrome.storage has no atomic rename, so the claim the CLI does with a file is a key
+// move serialized on this promise. Two scans failing at once share one tally instead of
+// each writing over the other.
+const SCAN_FAILED_KEY = "scanFailed";
+const SCAN_FAILED_CLAIM = "scanFailedClaim";
+let ledgerChain = Promise.resolve();
+function withLedger(fn) {
+  const run = ledgerChain.then(fn, fn);
+  ledgerChain = run.then(() => {}, () => {});
+  return run;
+}
+async function ledgerState() {
+  const bag = await chrome.storage.local.get({ [SCAN_FAILED_KEY]: null, [SCAN_FAILED_CLAIM]: null });
+  return { pending: bag[SCAN_FAILED_KEY], claim: bag[SCAN_FAILED_CLAIM] };
+}
+async function saveLedger(state) {
+  const keep = {};
+  const drop = [];
+  if (state.pending && state.pending.count) keep[SCAN_FAILED_KEY] = state.pending;
+  else drop.push(SCAN_FAILED_KEY);
+  if (state.claim && state.claim.count) keep[SCAN_FAILED_CLAIM] = state.claim;
+  else drop.push(SCAN_FAILED_CLAIM);
+  if (drop.length) await chrome.storage.local.remove(drop);
+  if (Object.keys(keep).length) await chrome.storage.local.set(keep);
+}
+async function recordScanFailure(reason) {
+  try {
+    await withLedger(async () => {
+      await saveLedger(failOpen.recordFailure(await ledgerState(), reason, Math.floor(Date.now() / 1000)));
+    });
+  } catch (_) { /* counting a failure must not change the fail-open the caller already chose */ }
+}
+async function claimScanFailures() {
+  try {
+    return await withLedger(async () => {
+      const taken = failOpen.takeClaim(await ledgerState());
+      await saveLedger(taken.state);
+      return taken.report;
+    });
+  } catch (_) { return null; }
+}
+async function scanFailuresDelivered() {
+  try {
+    await withLedger(async () => { await saveLedger(failOpen.dropClaim(await ledgerState())); });
+  } catch (_) { /* a delivered tally left behind is folded back on the next failure */ }
+}
+function clientHeaders() {
+  // The browser will not let an extension set User-Agent. Fleet reads this header as the
+  // same client token the hooks put in that header (palivane-extension/<version>).
+  let version = "0";
+  try { version = chrome.runtime.getManifest().version || "0"; } catch (_) {}
+  return { "X-Palivane-Client": "palivane-extension/" + version };
 }
 
 // Installed-extension inventory. Chrome isolates extensions from each other, so Palivane can't
@@ -333,6 +393,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (!msg || msg.type !== "scan") return;
   (async () => {
+    // Set once the backend has accepted this request, so a later local error (badge,
+    // storage) is not counted as "the backend was unreachable".
+    let reported = false;
     try {
       const c = await config();
       let key = await getIngestKey(c);
@@ -341,19 +404,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // when the backend honored it (verdict.overridden) so it cannot linger.
       const { overrideGrant } = await chrome.storage.session.get({ overrideGrant: null });
       const grant = overrideGrant && overrideGrant.expires > Date.now() ? overrideGrant.token : "";
+      // The pending fail-open tally rides on this request, the way the CLI attaches it.
+      // Counts and times only — never the prompt that could not be scanned.
+      const report = await claimScanFailures();
       const call = (k) => fetch(c.backendUrl.replace(/\/$/, "") + "/api/ingest/ai-usage", {
         method: "POST",
-        headers: { "content-type": "application/json", "X-Palivane-Token": k },
+        headers: { "content-type": "application/json", "X-Palivane-Token": k, ...clientHeaders() },
         body: JSON.stringify({ content: msg.content, destination: msg.destination, user: c.user,
                                ...(msg.endpoint ? { endpoint: String(msg.endpoint).slice(0, 200) } : {}),
                                ...(grant ? { override_token: grant } : {}),
                                // the edited message from "send with these removed": links it
                                // to the block it fixes (the backend marks that finding)
-                               ...(Number.isInteger(msg.redactedFrom) ? { redacted_from: msg.redactedFrom } : {}) }),
+                               ...(Number.isInteger(msg.redactedFrom) ? { redacted_from: msg.redactedFrom } : {}),
+                               ...(report ? { scan_failed: report } : {}) }),
       });
       let res = await call(key);
       // A cached device key can be revoked/rotated server-side. With an enrollToken we can
       // self-heal: re-enroll for a fresh key and retry once. A static token has no fallback.
+      // A 401 that the retry repairs is not a fail-open: the message was scanned.
       if ((res.status === 401 || res.status === 403) && !c.token && c.enrollToken) {
         key = await getIngestKey(c, true);
         if (key) res = await call(key);
@@ -361,10 +429,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!res.ok) {
         const why = res.status === 401 || res.status === 403 ? "capture key rejected, sign in again"
                                                               : "server error " + res.status;
+        await recordScanFailure(res.status);   // folds the undelivered claim back in
         sendResponse(skipped(why, "backend " + res.status));
         return;
       }
-      const verdict = await res.json();
+      let verdict;
+      try { verdict = await res.json(); }
+      catch (_) {
+        // The backend accepted the request (and the tally on it). The unreadable body is
+        // a new failure, not the same one sent again.
+        await scanFailuresDelivered();
+        await recordScanFailure("bad-response");
+        sendResponse(skipped("could not reach Palivane", "bad response"));
+        return;
+      }
+      await scanFailuresDelivered();
+      reported = true;
       // In monitor mode (enforce off) a "block" is normally downgraded to "warn", but a
       // CONFIRMED secret/PII leak (force_block) is hard-blocked regardless: block the
       // certain, monitor the fuzzy.
@@ -383,6 +463,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.partial) await recordSkip("message too long, only the first part was checked");
       sendResponse(verdict);
     } catch (e) {
+      // The backend was unreachable. The message still goes out — fail open — and the
+      // miss is counted locally so Fleet hears about it on the next request that lands.
+      if (!reported) await recordScanFailure(e);
       sendResponse(skipped("could not reach Palivane", String(e))); // fail open
     }
   })();
