@@ -634,7 +634,10 @@ def scan(endpoint: str, payload: dict, url: str, token: str,
         req = urllib.request.Request(
             url.rstrip("/") + endpoint, method="POST",
             data=json.dumps(body).encode(),
-            headers={"content-type": "application/json", "User-Agent": ua or agent_ua(), "X-Palivane-Token": token},
+            headers={"content-type": "application/json", "User-Agent": ua or agent_ua(), "X-Palivane-Token": token,
+                     # A capability passport issued to this agent (console > Agents > Passport):
+                     # presented as the agent identity, so the server refuses calls outside it.
+                     **({"X-Palivane-Agent": os.environ["PALIVANE_PASSPORT"].strip()} if os.environ.get("PALIVANE_PASSPORT", "").strip() else {})},
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
