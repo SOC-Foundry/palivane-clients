@@ -36,12 +36,17 @@ document.addEventListener(CHANNEL + ":up", async (e) => {
   try { d = JSON.parse(e.detail); } catch (_) { return; }
   if (!d) return;
 
-  if (d.kind === "scan") {
+  if (d.kind === "scan" || d.kind === "attachment") {
     let verdict = { action: "allow" };
     try {
-      verdict = await chrome.runtime.sendMessage({
+      verdict = await chrome.runtime.sendMessage(d.kind === "attachment" ? {
+        type: "scan-attachment", name: d.name, mime: d.mime, data_b64: d.data_b64,
+        destination: d.destination, endpoint: d.endpoint,
+      } : {
         type: "scan", content: d.content, destination: d.destination, endpoint: d.endpoint,
-        partial: !!d.partial, ...(resendOf(d.content) ? { redactedFrom: resendOf(d.content) } : {}),
+        partial: !!d.partial,
+        ...(d.partialReason ? { partialReason: d.partialReason } : {}),
+        ...(resendOf(d.content) ? { redactedFrom: resendOf(d.content) } : {}),
       });
       if (verdict && verdict.redacted_resend) pendingResend = null;   // recorded: one use
     } catch (_) {
@@ -216,10 +221,10 @@ function showBlockModal(verdict, prompt = null) {
         border:1px solid #2a3346;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.5);
         padding:22px 24px">
       <div style="display:flex;align-items:center;gap:10px;font-size:17px;font-weight:800">
-        <span style="color:#ff5d6c">🛡</span> Palivane ${cleaned ? "held" : "blocked"} this message
+        <span style="color:#ff5d6c">🛡</span> Palivane ${cleaned ? "held" : "blocked"} this ${verdict.attachment ? "file" : "message"}
       </div>
       <p style="color:#c4ccdb;margin:12px 0 6px">
-        It was <strong>not sent</strong> to the AI tool because it contained ${reasonText(verdict)}.
+        It was <strong>not ${verdict.attachment ? "uploaded" : "sent"}</strong> to the AI tool because it contained ${reasonText(verdict)}.
       </p>
       <ul style="margin:8px 0 4px;padding-left:18px;color:#e6e9f0">${rows}</ul>
       ${redactBox}

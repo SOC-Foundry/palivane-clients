@@ -154,6 +154,22 @@ function skipped(label, reason) {
   return { action: "allow", reason, skipped: label };
 }
 
+// Monitor mode downgrades a block to a warning, except a confirmed leak (force_block),
+// which is held either way. Shared by prompt scans and attachment scans.
+function applyEnforce(c, verdict) {
+  if (!verdict || typeof verdict !== "object") return { action: "allow" };
+  if (!c.enforce && verdict.action === "block" && !verdict.force_block) verdict.action = "warn";
+  if (!c.enforce && verdict.coached && !verdict.force_block) verdict.coached = false;
+  return verdict;
+}
+
+function unreadLabel(code) {
+  if (code === "image") return "an attached image was not read";
+  if (code === "too_large") return "an attachment was too large to check";
+  if (code === "partial") return "an attachment was only partly read";
+  return "an attachment could not be read";
+}
+
 // chrome.storage has no atomic rename, so the claim the CLI does with a file is a key
 // move serialized on this promise. Two scans failing at once share one tally instead of
 // each writing over the other.
@@ -391,6 +407,51 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return;
   }
+  if (msg && msg.type === "scan-attachment") {
+    (async () => {
+      try {
+        const c = await config();
+        let key = await getIngestKey(c);
+        if (!key) { sendResponse(skipped("not signed in", "unconfigured")); return; }
+        const call = (k) => fetch(c.backendUrl.replace(/\/$/, "") + "/api/ingest/ai-attachment", {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Palivane-Token": k, ...clientHeaders() },
+          body: JSON.stringify({
+            filename: String(msg.name || "attachment").slice(0, 200),
+            mime: String(msg.mime || "").slice(0, 128),
+            data_b64: msg.data_b64 || "",
+            destination: msg.destination || "",
+            user: c.user,
+            ...(msg.endpoint ? { endpoint: String(msg.endpoint).slice(0, 200) } : {}),
+          }),
+        });
+        let res = await call(key);
+        if ((res.status === 401 || res.status === 403) && !c.token && c.enrollToken) {
+          key = await getIngestKey(c, true);
+          if (key) res = await call(key);
+        }
+        if (!res.ok) {
+          const why = res.status === 401 || res.status === 403 ? "capture key rejected, sign in again"
+                                                                : "server error " + res.status;
+          sendResponse(skipped(why, "backend " + res.status));
+          return;
+        }
+        const verdict = applyEnforce(c, await res.json());
+        // Unreadable (OCR off, a format we cannot open, only partly read) is not a clean
+        // check and is not a block: the file goes, and the popup says so.
+        if (verdict.unread) {
+          await recordSkip(unreadLabel(verdict.unread));
+          sendResponse(verdict);
+          return;
+        }
+        await recordVerdict(verdict, false);
+        sendResponse(verdict);
+      } catch (e) {
+        sendResponse(skipped("could not reach Palivane", String(e)));
+      }
+    })();
+    return true;
+  }
   if (!msg || msg.type !== "scan") return;
   (async () => {
     // Set once the backend has accepted this request, so a later local error (badge,
@@ -445,14 +506,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       await scanFailuresDelivered();
       reported = true;
-      // In monitor mode (enforce off) a "block" is normally downgraded to "warn", but a
-      // CONFIRMED secret/PII leak (force_block) is hard-blocked regardless: block the
-      // certain, monitor the fuzzy.
-      if (!c.enforce && verdict.action === "block" && !verdict.force_block) verdict.action = "warn";
-      // Monitor mode never holds a message, and a coached verdict is held: it falls back to the
-      // plain warning the org's softer action already was. A confirmed leak (force_block) is
-      // the exception, as above: it stays held, with the cleaned copy to send instead.
-      if (!c.enforce && verdict.coached && !verdict.force_block) verdict.coached = false;
+      verdict = applyEnforce(c, verdict);
       if (verdict.overridden) await chrome.storage.session.remove("overrideGrant");  // consumed
       if (verdict.action === "block" && verdict.finding_id && verdict.self_justify) {
         await chrome.storage.session.set({
@@ -460,7 +514,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       await recordVerdict(verdict, !!msg.partial);
       // Only part of the message was scored: it went out partly unchecked, and must say so.
-      if (msg.partial) await recordSkip("message too long, only the first part was checked");
+      if (msg.partial) await recordSkip(msg.partialReason || "message too long, only the first part was checked");
       sendResponse(verdict);
     } catch (e) {
       // The backend was unreachable. The message still goes out — fail open — and the

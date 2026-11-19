@@ -246,11 +246,12 @@
 
   // partial: this content is only part of the message (the rest was never scanned), so its verdict
   // must not read as a clean check of the whole message (background.js keeps the "unchecked" mark).
-  function scan(content, destination, endpoint, partial = false) {
+  function scan(content, destination, endpoint, partial = false, partialReason = "") {
     return new Promise((resolve) => {
       const id = newId();
       PENDING.set(id, resolve);
-      if (!post({ kind: "scan", id, content, destination, endpoint, ...(partial ? { partial: true } : {}) })) {
+      if (!post({ kind: "scan", id, content, destination, endpoint,
+                  ...(partial ? { partial: true, ...(partialReason ? { partialReason } : {}) } : {}) })) {
         PENDING.delete(id); resolve({ action: "allow" }); return;   // no content script here
       }
       // Fail OPEN: never break the user's tool if Palivane is slow/unreachable. But not in
@@ -266,8 +267,8 @@
     });
   }
 
-  async function scanAll(prompt, destination, endpoint) {
-    if (prompt.length <= WINDOW) return scan(prompt, destination, endpoint);
+  async function scanAll(prompt, destination, endpoint, partial = false, partialReason = "") {
+    if (prompt.length <= WINDOW) return scan(prompt, destination, endpoint, partial, partialReason);
     // Past the cap the tail is never scored: report it, and mark every window's scan partial so an
     // allow on the prefix does not clear the "sent unchecked" notice. Still fail open: it goes out.
     const truncated = prompt.length > WINDOW * MAX_WINDOWS;
@@ -277,7 +278,8 @@
       parts.push(prompt.slice(i, i + WINDOW));
       if (i + WINDOW >= prompt.length) break;
     }
-    const verdicts = await Promise.all(parts.map((p) => scan(p, destination, endpoint, truncated)));
+    const reason = truncated ? "" : partialReason;
+    const verdicts = await Promise.all(parts.map((p) => scan(p, destination, endpoint, truncated || partial, reason)));
     return verdicts.find(stop) || verdicts.find((v) => v.action === "warn") || { action: "allow" };
   }
 
@@ -411,12 +413,136 @@
     return new Response(JSON.stringify(body), { status: rpc ? 403 : 451, headers: { "content-type": "application/json" } });
   }
 
+  // Files and screenshots on ChatGPT, Claude and Gemini. Only these three: the privacy
+  // policy names them, and a file upload leaves before the prompt that references it does.
+  const ATTACH_HOSTS = { "chatgpt.com": 1, "chat.openai.com": 1, "claude.ai": 1, "gemini.google.com": 1 };
+  const isAttachHost = () => !!ATTACH_HOSTS[location.hostname];
+  const MAX_ATTACH_BYTES = 4 << 20;
+  const MAX_ATTACH_FILES = 4;
+
+  function isUploadBlob(v) {
+    if (!v || typeof Blob === "undefined" || !(v instanceof Blob) || !(v.size > 0)) return false;
+    if (typeof File !== "undefined" && v instanceof File) return true;
+    const t = v.type || "";
+    return t.indexOf("image/") === 0 || t === "application/pdf"
+      || t.indexOf("officedocument") >= 0 || t.indexOf("opendocument") >= 0;
+  }
+
+  function syncFiles(body) {
+    const out = [];
+    try {
+      if (typeof FormData !== "undefined" && body instanceof FormData) {
+        for (const [, v] of body.entries()) if (isUploadBlob(v)) out.push(v);
+      } else if (isUploadBlob(body)) out.push(body);
+    } catch (_) { /* not a body we can list */ }
+    return out.slice(0, MAX_ATTACH_FILES);
+  }
+
+  // A screenshot inlined as a data URI in the prompt body, rather than uploaded on its own.
+  function dataImages(text) {
+    if (!text || text.indexOf("data:image/") < 0) return [];
+    const out = [];
+    const re = /data:image\/(png|jpe?g|gif|webp|bmp);base64,([A-Za-z0-9+/=\r\n]+)/gi;
+    let m;
+    while ((m = re.exec(text)) && out.length < MAX_ATTACH_FILES) {
+      const b64 = m[2].replace(/\s/g, "");
+      if (b64.length < 16) continue;
+      const kind = m[1].toLowerCase() === "jpg" ? "jpeg" : m[1].toLowerCase();
+      out.push({ name: "screenshot." + (kind === "jpeg" ? "jpg" : kind), mime: "image/" + kind,
+                 b64, bytes: Math.floor(b64.length * 3 / 4) });
+    }
+    return out;
+  }
+
+  function blobToB64(blob) {
+    return blob.arrayBuffer().then((buf) => {
+      const bytes = new Uint8Array(buf);
+      let s = "";
+      for (let i = 0; i < bytes.length; i += 8192) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 8192, bytes.length)));
+      }
+      return btoa(s);
+    });
+  }
+
+  function scanAttachment(meta, endpoint) {
+    return new Promise((resolve) => {
+      const id = newId();
+      PENDING.set(id, resolve);
+      if (!post({ kind: "attachment", id, name: meta.name || "attachment", mime: meta.mime || "",
+                  data_b64: meta.b64, destination: location.origin, endpoint: endpoint || "" })) {
+        PENDING.delete(id); resolve({ action: "allow" }); return;
+      }
+      setTimeout(() => {
+        if (PENDING.has(id)) {
+          PENDING.delete(id); LATE.add(id);
+          post({ kind: "skipped", reason: "no answer in time" });
+          resolve({ action: "allow" });
+        }
+      }, SCAN_TIMEOUT_MS);
+    });
+  }
+
+  function unreadWhy(code) {
+    if (code === "image") return "an attached image was not read";
+    if (code === "too_large") return "an attachment was too large to check";
+    if (code === "partial") return "an attachment was only partly read";
+    return "an attachment could not be read";
+  }
+
+  // "blocked" stops the upload. "unread" lets it go and the caller keeps the unchecked mark.
+  async function holdFiles(files, endpoint) {
+    let unread = false;
+    for (const f of files) {
+      const size = f && (f.size || f.bytes) || 0;
+      if (size > MAX_ATTACH_BYTES) {
+        post({ kind: "skipped", reason: "an attachment was too large to check" });
+        unread = true;
+        continue;
+      }
+      let meta = f;
+      if (typeof Blob !== "undefined" && f instanceof Blob) {
+        let b64;
+        try { b64 = await blobToB64(f); }
+        catch (_) {
+          post({ kind: "skipped", reason: "an attachment could not be read" });
+          unread = true;
+          continue;
+        }
+        meta = { name: f.name || "attachment", mime: f.type || "", b64 };
+      }
+      const verdict = await scanAttachment(meta, endpoint);
+      if (stop(verdict)) {
+        post(blockedMsg(verdict, null));
+        return "blocked";
+      }
+      if (verdict && verdict.action === "warn") post({ kind: "warn", verdict });
+      if (verdict && verdict.unread) {
+        post({ kind: "skipped", reason: unreadWhy(verdict.unread) });
+        unread = true;
+      }
+    }
+    return unread ? "unread" : "ok";
+  }
+
   const origFetch = window.fetch;
   window.fetch = async function (input, init) {
     try {
       const isReq = typeof Request !== "undefined" && input instanceof Request;
       const url = typeof input === "string" ? input : (input && (input.url || input.href)) || "";
       const method = ((init && init.method) || (isReq && input.method) || "GET").toUpperCase();
+      // An attached file leaves on its own request, before the prompt that names it.
+      if (method === "POST" && isAttachHost()) {
+        let files = [];
+        if (init && init.body != null) files = syncFiles(init.body);
+        else if (isReq && input && !input.bodyUsed) {
+          const ct = (input.headers && input.headers.get && input.headers.get("content-type")) || "";
+          if (/multipart\/form-data/i.test(ct)) {
+            try { files = syncFiles(await input.clone().formData()); } catch (_) { /* not multipart */ }
+          }
+        }
+        if (files.length && await holdFiles(files, endpointOf(url)) === "blocked") return blockedResponse(url);
+      }
       if (method === "POST" && looksLikeSend(url)) {
         // fetch(url, {body}) or fetch(new Request(url, {body})): init.body wins when both exist.
         // A Request's own body is read from a clone, so the page's real send is untouched.
@@ -437,6 +563,13 @@
         const prompt = promptFrom(url, body);
         if (DEBUG) console.log("[Palivane] captured", url, "promptChars=", (prompt || "").length,
           "snippet=", (prompt || "").slice(0, 80));
+        // A screenshot pasted into the composer rides inside the send as a data URI.
+        let attachPartial = false;
+        if (isAttachHost() && body.text && body.text.indexOf("data:image/") >= 0) {
+          const held = await holdFiles(dataImages(body.text), endpointOf(url));
+          if (held === "blocked") return blockedResponse(url);
+          attachPartial = held === "unread";
+        }
         if (prompt && prompt.trim()) {
           const key = sendKey(url, prompt);
           const prior = recentBlocks.get(key);
@@ -445,7 +578,8 @@
             prior.until = Date.now() + BLOCK_QUIET_MS;
             return blockedResponse(url);
           }
-          const verdict = await scanAll(prompt, location.origin, endpointOf(url));
+          const verdict = await scanAll(prompt, location.origin, endpointOf(url), attachPartial,
+            attachPartial ? "an attached image was not read" : "");
           if (DEBUG) console.log("[Palivane] verdict", verdict.action, verdict.severity, verdict.risk_score);
           if (stop(verdict)) {
             recentBlocks.set(key, { until: Date.now() + BLOCK_QUIET_MS,
@@ -477,38 +611,56 @@
     return origOpen.apply(this, arguments);
   };
 
+  function failXhr(xhr) {
+    // Don't send. Signal a network failure so the app's error path runs;
+    // the sensitive body never left the browser.
+    try {
+      Object.defineProperty(xhr, "readyState", { value: 4, configurable: true });
+      Object.defineProperty(xhr, "status", { value: 0, configurable: true });
+    } catch (_) { /* native props may be non-configurable; events still fire */ }
+    try { xhr.dispatchEvent(new Event("readystatechange")); } catch (_) {}
+    try { xhr.dispatchEvent(new ProgressEvent("error")); } catch (_) {}
+    try { xhr.dispatchEvent(new ProgressEvent("loadend")); } catch (_) {}
+  }
+
   XMLHttpRequest.prototype.send = function (body) {
     try {
       const info = this.__palivane;
-      if (info && info.method === "POST" && looksLikeSend(info.url) && body != null) {
+      const sendish = info && info.method === "POST" && looksLikeSend(info.url) && body != null;
+      const files = info && info.method === "POST" && isAttachHost() && body != null ? syncFiles(body) : [];
+      if (sendish || files.length) {
         const xhr = this, args = arguments;
         // Reading a Blob is asynchronous, so the real send is deferred until we know whether
         // there is a prompt in it (and, if so, what Palivane says about it).
-        readBody(body).then(async (b) => {
+        (async () => {
+          if (files.length && await holdFiles(files, endpointOf(info.url)) === "blocked") {
+            failXhr(xhr); return;
+          }
+          if (!sendish) { origSend.apply(xhr, args); return; }
+          const b = await readBody(body);
           if (DEBUG) console.debug("[Palivane] xhr POST", info.url, "bodyChars=", b.text.length, "unreadable=", b.unreadable);
           if (b.unreadable) reportBlind();
+          let attachPartial = false;
+          if (isAttachHost() && b.text && b.text.indexOf("data:image/") >= 0) {
+            const held = await holdFiles(dataImages(b.text), endpointOf(info.url));
+            if (held === "blocked") { failXhr(xhr); return; }
+            attachPartial = held === "unread";
+          }
           const prompt = promptFrom(info.url, b);
           if (!(prompt && prompt.trim())) { origSend.apply(xhr, args); return; }
-          const verdict = await scanAll(prompt, location.origin, endpointOf(info.url));
+          const verdict = await scanAll(prompt, location.origin, endpointOf(info.url), attachPartial,
+            attachPartial ? "an attached image was not read" : "");
           if (DEBUG) console.log("[Palivane] xhr verdict", verdict.action, verdict.severity, verdict.risk_score);
           if (stop(verdict)) {
             post(blockedMsg(verdict, prompt));
-            // Don't send. Signal a network failure so the app's error path runs;
-            // the sensitive body never left the browser.
-            try {
-              Object.defineProperty(xhr, "readyState", { value: 4, configurable: true });
-              Object.defineProperty(xhr, "status", { value: 0, configurable: true });
-            } catch (_) { /* native props may be non-configurable; events still fire */ }
-            try { xhr.dispatchEvent(new Event("readystatechange")); } catch (_) {}
-            try { xhr.dispatchEvent(new ProgressEvent("error")); } catch (_) {}
-            try { xhr.dispatchEvent(new ProgressEvent("loadend")); } catch (_) {}
+            failXhr(xhr);
             return;
           }
           if (verdict.action === "warn") {
             post({ kind: "warn", verdict });
           }
           origSend.apply(xhr, args);   // allowed → send for real
-        }).catch(() => { try { origSend.apply(xhr, args); } catch (_) { /* fail open */ } });
+        })().catch(() => { try { origSend.apply(xhr, args); } catch (_) { /* fail open */ } });
         return;   // defer the real send until the verdict resolves
       }
     } catch (_) { /* fail open */ }

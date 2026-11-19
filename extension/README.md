@@ -10,8 +10,9 @@ Palivane backend (`POST /api/ingest/ai-usage`).
 > `extractPrompt` in `injected.js`). The newer hosts (Perplexity, Mistral, DeepSeek,
 > Grok, AI Studio, Poe) match on their submit endpoints and fall back to scanning the raw
 > request body; a vendor changing its endpoint/payload can silently break capture for
-> that site until the pattern is updated. Text prompts only, file/image **attachments
-> are not yet scanned**.
+> that site until the pattern is updated. On ChatGPT, Claude and Gemini, files and
+> pasted screenshots are scanned too (`POST /api/ingest/ai-attachment`); other hosts
+> are still text prompts only.
 
 > **Microsoft Copilot note.** `copilot.microsoft.com` is in the extension's matched
 > hosts, and the backend already labels it as a destination. Reliable browser capture
@@ -62,9 +63,18 @@ windows (up to 1.2 million characters; the rest is reported the same way), and a
 not JSON (Gemini's form-encoded one) is scanned whole rather than cut to its first 8,000
 characters.
 
-It **fails open**: if the backend is slow, unreachable, or unconfigured, prompts go
-through, the extension never breaks the user's tool. But a check that did not happen no
-longer looks like a clean one:
+On chatgpt.com, chat.openai.com, claude.ai and gemini.google.com a file or image attached
+to the composer (a document, a pasted screenshot, or an image inlined in the send) is
+scanned before it is uploaded. The backend reads text and documents directly and images
+with the same local OCR path as the gateway (`app/ocr.py`, off unless `PALIVANE_OCR` is
+set). The verdict is the prompt verdict: block, warn, or allow, including monitor versus
+enforce and the hard block on a confirmed leak. A file that cannot be read (OCR off, an
+unsupported format, anything over 4 MB) is **not** blocked; it is allowed and marked
+unchecked, the same fail-open rule as a prompt the extension could not read.
+
+It **fails open**: if the backend is slow, unreachable, or unconfigured, prompts and
+attachments go through, the extension never breaks the user's tool. But a check that did
+not happen no longer looks like a clean one:
 
 - A message sent **unchecked** (not signed in, capture key rejected, server error, no
   answer within 4 seconds, or the extension was updated under an open tab) shows a grey

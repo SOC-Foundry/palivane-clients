@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Palivane, Shadow-AI Guard",
-  "version": "0.8.0",
-  "description": "Inspects prompts sent to external AI tools for secrets, PII, and proprietary data, and warns or blocks before they leave.",
+  "version": "0.8.1",
+  "description": "Inspects prompts, and files or screenshots attached on ChatGPT, Claude and Gemini, for secrets, PII, and proprietary data, and warns or blocks before they leave.",
   "permissions": [
     "storage",
     "identity"

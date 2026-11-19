@@ -1,6 +1,6 @@
 # Palivane. Shadow-AI Guard · Privacy Policy
 
-_Last updated: 2026-10-24_
+_Last updated: 2026-11-18_
 
 Palivane. Shadow-AI Guard ("the extension") is an organizational data-loss-prevention
 tool. It is deployed by an administrator and connected to a **Palivane backend that your
@@ -18,10 +18,21 @@ extension reads the text of a prompt **before it is sent** so that it can be sca
 secrets, credentials, personal data, and proprietary content, and then **warns or
 blocks** risky submissions.
 
+On **ChatGPT** (chatgpt.com, chat.openai.com), **Claude** (claude.ai) and **Gemini**
+(gemini.google.com) it also reads **files and images you attach or paste**, including
+screenshots, before that upload leaves the browser, and scans them the same way. It does
+not read attachments on the other tools in the list above.
+
 ## What data is processed
 
 - **Prompt content** you submit to the supported AI tools, sent to your organization's
   Palivane backend for scanning.
+- **Files and images** (including pasted screenshots) you attach on ChatGPT, Claude or
+  Gemini: the file name, the type, and the file itself, sent to that same backend so it
+  can be scanned. Images are read **on the backend you operate**, with local OCR, and
+  only when your administrator has turned OCR on. They are not sent to a vision API or
+  any other third party. If OCR is off, or the file cannot be read, the upload is not
+  blocked for that reason and the extension says it was not fully checked.
 - **An optional user identifier** (e.g. your work email), if your administrator
   configures one, so findings can be attributed.
 - **Configuration** (backend URL, access token, enforce flag) stored locally via the
@@ -36,21 +47,24 @@ blocks** risky submissions.
 
 ## Where data goes
 
-Scanned content is transmitted **only** to the Palivane backend endpoint your organization
-configures (`POST /api/ingest/ai-usage`). It is **not** transmitted to the extension's
-developer, and it is **not** sold, shared, or used for advertising or any purpose
-unrelated to the security scan.
+Scanned content is transmitted **only** to the Palivane backend your organization
+configures (`POST /api/ingest/ai-usage` for prompts, `POST /api/ingest/ai-attachment` for
+files and images). It is **not** transmitted to the extension's developer, and it is
+**not** sold, shared, or used for advertising or any purpose unrelated to the security scan.
 
 ## Retention
 
-The extension itself stores no prompt history; it relays content for a real-time verdict
-and discards it. Any retention of findings happens in your organization's Palivane backend,
-governed by your organization's own data policy.
+The extension itself stores no prompt history and no copies of files or images; it relays
+them for a real-time verdict and discards them. The backend does not keep the file bytes.
+Any retention of findings (the text that was scanned, under your organization's content
+policy) happens in your organization's Palivane backend, governed by your organization's
+own data policy.
 
 ## Failure behavior
 
-The extension **fails open**: if the backend is unreachable or misconfigured, prompts are
-sent to the AI tool untouched and no data is captured.
+The extension **fails open**: if the backend is unreachable, slow, or misconfigured,
+prompts and attachments are sent to the AI tool untouched. A check that did not happen
+is shown as unchecked; it is not reported as a clean scan.
 
 ## Contact
 
